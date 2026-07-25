@@ -533,20 +533,6 @@ def sys_info():
 
 # ---------------------------------------------------------------- power
 
-def power_unlock(pin):
-    """Unlock the PC by typing the PIN/password at the lock screen.
-
-    This simulates keyboard input: any key to dismiss the lock curtain, then
-    type the PIN and Enter. It cannot bypass an enforced Ctrl+Alt+Del
-    prompt (the secure desktop ignores injected input by design)."""
-    kb.press(Key.space)
-    kb.release(Key.space)
-    time.sleep(1.2)  # let the sign-in field appear
-    kb.type(pin)
-    kb.press(Key.enter)
-    kb.release(Key.enter)
-
-
 def power(action):
     system = platform.system()
     cmds = {
@@ -799,14 +785,7 @@ class Agent:
         return {}
 
     async def h_power(self, msg):
-        action = msg.get("action", "lock")
-        if action == "unlock":
-            pin = msg.get("pin", "")
-            if not pin:
-                raise ValueError("unlock needs the PC PIN/password in 'pin'")
-            await asyncio.to_thread(power_unlock, pin)
-            return {"action": "unlock", "scheduled": True}
-        return power(action)
+        return power(msg.get("action", "lock"))
 
     async def h_media(self, msg):
         do_key(msg.get("action", "media_play_pause"))

@@ -460,62 +460,6 @@ class _HomePageState extends State<HomePage> {
     if (mounted) showMessage(context, '$label command sent');
   }
 
-  /// Unlocks the PC: the agent types the PIN/password at the Windows lock
-  /// screen. Unlike [_power] there is no confirmation step — the dialog
-  /// itself collects the credentials.
-  Future<void> _unlock() async {
-    final client = _client;
-    if (client == null) return;
-    final ctrl = TextEditingController();
-    final pin = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Unlock PC'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-                'Types your PIN or password at the Windows lock screen to sign you in.'),
-            const SizedBox(height: 12),
-            TextField(
-              controller: ctrl,
-              autofocus: true,
-              obscureText: true,
-              decoration: const InputDecoration(
-                labelText: 'PIN or password',
-                border: OutlineInputBorder(),
-              ),
-              onSubmitted: (value) => Navigator.pop(ctx, value),
-            ),
-            const SizedBox(height: 12),
-            Text(
-              "Won't work if your PC requires Ctrl+Alt+Del to sign in.",
-              style: TextStyle(color: Theme.of(ctx).hintColor, fontSize: 12),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, ctrl.text),
-            child: const Text('Unlock'),
-          ),
-        ],
-      ),
-    );
-    if (pin == null || pin.isEmpty) return;
-    try {
-      await client.request('power', {'action': 'unlock', 'pin': pin});
-      if (mounted) showMessage(context, 'Unlock command sent');
-    } catch (e) {
-      if (mounted) showError(context, e);
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     if (_selected == null) return _buildDeviceList();
@@ -874,11 +818,6 @@ class _HomePageState extends State<HomePage> {
                 tooltip: 'Lock',
                 icon: Icons.lock_outline,
                 onPressed: () => _power('lock', 'Lock'),
-              ),
-              _quickAction(
-                tooltip: 'Unlock',
-                icon: Icons.lock_open,
-                onPressed: _unlock,
               ),
               _quickAction(
                 tooltip: 'Sleep',

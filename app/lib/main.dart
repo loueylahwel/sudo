@@ -16,9 +16,41 @@ class SudoApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
+        // AMOLED theme: true black backgrounds (pixels off = battery saved)
+        // with near-black surfaces and hairline borders for definition.
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF0D9488),
           brightness: Brightness.dark,
+        ).copyWith(
+          surface: Colors.black,
+          surfaceContainerLowest: Colors.black,
+        ),
+        scaffoldBackgroundColor: Colors.black,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Colors.black,
+          surfaceTintColor: Colors.transparent,
+        ),
+        cardTheme: CardThemeData(
+          color: const Color(0xFF0F0F0F),
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: Color(0xFF1E1E1E)),
+          ),
+        ),
+        dialogTheme: DialogThemeData(
+          backgroundColor: const Color(0xFF101010),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+            side: const BorderSide(color: Color(0xFF222222)),
+          ),
+        ),
+        bottomSheetTheme: const BottomSheetThemeData(
+          backgroundColor: Color(0xFF101010),
+          surfaceTintColor: Colors.transparent,
+        ),
+        snackBarTheme: const SnackBarThemeData(
+          backgroundColor: Color(0xFF1A1A1A),
         ),
       ),
       routes: {

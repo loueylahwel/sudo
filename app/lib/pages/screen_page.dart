@@ -8,8 +8,6 @@ import '../client_registry.dart';
 import '../relay_client.dart';
 import '../util.dart';
 
-enum _TouchMode { tap, scroll }
-
 enum _GestureState { idle, pressing, dragging, longPressPending, dragSelect }
 
 class ScreenPage extends StatefulWidget {
@@ -37,7 +35,6 @@ class _ScreenPageState extends State<ScreenPage> {
   int _frameW = 16;
   int _frameH = 9;
   Rect _imageRect = Rect.zero;
-  _TouchMode _mode = _TouchMode.tap;
   bool _streaming = false;
   // True from socket loss until the stream is back (first frame after
   // reconnection, or `agent.online`). Drives the reconnecting overlay.
@@ -50,6 +47,7 @@ class _ScreenPageState extends State<ScreenPage> {
   bool _binaryMode = false;
 
   double _scrollAccum = 0;
+  double _scrollAccumX = 0;
   static const double _scrollThreshold = 24;
 
   // Touchpad movement: pixel deltas are normalized by the displayed image
@@ -70,6 +68,10 @@ class _ScreenPageState extends State<ScreenPage> {
   //   dragSelect       long-press followed by a move past slop (button held)
   _GestureState _gesture = _GestureState.idle;
   int? _pointerId; // the finger currently driving the gesture
+  // Laptop-style touchpad: a second finger switches the gesture to scroll.
+  int? _secondPointerId;
+  Offset _secondPos = Offset.zero;
+  bool _twoFinger = false;
   Offset _downPos = Offset.zero;
   Offset _lastPos = Offset.zero;
   DateTime _downTime = DateTime.now();
@@ -239,23 +241,28 @@ class _ScreenPageState extends State<ScreenPage> {
     _client.send('input', {'action': action, 'button': 'left'});
   }
 
-  void _scroll(double dy) {
-    _client.send('input', {'action': 'scroll', 'dx': 0, 'dy': dy});
+  void _scroll(double dx, double dy) {
+    _client.send('input', {'action': 'scroll', 'dx': dx, 'dy': dy});
   }
 
-  /// Per-move delta handler for the `dragging` state: touchpad mode queues
-  /// normalized `move_rel` deltas, scroll mode accumulates wheel ticks.
-  /// Identical logic to the old onPanUpdate.
+  /// Per-move delta while dragging with one finger: queue normalized
+  /// `move_rel` deltas (touchpad cursor movement).
   void _applyDragDelta(Offset delta) {
-    if (_mode == _TouchMode.scroll) {
-      _scrollAccum += delta.dy;
-      while (_scrollAccum.abs() >= _scrollThreshold) {
-        // Finger down = content up = wheel up = negative dy.
-        _scroll(_scrollAccum > 0 ? -1 : 1);
-        _scrollAccum -= _scrollThreshold * _scrollAccum.sign;
-      }
-    } else {
-      _queueMoveRel(delta);
+    _queueMoveRel(delta);
+  }
+
+  /// Two-finger drag, like a laptop touchpad: finger down = content up
+  /// (wheel up), on both axes.
+  void _applyTwoFingerDelta(Offset delta) {
+    _scrollAccum += delta.dy;
+    _scrollAccumX += delta.dx;
+    while (_scrollAccum.abs() >= _scrollThreshold) {
+      _scroll(0, _scrollAccum > 0 ? -1 : 1);
+      _scrollAccum -= _scrollThreshold * _scrollAccum.sign;
+    }
+    while (_scrollAccumX.abs() >= _scrollThreshold) {
+      _scroll(_scrollAccumX > 0 ? -1 : 1, 0);
+      _scrollAccumX -= _scrollThreshold * _scrollAccumX.sign;
     }
   }
 
@@ -263,13 +270,29 @@ class _ScreenPageState extends State<ScreenPage> {
     // A new touch while idle always takes control. Fingers that went down
     // mid-gesture (a resting palm) are simply ignored, so they can never
     // lock out a deliberate touch.
-    if (_gesture != _GestureState.idle) return;
-    _pointerId = event.pointer;
-    _gesture = _GestureState.pressing;
-    _downPos = event.localPosition;
-    _lastPos = event.localPosition;
-    _downTime = DateTime.now();
-    _lpTimer = Timer(_longPressDelay, _onLongPressTimer);
+    if (_gesture == _GestureState.idle) {
+      _pointerId = event.pointer;
+      _gesture = _GestureState.pressing;
+      _downPos = event.localPosition;
+      _lastPos = event.localPosition;
+      _downTime = DateTime.now();
+      _lpTimer = Timer(_longPressDelay, _onLongPressTimer);
+      return;
+    }
+    // Second finger mid-gesture → laptop-style two-finger scroll.
+    if (!_twoFinger && _secondPointerId == null) {
+      _secondPointerId = event.pointer;
+      _secondPos = event.localPosition;
+      _twoFinger = true;
+      _cancelLpTimer();
+      _scrollAccum = 0;
+      _scrollAccumX = 0;
+      // A not-yet-committed primary can't turn into tap/long-press anymore.
+      if (_gesture == _GestureState.pressing ||
+          _gesture == _GestureState.longPressPending) {
+        _gesture = _GestureState.dragging;
+      }
+    }
   }
 
   void _onLongPressTimer() {
@@ -281,6 +304,20 @@ class _ScreenPageState extends State<ScreenPage> {
   }
 
   void _onPointerMove(PointerMoveEvent event) {
+    if (_twoFinger) {
+      Offset delta;
+      if (event.pointer == _pointerId) {
+        delta = event.localPosition - _lastPos;
+        _lastPos = event.localPosition;
+      } else if (event.pointer == _secondPointerId) {
+        delta = event.localPosition - _secondPos;
+        _secondPos = event.localPosition;
+      } else {
+        return;
+      }
+      _applyTwoFingerDelta(delta);
+      return;
+    }
     if (event.pointer != _pointerId) return;
     final pos = event.localPosition;
     switch (_gesture) {
@@ -310,6 +347,10 @@ class _ScreenPageState extends State<ScreenPage> {
   }
 
   void _onPointerUp(PointerUpEvent event) {
+    if (_twoFinger) {
+      _endTwoFinger(event.pointer);
+      return;
+    }
     if (event.pointer != _pointerId) return;
     _cancelLpTimer();
     switch (_gesture) {
@@ -330,11 +371,41 @@ class _ScreenPageState extends State<ScreenPage> {
   }
 
   void _onPointerCancel(PointerCancelEvent event) {
+    if (_twoFinger) {
+      _endTwoFinger(event.pointer);
+      return;
+    }
     if (event.pointer != _pointerId) return;
     _cancelLpTimer();
     // Up-without-action: only release the button if a drag-select held it.
     if (_gesture == _GestureState.dragSelect) _button('up');
     _resetGesture();
+  }
+
+  /// One of the two fingers lifted during a two-finger scroll: the gesture
+  /// continues with the remaining finger (rebaselined, so no cursor jump).
+  void _endTwoFinger(int pointer) {
+    if (pointer == _secondPointerId) {
+      _secondPointerId = null;
+      _twoFinger = false;
+      // Continue with the primary finger: a still-under-slop press becomes
+      // a fresh press (a clean release can still tap), anything else stays
+      // a drag with the baseline already tracked in _lastPos.
+      if (_gesture == _GestureState.pressing ||
+          _gesture == _GestureState.longPressPending) {
+        _gesture = _GestureState.pressing;
+        _downPos = _lastPos;
+        _downTime = DateTime.now();
+      }
+    } else if (pointer == _pointerId) {
+      // Primary lifted: the second finger takes over as primary.
+      _pointerId = _secondPointerId;
+      _secondPointerId = null;
+      _twoFinger = false;
+      _lastPos = _secondPos;
+      _downPos = _secondPos;
+      _gesture = _GestureState.dragging;
+    }
   }
 
   /// A quick release under slop. The first tap clicks immediately (no wait
@@ -428,18 +499,6 @@ class _ScreenPageState extends State<ScreenPage> {
         title: const Text('Screen'),
         actions: [
           IconButton(
-            tooltip: _mode == _TouchMode.tap
-                ? 'Touchpad mode (drag moves cursor) — tap for scroll mode'
-                : 'Scroll mode (drag scrolls) — tap for touchpad mode',
-            icon: Icon(_mode == _TouchMode.tap
-                ? Icons.touch_app
-                : Icons.swap_vert),
-            onPressed: () => setState(() {
-              _mode =
-                  _mode == _TouchMode.tap ? _TouchMode.scroll : _TouchMode.tap;
-            }),
-          ),
-          IconButton(
             tooltip: 'Keyboard',
             icon: const Icon(Icons.keyboard),
             onPressed: _openKeyboard,
@@ -527,9 +586,7 @@ class _ScreenPageState extends State<ScreenPage> {
                           padding: const EdgeInsets.symmetric(
                               horizontal: 14, vertical: 6),
                           child: Text(
-                            _mode == _TouchMode.tap
-                                ? 'Drag to move cursor • Tap to click • Hold for right-click'
-                                : 'Drag to scroll • Tap to click • Hold for right-click',
+                            'Drag to move cursor • Two fingers to scroll • Tap to click • Hold for right-click',
                             style: const TextStyle(
                                 color: Colors.white70, fontSize: 12),
                           ),

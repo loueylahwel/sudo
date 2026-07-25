@@ -1,4 +1,4 @@
-package io.github.loueylahwel.rein
+package io.github.loueylahwel.sudo
 
 import android.content.ContentValues
 import android.os.Build
@@ -45,7 +45,7 @@ class MainActivity : FlutterActivity() {
             put(MediaStore.Downloads.DISPLAY_NAME, name)
             put(
                 MediaStore.Downloads.RELATIVE_PATH,
-                Environment.DIRECTORY_DOWNLOADS + File.separator + "Rein",
+                Environment.DIRECTORY_DOWNLOADS + File.separator + "Sudo",
             )
             put(MediaStore.Downloads.IS_PENDING, 1)
         }

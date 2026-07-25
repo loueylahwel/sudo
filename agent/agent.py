@@ -67,16 +67,20 @@ def ensure_single_instance():
 def _default_config_path():
     if platform.system() == "Windows":
         base = Path(os.environ.get("APPDATA", str(Path.home())))
-        new = base / "Rein" / "config.json"
-        old = base / "PCocket" / "config.json"
-        if not new.exists() and old.exists():
-            try:  # one-time migration from the PCocket days
-                new.parent.mkdir(parents=True, exist_ok=True)
-                new.write_text(old.read_text())
-            except OSError:
-                return old
+        new = base / "Sudo" / "config.json"
+        if not new.exists():
+            # one-time migration chain: PCocket -> Rein -> Sudo
+            for old_name in ("Rein", "PCocket"):
+                old = base / old_name / "config.json"
+                if old.exists():
+                    try:
+                        new.parent.mkdir(parents=True, exist_ok=True)
+                        new.write_text(old.read_text())
+                    except OSError:
+                        return old
+                    break
         return new
-    return Path.home() / ".config" / "rein" / "config.json"
+    return Path.home() / ".config" / "sudo" / "config.json"
 
 
 # A config.json next to the script/exe wins (dev flow); otherwise use the
@@ -529,6 +533,20 @@ def sys_info():
 
 # ---------------------------------------------------------------- power
 
+def power_unlock(pin):
+    """Unlock the PC by typing the PIN/password at the lock screen.
+
+    This simulates keyboard input: any key to dismiss the lock curtain, then
+    type the PIN and Enter. It cannot bypass an enforced Ctrl+Alt+Del
+    prompt (the secure desktop ignores injected input by design)."""
+    kb.press(Key.space)
+    kb.release(Key.space)
+    time.sleep(1.2)  # let the sign-in field appear
+    kb.type(pin)
+    kb.press(Key.enter)
+    kb.release(Key.enter)
+
+
 def power(action):
     system = platform.system()
     cmds = {
@@ -781,7 +799,14 @@ class Agent:
         return {}
 
     async def h_power(self, msg):
-        return power(msg.get("action", "lock"))
+        action = msg.get("action", "lock")
+        if action == "unlock":
+            pin = msg.get("pin", "")
+            if not pin:
+                raise ValueError("unlock needs the PC PIN/password in 'pin'")
+            await asyncio.to_thread(power_unlock, pin)
+            return {"action": "unlock", "scheduled": True}
+        return power(action)
 
     async def h_media(self, msg):
         do_key(msg.get("action", "media_play_pause"))
@@ -891,7 +916,7 @@ class Agent:
             print(f"[agent] discovery beacon disabled: {e}")
             return
         port = urlparse(self.cfg["relay"]).port or 8080
-        msg = f"REIN|{self.cfg['name']}|{port}".encode()
+        msg = f"SUDO|{self.cfg['name']}|{port}".encode()
         while True:
             transport.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
             await asyncio.sleep(3)
@@ -1047,7 +1072,7 @@ def pairing_payload(cfg):
         # the app prefers it whenever phone and PC share a network, skipping
         # the internet round-trip that makes screen sharing laggy
         lan = f"ws://{lan_ip()}:8080"
-    payload = f"rein://pair?relay={quote(relay, safe='')}&code={cfg['code']}"
+    payload = f"sudo://pair?relay={quote(relay, safe='')}&code={cfg['code']}"
     if lan:
         payload += f"&lan={quote(lan, safe='')}"
     return payload
@@ -1083,7 +1108,7 @@ def ensure_startup_shortcut():
     if not getattr(sys, "frozen", False) or platform.system() != "Windows":
         return
     link = Path(os.environ.get("APPDATA", "")) / (
-        r"Microsoft\Windows\Start Menu\Programs\Startup\Rein-Service.lnk")
+        r"Microsoft\Windows\Start Menu\Programs\Startup\Sudo-Service.lnk")
     if link.exists():
         return
     ps = ("$s=(New-Object -ComObject WScript.Shell)"
@@ -1105,7 +1130,7 @@ def main():
     ensure_startup_shortcut()
     cfg = load_config()
     print("=" * 52)
-    print("  Rein agent")
+    print("  Sudo agent")
     print(f"  PC name : {cfg['name']}")
     print(f"  Pairing code : {cfg['code']}")
     print(f"  Relay : {cfg['relay']}")

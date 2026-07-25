@@ -1,4 +1,4 @@
-name: rein
+name: sudo
 description: "Control your Windows PC from your phone over your local network."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.

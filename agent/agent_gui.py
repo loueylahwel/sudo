@@ -1,11 +1,11 @@
-"""Rein Agent — the normal-user way to run the agent.
+"""Sudo Agent — the normal-user way to run the agent.
 
 Double-click the exe (or `python agent_gui.py`): a small window shows the
 pairing QR immediately. No terminal, no Python install needed when frozen
-with PyInstaller. Scan the QR with the Rein phone app and you're connected.
+with PyInstaller. Scan the QR with the Sudo phone app and you're connected.
 
 Build the exe:
-    pyinstaller --noconsole --onefile --name Rein-Agent --icon rein.ico agent_gui.py
+    pyinstaller --noconsole --onefile --name Sudo-Agent --icon sudo.ico agent_gui.py
 """
 
 import asyncio
@@ -36,7 +36,7 @@ STARTUP_DIR = (
     Path(os.environ.get("APPDATA", ""))
     / r"Microsoft\Windows\Start Menu\Programs\Startup"
 )
-STARTUP_LINK = STARTUP_DIR / "Rein-Agent.lnk"
+STARTUP_LINK = STARTUP_DIR / "Sudo-Agent.lnk"
 
 
 def startup_enabled():
@@ -67,13 +67,13 @@ class AgentGui:
         self.root = root
         self.cfg = load_config()
 
-        root.title("Rein")
+        root.title("Sudo")
         root.configure(bg=BG)
         root.resizable(False, False)
 
-        tk.Label(root, text="Rein", bg=BG, fg=FG,
+        tk.Label(root, text="Sudo", bg=BG, fg=FG,
                  font=("Segoe UI", 20, "bold")).pack(pady=(18, 2))
-        tk.Label(root, text="Scan with the Rein phone app",
+        tk.Label(root, text="Scan with the Sudo phone app",
                  bg=BG, fg=MUTED, font=("Segoe UI", 10)).pack()
 
         payload = pairing_payload(self.cfg)
@@ -128,7 +128,7 @@ def main():
     root = tk.Tk()
     # bundled app icon (works both frozen and from source)
     ico = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) \
-        / "rein.ico"
+        / "sudo.ico"
     if ico.exists():
         root.iconbitmap(str(ico))
     AgentGui(root)

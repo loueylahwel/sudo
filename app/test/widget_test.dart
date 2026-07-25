@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:rein/util.dart';
+import 'package:sudo/util.dart';
 
 void main() {
   test('formatBytes picks sensible units', () {

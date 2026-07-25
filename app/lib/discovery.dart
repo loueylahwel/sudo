@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-/// A PC found on the local network via the Rein agent's UDP broadcast.
+/// A PC found on the local network via the Sudo agent's UDP broadcast.
 class DiscoveredPc {
   DiscoveredPc({required this.name, required this.ip, required this.port});
 
@@ -22,7 +22,7 @@ class DiscoveredPc {
 /// Listens for the PC agent's UDP broadcasts for [duration] and returns the
 /// PCs that announced themselves, deduplicated by sender IP.
 ///
-/// The agent broadcasts `REIN|<pc-name>|<relay-port>` (plain UTF-8) to
+/// The agent broadcasts `SUDO|<pc-name>|<relay-port>` (plain UTF-8) to
 /// 255.255.255.255:[port] every few seconds. Receiving broadcasts needs no
 /// extra Android permission. Returns an empty list when the socket cannot be
 /// opened or nothing answers in time; the socket is always closed.
@@ -53,7 +53,7 @@ Future<List<DiscoveredPc>> discoverPcs({
       return;
     }
     final parts = text.split('|');
-    if (parts.length != 3 || parts[0] != 'REIN') return;
+    if (parts.length != 3 || parts[0] != 'SUDO') return;
     final relayPort = int.tryParse(parts[2].trim());
     if (relayPort == null) return;
     final ip = dg.address.address;

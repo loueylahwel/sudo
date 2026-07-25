@@ -82,7 +82,7 @@ class RelayException implements Exception {
   String toString() => message;
 }
 
-/// Wraps the WebSocket connection to the relay and speaks the Rein
+/// Wraps the WebSocket connection to the relay and speaks the Sudo
 /// wire protocol: pair handshake, id-matched request/response, fire-and-forget
 /// sends and pushed events.
 class RelayClient {
@@ -136,9 +136,12 @@ class RelayClient {
     } catch (e) {
       _channel = null;
       try {
-        await channel.sink.close();
+        // On a blackholed socket (stale IP after a network switch) an
+        // unbounded close() never completes and would hang the caller
+        // forever — bound it.
+        await channel.sink.close().timeout(const Duration(seconds: 2));
       } catch (_) {
-        // Socket already gone; nothing to do.
+        // Socket already gone, or close timed out; either way, move on.
       }
       throw RelayException('Could not connect to $relayUrl');
     }
@@ -248,9 +251,9 @@ class RelayClient {
     _channel = null;
     if (channel != null) {
       try {
-        await channel.sink.close();
+        await channel.sink.close().timeout(const Duration(seconds: 2));
       } catch (_) {
-        // Socket already gone; nothing to do.
+        // Socket already gone, or close timed out on a dead link.
       }
     }
     _failPending('Disconnected');

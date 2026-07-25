@@ -53,6 +53,9 @@ class _HomePageState extends State<HomePage> {
   static const int _maxReconnectAttempts = 5;
   static const int _maxReconnectDelaySecs = 30;
 
+  // Temporary diagnostics for the network-switch bug (visible in logcat).
+  void _dbg(String msg) => debugPrint('[Sudo] $msg');
+
   @override
   void initState() {
     super.initState();
@@ -117,6 +120,8 @@ class _HomePageState extends State<HomePage> {
     var secs = 3 << _reconnectAttempts; // 3, 6, 12, 24, 48…
     if (secs > _maxReconnectDelaySecs) secs = _maxReconnectDelaySecs;
     _reconnectAttempts++;
+    _dbg('reconnect attempt $_reconnectAttempts in ${secs}s '
+        '(device=${device.relayUrl})');
     setState(() => _reconnecting = true);
     _reconnectTimer = Timer(Duration(seconds: secs), () {
       _reconnectTimer = null;
@@ -130,6 +135,7 @@ class _HomePageState extends State<HomePage> {
   /// header shows "Reconnecting…"), and a failure schedules the next attempt
   /// instead of showing an error.
   Future<void> _connect(SavedDevice device, {bool auto = false}) async {
+    _dbg('_connect(auto=$auto) to ${device.relayUrl} name=${device.name}');
     if (!auto) _cancelReconnect();
     _tearDownClient();
     setState(() {
@@ -140,40 +146,79 @@ class _HomePageState extends State<HomePage> {
       _sysInfo = null;
       _viaText = null;
     });
-    final client = RelayClient();
-    _connSub = client.connectionState.listen((up) {
-      if (!mounted) return;
-      setState(() => _socketUp = up);
-      // Only the live client can trigger a reconnect: a drop reported while
-      // a (re)connect is still in flight (client not yet assigned to
-      // _client) is handled by that attempt's own failure path.
-      if (!up && identical(client, _client)) _scheduleReconnect();
-    });
-    _eventSub = client.events.listen(_onEvent);
+    RelayClient? winner;
+    var current = device;
+    PairResult? result;
 
-    Future<PairResult?> tryConnect(SavedDevice d) async {
+    Future<PairResult?> attempt(RelayClient c, SavedDevice d) async {
       try {
-        return await connectAndPair(client,
-            relayUrl: d.relayUrl,
-            code: d.code,
-            timeout: const Duration(seconds: 5));
-      } catch (_) {
-        await client.disconnect();
+        // Hard OUTER timeout: on a blackholed address (phone switched
+        // networks) inner socket timeouts have proven unreliable — a
+        // connect attempt hung forever and froze the whole retry loop.
+        return await connectAndPair(c,
+                relayUrl: d.relayUrl,
+                code: d.code,
+                timeout: const Duration(seconds: 4))
+            .timeout(const Duration(seconds: 6));
+      } catch (e) {
+        _dbg('connect to ${d.relayUrl} failed: $e');
+        unawaited(
+            c.disconnect().timeout(const Duration(seconds: 2), onTimeout: () {}));
         return null;
       }
     }
 
-    var current = device;
-    PairResult? result;
     if (auto) {
-      // Recovery after a network switch: the saved address is almost
-      // certainly stale, so rediscover FIRST — discovery is fast (~4s) and
-      // reliable, while a dead address just burns a 5s timeout per attempt.
-      final rediscovered = await _rediscover(current);
-      if (rediscovered != null) current = rediscovered;
-      result = await tryConnect(current);
+      // Recovery after a network switch: race the saved address against a
+      // fresh discovery — first success wins; if both fail we're out in
+      // ~6s instead of hanging or grinding sequential timeouts.
+      final race = Completer<void>();
+      var failures = 0;
+      final c1 = RelayClient();
+      final c2 = RelayClient();
+      void win(RelayClient c, PairResult r) {
+        if (race.isCompleted) return;
+        winner = c;
+        result = r;
+        race.complete();
+      }
+
+      void lose() {
+        if (++failures == 2 && !race.isCompleted) race.complete();
+      }
+
+      unawaited(attempt(c1, current).then((r) {
+        if (r != null) {
+          win(c1, r);
+        } else {
+          lose();
+        }
+      }));
+      unawaited(() async {
+        final rd = await _rediscover(current);
+        if (rd == null) {
+          lose();
+          return;
+        }
+        current = rd;
+        final r = await attempt(c2, rd);
+        if (r != null) {
+          win(c2, r);
+        } else {
+          lose();
+        }
+      }());
+      await race.future.timeout(const Duration(seconds: 12), onTimeout: () {});
+      for (final c in [c1, c2]) {
+        if (!identical(c, winner)) {
+          unawaited(c
+              .disconnect()
+              .timeout(const Duration(seconds: 2), onTimeout: () {}));
+        }
+      }
     } else {
-      result = await tryConnect(current);
+      final client = RelayClient();
+      result = await attempt(client, current);
       if (result == null) {
         // The saved address is stale (e.g. the PC got a new IP after a DHCP
         // renewal): discover PCs on the LAN once and retry the same PC,
@@ -181,12 +226,19 @@ class _HomePageState extends State<HomePage> {
         final rediscovered = await _rediscover(current);
         if (rediscovered != null) {
           current = rediscovered;
-          result = await tryConnect(current);
+          result = await attempt(client, current);
         }
       }
+      if (result != null) {
+        winner = client;
+      } else {
+        unawaited(client
+            .disconnect()
+            .timeout(const Duration(seconds: 2), onTimeout: () {}));
+      }
     }
-    if (result == null) {
-      unawaited(client.disconnect());
+
+    if (result == null || winner == null) {
       if (!mounted) return;
       setState(() {
         _connecting = false;
@@ -204,10 +256,20 @@ class _HomePageState extends State<HomePage> {
       }
       return;
     }
+    final client = winner!;
+    _connSub = client.connectionState.listen((up) {
+      if (!mounted) return;
+      setState(() => _socketUp = up);
+      // Only the live client can trigger a reconnect: a drop reported while
+      // a (re)connect is still in flight (client not yet assigned to
+      // _client) is handled by that attempt's own failure path.
+      if (!up && identical(client, _client)) _scheduleReconnect();
+    });
+    _eventSub = client.events.listen(_onEvent);
     _client = client;
     ClientRegistry.instance.set(client);
     if (!mounted) return;
-    final usedHost = Uri.tryParse(result.usedUrl)?.host ?? result.usedUrl;
+    final usedHost = Uri.tryParse(result!.usedUrl)?.host ?? result!.usedUrl;
     setState(() {
       _selected = current;
       _connecting = false;
@@ -232,14 +294,19 @@ class _HomePageState extends State<HomePage> {
     List<DiscoveredPc> found;
     try {
       found = await discoverPcs();
-    } catch (_) {
+    } catch (e) {
+      _dbg('discovery error: $e');
       return null;
     }
     if (!mounted) return null;
+    _dbg('discovery found: ${found.map((p) => '${p.name}@${p.relayUrl}').toList()}');
     final name = device.name.toLowerCase();
     final matches =
         found.where((pc) => pc.name.toLowerCase() == name).toList();
-    if (matches.isEmpty) return null;
+    if (matches.isEmpty) {
+      _dbg('rediscover: no PC named "$name" among ${found.length} found');
+      return null;
+    }
     final pc = matches.first;
     if (pc.relayUrl == device.relayUrl) return device;
     final updated = SavedDevice(
@@ -391,6 +458,62 @@ class _HomePageState extends State<HomePage> {
     if (confirmed != true) return;
     await _runCommand('power', {'action': action});
     if (mounted) showMessage(context, '$label command sent');
+  }
+
+  /// Unlocks the PC: the agent types the PIN/password at the Windows lock
+  /// screen. Unlike [_power] there is no confirmation step — the dialog
+  /// itself collects the credentials.
+  Future<void> _unlock() async {
+    final client = _client;
+    if (client == null) return;
+    final ctrl = TextEditingController();
+    final pin = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Unlock PC'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+                'Types your PIN or password at the Windows lock screen to sign you in.'),
+            const SizedBox(height: 12),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: 'PIN or password',
+                border: OutlineInputBorder(),
+              ),
+              onSubmitted: (value) => Navigator.pop(ctx, value),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              "Won't work if your PC requires Ctrl+Alt+Del to sign in.",
+              style: TextStyle(color: Theme.of(ctx).hintColor, fontSize: 12),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text),
+            child: const Text('Unlock'),
+          ),
+        ],
+      ),
+    );
+    if (pin == null || pin.isEmpty) return;
+    try {
+      await client.request('power', {'action': 'unlock', 'pin': pin});
+      if (mounted) showMessage(context, 'Unlock command sent');
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
   }
 
   @override
@@ -627,6 +750,37 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// Compact icon button for the quick-action rows: 40x40 effective size
+  /// (22px icon + 4px padding under compact density), so a full row of
+  /// them fits on one line on a ~360px-wide phone.
+  Widget _quickAction({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onPressed,
+  }) {
+    return IconButton(
+      tooltip: tooltip,
+      iconSize: 22,
+      padding: const EdgeInsets.all(4),
+      visualDensity: VisualDensity.compact,
+      icon: Icon(icon),
+      onPressed: onPressed,
+    );
+  }
+
+  /// Spreads quick-action buttons across the card on a single line. The
+  /// per-button FittedBox is a last-resort guard that scales buttons down
+  /// instead of overflowing on very narrow screens.
+  Widget _oneLineRow(List<Widget> buttons) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        for (final button in buttons)
+          Flexible(child: FittedBox(fit: BoxFit.scaleDown, child: button)),
+      ],
+    );
+  }
+
   Widget _buildMediaCard(ThemeData theme) {
     return Card(
       child: Padding(
@@ -635,49 +789,44 @@ class _HomePageState extends State<HomePage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text('Media', style: theme.textTheme.titleSmall),
-            Wrap(
-              spacing: 8,
-              runSpacing: 4,
-              children: [
-                IconButton(
-                  tooltip: 'Previous',
-                  icon: const Icon(Icons.skip_previous),
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_previous'}),
-                ),
-                IconButton(
-                  tooltip: 'Play / pause',
-                  iconSize: 36,
-                  icon: const Icon(Icons.play_arrow),
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_play_pause'}),
-                ),
-                IconButton(
-                  tooltip: 'Next',
-                  icon: const Icon(Icons.skip_next),
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_next'}),
-                ),
-                IconButton(
-                  tooltip: 'Volume down',
-                  icon: const Icon(Icons.volume_down),
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_volume_down'}),
-                ),
-                IconButton(
-                  tooltip: 'Volume up',
-                  icon: const Icon(Icons.volume_up),
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_volume_up'}),
-                ),
-                IconButton(
-                  tooltip: 'Mute',
-                  icon: const Icon(Icons.volume_off),
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_volume_mute'}),
-                ),
-              ],
-            ),
+            _oneLineRow([
+              _quickAction(
+                tooltip: 'Previous',
+                icon: Icons.skip_previous,
+                onPressed: () =>
+                    _runCommand('media', {'action': 'media_previous'}),
+              ),
+              _quickAction(
+                tooltip: 'Play / pause',
+                icon: Icons.play_arrow,
+                onPressed: () =>
+                    _runCommand('media', {'action': 'media_play_pause'}),
+              ),
+              _quickAction(
+                tooltip: 'Next',
+                icon: Icons.skip_next,
+                onPressed: () =>
+                    _runCommand('media', {'action': 'media_next'}),
+              ),
+              _quickAction(
+                tooltip: 'Volume down',
+                icon: Icons.volume_down,
+                onPressed: () =>
+                    _runCommand('media', {'action': 'media_volume_down'}),
+              ),
+              _quickAction(
+                tooltip: 'Volume up',
+                icon: Icons.volume_up,
+                onPressed: () =>
+                    _runCommand('media', {'action': 'media_volume_up'}),
+              ),
+              _quickAction(
+                tooltip: 'Mute',
+                icon: Icons.volume_off,
+                onPressed: () =>
+                    _runCommand('media', {'action': 'media_volume_mute'}),
+              ),
+            ]),
           ],
         ),
       ),
@@ -693,22 +842,18 @@ class _HomePageState extends State<HomePage> {
           children: [
             Text('Clipboard', style: theme.textTheme.titleSmall),
             const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                FilledButton.tonalIcon(
-                  onPressed: _pasteFromPc,
-                  icon: const Icon(Icons.content_paste),
-                  label: const Text('Paste from PC'),
-                ),
-                FilledButton.tonalIcon(
-                  onPressed: _sendToPc,
-                  icon: const Icon(Icons.send_to_mobile),
-                  label: const Text('Send to PC'),
-                ),
-              ],
-            ),
+            _oneLineRow([
+              FilledButton.tonalIcon(
+                onPressed: _pasteFromPc,
+                icon: const Icon(Icons.content_paste),
+                label: const Text('Paste from PC'),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: _sendToPc,
+                icon: const Icon(Icons.send_to_mobile),
+                label: const Text('Send to PC'),
+              ),
+            ]),
           ],
         ),
       ),
@@ -724,34 +869,35 @@ class _HomePageState extends State<HomePage> {
           children: [
             Text('Power', style: theme.textTheme.titleSmall),
             const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                OutlinedButton.icon(
-                  onPressed: () => _power('lock', 'Lock'),
-                  icon: const Icon(Icons.lock_outline),
-                  label: const Text('Lock'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => _power('sleep', 'Sleep'),
-                  icon: const Icon(Icons.bedtime_outlined),
-                  label: const Text('Sleep'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () =>
-                      _power('restart', 'Restart', dangerous: true),
-                  icon: const Icon(Icons.restart_alt),
-                  label: const Text('Restart'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () =>
-                      _power('shutdown', 'Shut down', dangerous: true),
-                  icon: const Icon(Icons.power_settings_new),
-                  label: const Text('Shut down'),
-                ),
-              ],
-            ),
+            _oneLineRow([
+              _quickAction(
+                tooltip: 'Lock',
+                icon: Icons.lock_outline,
+                onPressed: () => _power('lock', 'Lock'),
+              ),
+              _quickAction(
+                tooltip: 'Unlock',
+                icon: Icons.lock_open,
+                onPressed: _unlock,
+              ),
+              _quickAction(
+                tooltip: 'Sleep',
+                icon: Icons.bedtime_outlined,
+                onPressed: () => _power('sleep', 'Sleep'),
+              ),
+              _quickAction(
+                tooltip: 'Restart',
+                icon: Icons.restart_alt,
+                onPressed: () =>
+                    _power('restart', 'Restart', dangerous: true),
+              ),
+              _quickAction(
+                tooltip: 'Shut down',
+                icon: Icons.power_settings_new,
+                onPressed: () =>
+                    _power('shutdown', 'Shut down', dangerous: true),
+              ),
+            ]),
           ],
         ),
       ),
@@ -761,45 +907,54 @@ class _HomePageState extends State<HomePage> {
   Widget _buildSysInfoCard(ThemeData theme) {
     final info = _sysInfo;
     return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Text('System', style: theme.textTheme.titleMedium),
-                const Spacer(),
-                if (_sysInfoLoading)
-                  const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                else
-                  IconButton(
-                    tooltip: 'Refresh',
-                    icon: const Icon(Icons.refresh),
-                    onPressed: _refreshSysInfo,
-                  ),
-              ],
-            ),
-            if (info == null)
-              const Text('No data yet')
-            else ...[
-              _InfoRow('Name', '${info['name'] ?? '?'}'),
-              _InfoRow('Platform', '${info['platform'] ?? '?'}'),
-              _InfoRow('CPU',
-                  '${(info['cpu_percent'] as num?)?.toStringAsFixed(0) ?? '?'}%'),
-              _InfoRow(
-                'RAM',
-                '${formatBytes((info['mem_used'] as num?) ?? 0)} / '
-                    '${formatBytes((info['mem_total'] as num?) ?? 0)}',
+      // The whole card doubles as a refresh button (the icon stays too).
+      child: InkWell(
+        onTap: _refreshSysInfo,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Text('System', style: theme.textTheme.titleMedium),
+                  const Spacer(),
+                  if (_sysInfoLoading)
+                    const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  else
+                    IconButton(
+                      tooltip: 'Refresh',
+                      icon: const Icon(Icons.refresh),
+                      onPressed: _refreshSysInfo,
+                    ),
+                ],
               ),
-              _InfoRow('Uptime',
-                  formatUptime((info['uptime'] as num?) ?? 0)),
+              if (info == null)
+                const Text('No data yet')
+              else ...[
+                _InfoRow('Name', '${info['name'] ?? '?'}'),
+                _InfoRow('Platform', '${info['platform'] ?? '?'}'),
+                _InfoRow(
+                  'CPU',
+                  '${(info['cpu_percent'] as num?)?.toStringAsFixed(0) ?? '?'}%',
+                  strong: true,
+                ),
+                _InfoRow(
+                  'RAM',
+                  '${formatBytes((info['mem_used'] as num?) ?? 0)} / '
+                      '${formatBytes((info['mem_total'] as num?) ?? 0)}',
+                  strong: true,
+                ),
+                _InfoRow('Uptime',
+                    formatUptime((info['uptime'] as num?) ?? 0)),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
@@ -848,10 +1003,14 @@ class _ControlCard extends StatelessWidget {
 }
 
 class _InfoRow extends StatelessWidget {
-  const _InfoRow(this.label, this.value);
+  const _InfoRow(this.label, this.value, {this.strong = false});
 
   final String label;
   final String value;
+
+  /// Renders the value with slightly stronger typography (used for the
+  /// live CPU/RAM numbers).
+  final bool strong;
 
   @override
   Widget build(BuildContext context) {
@@ -864,7 +1023,14 @@ class _InfoRow extends StatelessWidget {
             child: Text(label,
                 style: TextStyle(color: Theme.of(context).hintColor)),
           ),
-          Expanded(child: Text(value)),
+          Expanded(
+            child: Text(
+              value,
+              style: strong
+                  ? const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)
+                  : null,
+            ),
+          ),
         ],
       ),
     );

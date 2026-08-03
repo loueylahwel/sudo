@@ -28,6 +28,17 @@ class ScreenFrame {
   final String src;
 }
 
+/// One `H264` binary packet: the JSON header (carries `w`, `h`, `codec`,
+/// `encoder`, `fps`) plus the raw H.264 Annex-B bytestream chunk that
+/// followed it. Chunks are arbitrary splits of one continuous bytestream
+/// (SPS/PPS lead it); they must be fed, in order, to the platform decoder.
+class VideoChunk {
+  VideoChunk(this.header, this.data);
+
+  final Map<String, dynamic> header;
+  final Uint8List data;
+}
+
 /// Outcome of [connectAndPair]: the `paired` handshake reply plus the
 /// address that was used.
 class PairResult {
@@ -60,16 +71,27 @@ class ChooseDeviceException implements Exception {
 
 /// Connects [client] to [relayUrl] (e.g. `ws://192.168.1.10:8080`) and pairs
 /// it. When [code] is null or empty a codeless pair is sent (no `code`
-/// field). [timeout] bounds the socket connect; the pair handshake has its
-/// own reply timeout (see [RelayClient.pair]).
+/// field). [token] is the trust credential issued on an earlier pairing;
+/// when given it is sent along and the pair completes without an on-PC
+/// approval prompt. [timeout] bounds the socket connect; the pair handshake
+/// has its own reply timeout (see [RelayClient.pair]). [onApprovalPending]
+/// fires when the relay asks the user to approve the connection on the PC
+/// (see [RelayClient.pair]).
 Future<PairResult> connectAndPair(
   RelayClient client, {
   required String relayUrl,
   String? code,
+  String? token,
+  String? name,
   Duration? timeout,
+  void Function()? onApprovalPending,
 }) async {
   await client.connect(relayUrl, timeout: timeout);
-  final paired = await client.pair(code: code);
+  final paired = await client.pair(
+      code: code,
+      token: token,
+      name: name,
+      onApprovalPending: onApprovalPending);
   return PairResult(paired, relayUrl);
 }
 
@@ -98,6 +120,8 @@ class RelayClient {
       StreamController<RelayEvent>.broadcast();
   final StreamController<ScreenFrame> _framesCtrl =
       StreamController<ScreenFrame>.broadcast();
+  final StreamController<VideoChunk> _videoChunksCtrl =
+      StreamController<VideoChunk>.broadcast();
   final StreamController<bool> _connCtrl = StreamController<bool>.broadcast();
   final StreamController<Map<String, dynamic>> _commandsCtrl =
       StreamController<Map<String, dynamic>>.broadcast();
@@ -118,6 +142,10 @@ class RelayClient {
   /// [ScreenFrame.src] to route them. Frames may stop arriving while the
   /// source is idle — consumers should keep showing the last one.
   Stream<ScreenFrame> get screenFrames => _framesCtrl.stream;
+
+  /// Binary `H264` packets from `screen.start` with `codec: 'h264'`: raw
+  /// Annex-B bytestream chunks for the hardware decoder, in wire order.
+  Stream<VideoChunk> get videoChunks => _videoChunksCtrl.stream;
 
   /// Emits `true` when the socket comes up, `false` when it drops.
   Stream<bool> get connectionState => _connCtrl.stream;
@@ -159,9 +187,26 @@ class RelayClient {
   /// omitted and the relay pairs to the single online agent; if several are
   /// online it replies `{type:"choose"}` and this throws
   /// [ChooseDeviceException] with the candidates. `{type:"error"}` throws
-  /// [RelayException]. Throws after [timeout] (default 20s) with no reply.
+  /// [RelayException] (e.g. `denied on this PC` when the user rejects the
+  /// approval dialog on the PC). Throws after [timeout] (default 20s) with
+  /// no reply.
+  ///
+  /// [token] is the trust credential a newer agent issued on an earlier
+  /// pairing (the `token` field of `paired`); when given it is sent along
+  /// and the pair completes instantly, without an approval prompt.
+  ///
+  /// Agents with `require_approval` answer an unknown phone with
+  /// `{type:"approval.pending"}` and show an Allow/Deny dialog on the PC
+  /// (30s auto-deny) before the final `paired`/`error`. That message is
+  /// neither success nor failure: [onApprovalPending] is called once and
+  /// the wait continues with the timeout extended to 60s so the user has
+  /// time to react on the PC.
   Future<Map<String, dynamic>> pair(
-      {String? code, Duration timeout = const Duration(seconds: 20)}) {
+      {String? code,
+      String? token,
+      String? name,
+      Duration timeout = const Duration(seconds: 20),
+      void Function()? onApprovalPending}) {
     if (!_connected) {
       return Future.error(RelayException('Not connected'));
     }
@@ -169,6 +214,7 @@ class RelayClient {
     late StreamSubscription<Map<String, dynamic>> msgSub;
     late StreamSubscription<bool> connSub;
     Timer? timer;
+    var approvalPending = false;
 
     void finish([Object? error, Map<String, dynamic>? value]) {
       timer?.cancel();
@@ -186,6 +232,18 @@ class RelayClient {
       final type = msg['type'];
       if (type == 'paired') {
         finish(null, msg);
+      } else if (type == 'approval.pending') {
+        // The PC is showing an Allow/Deny dialog (30s auto-deny). Surface
+        // the pending state and keep waiting for the final paired/error,
+        // with the reply timeout extended to 60s so the user has time to
+        // react on the PC.
+        if (!approvalPending) {
+          approvalPending = true;
+          onApprovalPending?.call();
+          timer?.cancel();
+          timer = Timer(const Duration(seconds: 60),
+              () => finish(RelayException('Pairing timed out')));
+        }
       } else if (type == 'choose') {
         final devices = <ChooseDevice>[
           for (final d in (msg['devices'] as List? ?? const []))
@@ -203,6 +261,8 @@ class RelayClient {
     _write({
       'type': 'pair',
       if (code != null && code.isNotEmpty) 'code': code,
+      if (token != null && token.isNotEmpty) 'token': token,
+      if (name != null && name.isNotEmpty) 'name': name,
     });
     return completer.future;
   }
@@ -309,20 +369,33 @@ class RelayClient {
     }
   }
 
-  /// Handles a binary WebSocket frame. Only `PJF1` screen packets are
-  /// understood; anything else is dropped.
+  /// Handles a binary WebSocket frame. `PJF1` (JPEG screen/camera) and
+  /// `H264` (hardware-decoded screen video) packets are understood;
+  /// anything else is dropped.
   ///
-  /// Layout: `[4B "PJF1"][4B LE uint32 headerLen][headerLen bytes UTF-8 JSON
-  /// header {"w","h","src"}][JPEG bytes]`. `src` is `"screen"` or `"camera"`;
-  /// a missing `src` means `"screen"` (older agents).
+  /// `PJF1` layout: `[4B "PJF1"][4B LE uint32 headerLen][headerLen bytes
+  /// UTF-8 JSON header {"w","h","src"}][JPEG bytes]`. `src` is `"screen"`
+  /// or `"camera"`; a missing `src` means `"screen"` (older agents).
+  ///
+  /// `H264` layout: `[4B "H264"][4B LE uint32 headerLen][headerLen bytes
+  /// UTF-8 JSON header {"w","h","codec","encoder","fps"}][raw Annex-B
+  /// bytestream chunk]`.
   void _onBinaryMessage(dynamic raw) {
     // web_socket_channel normally delivers Uint8List, but accept any
     // List<int> so a different implementation can't silently break us.
     if (raw is! List<int>) return;
     final bytes = raw is Uint8List ? raw : Uint8List.fromList(raw);
+    if (bytes.length < 8) return;
+    // 0x48 'H', 0x32 '2', 0x36 '6', 0x34 '4'.
+    if (bytes[0] == 0x48 &&
+        bytes[1] == 0x32 &&
+        bytes[2] == 0x36 &&
+        bytes[3] == 0x34) {
+      _onH264Packet(bytes);
+      return;
+    }
     // 0x50 'P', 0x4A 'J', 0x46 'F', 0x31 '1'.
-    if (bytes.length < 8 ||
-        bytes[0] != 0x50 ||
+    if (bytes[0] != 0x50 ||
         bytes[1] != 0x4A ||
         bytes[2] != 0x46 ||
         bytes[3] != 0x31) {
@@ -338,6 +411,22 @@ class RelayClient {
       final src = header['src'] as String? ?? 'screen';
       final jpeg = Uint8List.sublistView(bytes, 8 + headerLen);
       _framesCtrl.add(ScreenFrame(jpeg, w, h, src: src));
+    } catch (_) {
+      // Malformed packet; drop it and wait for the next one.
+    }
+  }
+
+  /// Parses one `H264` packet (see [_onBinaryMessage] for the layout) and
+  /// emits its header + bytestream chunk on [videoChunks].
+  void _onH264Packet(Uint8List bytes) {
+    final headerLen = ByteData.sublistView(bytes).getUint32(4, Endian.little);
+    if (bytes.length < 8 + headerLen) return;
+    try {
+      final headerJson = utf8.decode(bytes.sublist(8, 8 + headerLen));
+      final header = (jsonDecode(headerJson) as Map).cast<String, dynamic>();
+      final data = Uint8List.sublistView(bytes, 8 + headerLen);
+      if (data.isEmpty) return;
+      _videoChunksCtrl.add(VideoChunk(header, data));
     } catch (_) {
       // Malformed packet; drop it and wait for the next one.
     }

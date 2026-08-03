@@ -29,6 +29,9 @@ class _HomePageState extends State<HomePage> {
   StreamSubscription<RelayEvent>? _eventSub;
   StreamSubscription<bool>? _connSub;
   bool _connecting = false;
+  // True while the agent waits for the user to Allow this phone in the
+  // Allow/Deny dialog shown on the PC (approval.pending during pairing).
+  bool _approvalPending = false;
   bool _socketUp = false;
   bool _agentOnline = true;
 
@@ -143,28 +146,68 @@ class _HomePageState extends State<HomePage> {
       if (!auto) _connecting = true;
       _socketUp = false;
       _agentOnline = true;
+      _approvalPending = false;
       _sysInfo = null;
       _viaText = null;
     });
     RelayClient? winner;
     var current = device;
     PairResult? result;
+    // Last connect/pair error; surfaced when it carries the real reason
+    // (e.g. the user tapped Deny on the PC → "denied on this PC").
+    Object? failure;
+    // Set once the agent asks for approval on the PC: the dialog there
+    // auto-denies after 30s, so the waits below get a longer bound (~60s).
+    var approvalSeen = false;
+
+    void noteApprovalPending() {
+      approvalSeen = true;
+      if (mounted) setState(() => _approvalPending = true);
+    }
+
+    // The agent's denial arrives as {type:"error", error:"denied on this PC"}.
+    bool isDenial(Object? e) =>
+        e is RelayException && e.message.contains('denied');
 
     Future<PairResult?> attempt(RelayClient c, SavedDevice d) async {
+      // Hard OUTER timeout: on a blackholed address (phone switched
+      // networks) inner socket timeouts have proven unreliable — a
+      // connect attempt hung forever and froze the whole retry loop.
+      // When the PC shows an approval dialog the bound is extended: the
+      // final paired/error answer can take the dialog's full 30s.
+      Timer? outerTimer;
+      final outer = Completer<void>();
+      void armOuter(Duration duration) {
+        outerTimer?.cancel();
+        outerTimer = Timer(duration, () {
+          if (!outer.isCompleted) outer.complete();
+        });
+      }
+
+      armOuter(const Duration(seconds: 6));
       try {
-        // Hard OUTER timeout: on a blackholed address (phone switched
-        // networks) inner socket timeouts have proven unreliable — a
-        // connect attempt hung forever and froze the whole retry loop.
-        return await connectAndPair(c,
-                relayUrl: d.relayUrl,
-                code: d.code,
-                timeout: const Duration(seconds: 4))
-            .timeout(const Duration(seconds: 6));
+        return await Future.any<PairResult?>([
+          connectAndPair(c,
+              relayUrl: d.relayUrl,
+              code: d.code,
+              token: d.token,
+              name: await DeviceStore.phoneName(),
+              timeout: const Duration(seconds: 4),
+              onApprovalPending: () {
+                armOuter(const Duration(seconds: 60));
+                noteApprovalPending();
+              }),
+          outer.future.then<PairResult?>(
+              (_) => throw TimeoutException('connect attempt timed out')),
+        ]);
       } catch (e) {
         _dbg('connect to ${d.relayUrl} failed: $e');
+        failure = e;
         unawaited(
             c.disconnect().timeout(const Duration(seconds: 2), onTimeout: () {}));
         return null;
+      } finally {
+        outerTimer?.cancel();
       }
     }
 
@@ -208,7 +251,15 @@ class _HomePageState extends State<HomePage> {
           lose();
         }
       }());
-      await race.future.timeout(const Duration(seconds: 12), onTimeout: () {});
+      // Wait for a winner (or both attempts failing). While the PC shows
+      // an approval dialog the user needs time to react, so the bound
+      // stretches from 12s to ~65s (dialog auto-denies after 30s).
+      final waitStart = DateTime.now();
+      while (!race.isCompleted) {
+        final budget = Duration(seconds: approvalSeen ? 65 : 12);
+        if (DateTime.now().difference(waitStart) >= budget) break;
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+      }
       for (final c in [c1, c2]) {
         if (!identical(c, winner)) {
           unawaited(c
@@ -219,7 +270,9 @@ class _HomePageState extends State<HomePage> {
     } else {
       final client = RelayClient();
       result = await attempt(client, current);
-      if (result == null) {
+      // A denial is final — a rediscovery retry would just pop the dialog
+      // on the PC again.
+      if (result == null && !isDenial(failure)) {
         // The saved address is stale (e.g. the PC got a new IP after a DHCP
         // renewal): discover PCs on the LAN once and retry the same PC,
         // matched by its name, at the new address.
@@ -240,19 +293,27 @@ class _HomePageState extends State<HomePage> {
 
     if (result == null || winner == null) {
       if (!mounted) return;
+      // A denial is final: retrying would keep popping the dialog on the
+      // PC. Show the agent's exact reason ("denied on this PC") instead of
+      // the generic connect failure, and stop any auto-reconnect loop.
+      final denied = isDenial(failure);
       setState(() {
         _connecting = false;
         _socketUp = false;
+        _approvalPending = false;
+        if (denied) _reconnecting = false;
       });
-      if (auto && _selected != null) {
+      if (auto && !denied && _selected != null) {
         // Keep the retry loop going; _scheduleReconnect applies the next
         // backoff step and eventually gives up.
         _scheduleReconnect();
       } else {
         showError(
             context,
-            RelayException('Could not connect to '
-                '${current.name.isEmpty ? current.relayUrl : current.name}'));
+            denied
+                ? failure!
+                : RelayException('Could not connect to '
+                    '${current.name.isEmpty ? current.relayUrl : current.name}'));
       }
       return;
     }
@@ -269,10 +330,26 @@ class _HomePageState extends State<HomePage> {
     _client = client;
     ClientRegistry.instance.set(client);
     if (!mounted) return;
+    // Persist the trust credential the agent issued so future connects skip
+    // the on-PC approval prompt (older agents send none → keep the token we
+    // already had).
+    final newToken = result!.paired['token'] as String? ?? '';
+    if (newToken.isNotEmpty && newToken != current.token) {
+      current = SavedDevice(
+          relayUrl: current.relayUrl,
+          code: current.code,
+          name: current.name,
+          token: newToken);
+      // save() dedupes by code+relayUrl — same key here, so the existing
+      // entry is replaced in place.
+      await _store.save(current);
+      if (!mounted) return;
+    }
     final usedHost = Uri.tryParse(result!.usedUrl)?.host ?? result!.usedUrl;
     setState(() {
       _selected = current;
       _connecting = false;
+      _approvalPending = false;
       _reconnecting = false;
       _reconnectAttempts = 0;
       _socketUp = true;
@@ -310,7 +387,10 @@ class _HomePageState extends State<HomePage> {
     final pc = matches.first;
     if (pc.relayUrl == device.relayUrl) return device;
     final updated = SavedDevice(
-        relayUrl: pc.relayUrl, code: device.code, name: device.name);
+        relayUrl: pc.relayUrl,
+        code: device.code,
+        name: device.name,
+        token: device.token);
     // save() dedupes by code+relayUrl, so remove the stale entry first or
     // the updated address would be stored alongside it.
     await _store.delete(device);
@@ -509,13 +589,15 @@ class _HomePageState extends State<HomePage> {
     final device = _selected!;
     final theme = Theme.of(context);
     final online = _socketUp && _agentOnline;
-    final statusText = _reconnecting
-        ? 'Reconnecting…'
-        : !_socketUp
-            ? 'Disconnected'
-            : _agentOnline
-                ? 'Connected'
-                : 'PC is offline';
+    final statusText = _approvalPending
+        ? 'Waiting for approval on the PC…'
+        : _reconnecting
+            ? 'Reconnecting…'
+            : !_socketUp
+                ? 'Disconnected'
+                : _agentOnline
+                    ? 'Connected'
+                    : 'PC is offline';
     final deviceName = device.name.isEmpty ? device.code : device.name;
     return Scaffold(
       appBar: AppBar(
@@ -532,7 +614,16 @@ class _HomePageState extends State<HomePage> {
                 children: [
                   const CircularProgressIndicator(),
                   const SizedBox(height: 16),
-                  Text('Connecting to $deviceName…'),
+                  Text(_approvalPending
+                      ? 'Waiting for approval on the PC…'
+                      : 'Connecting to $deviceName…'),
+                  if (_approvalPending) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      'Tap Allow in the dialog shown on your PC.',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ],
                 ],
               ),
             )

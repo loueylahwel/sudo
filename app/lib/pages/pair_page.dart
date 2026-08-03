@@ -14,8 +14,14 @@ class PairPage extends StatefulWidget {
 
 class _PairPageState extends State<PairPage> {
   final _addrCtrl = TextEditingController();
+  final _phoneNameCtrl = TextEditingController();
   bool _busy = false;
   String? _error;
+
+  // True while the relay waits for the user to Allow this phone on the PC
+  // (agents with require_approval answer an unknown phone with
+  // "approval.pending" and show an Allow/Deny dialog there).
+  bool _approvalPending = false;
 
   // Discovery state: null = not searched yet this session.
   bool _scanning = false;
@@ -24,8 +30,17 @@ class _PairPageState extends State<PairPage> {
   bool _manualVisible = false;
 
   @override
+  void initState() {
+    super.initState();
+    DeviceStore.phoneName().then((n) {
+      if (mounted) _phoneNameCtrl.text = n;
+    });
+  }
+
+  @override
   void dispose() {
     _addrCtrl.dispose();
+    _phoneNameCtrl.dispose();
     super.dispose();
   }
 
@@ -71,16 +86,37 @@ class _PairPageState extends State<PairPage> {
     setState(() {
       _busy = true;
       _error = null;
+      _approvalPending = false;
     });
     final client = RelayClient();
     try {
+      // If this PC was paired before, send its saved trust token so the
+      // agent skips the on-PC approval prompt.
+      var token = '';
+      for (final d in await DeviceStore().load()) {
+        if (d.relayUrl == relayUrl && d.token.isNotEmpty) {
+          token = d.token;
+          break;
+        }
+      }
       final result = await connectAndPair(client,
           relayUrl: relayUrl,
           code: code,
-          timeout: const Duration(seconds: 5));
+          token: token,
+          name: await DeviceStore.phoneName(),
+          timeout: const Duration(seconds: 5),
+          onApprovalPending: () {
+            if (mounted) setState(() => _approvalPending = true);
+          });
       final name = result.paired['name'] as String? ?? relayUrl;
-      await DeviceStore()
-          .save(SavedDevice(relayUrl: relayUrl, code: code ?? '', name: name));
+      // Nothing is saved before this point: only a successful pair
+      // (`paired`) persists the device. `token` is the trust credential for
+      // prompt-free re-pairing; older agents send none, then '' is stored.
+      await DeviceStore().save(SavedDevice(
+          relayUrl: relayUrl,
+          code: code ?? '',
+          name: name,
+          token: result.paired['token'] as String? ?? ''));
       await client.disconnect();
       if (!mounted) return;
       if (Navigator.canPop(context)) {
@@ -94,7 +130,10 @@ class _PairPageState extends State<PairPage> {
       // its code.
       await client.disconnect();
       if (!mounted) return;
-      setState(() => _busy = false);
+      setState(() {
+        _busy = false;
+        _approvalPending = false;
+      });
       final chosen = await _chooseDevice(e.devices);
       if (chosen == null || !mounted) return;
       await _pairWith(relayUrl, chosen.code);
@@ -103,6 +142,8 @@ class _PairPageState extends State<PairPage> {
       if (!mounted) return;
       setState(() {
         _busy = false;
+        _approvalPending = false;
+        // Shows the agent's exact reason, e.g. "denied on this PC".
         _error = '$e';
       });
     }
@@ -162,6 +203,17 @@ class _PairPageState extends State<PairPage> {
               style: theme.textTheme.bodyMedium,
               textAlign: TextAlign.center,
             ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _phoneNameCtrl,
+              textAlign: TextAlign.center,
+              decoration: const InputDecoration(
+                labelText: 'This phone’s name (shown on the PC)',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              onChanged: DeviceStore.setPhoneName,
+            ),
             const SizedBox(height: 32),
             FilledButton.icon(
               onPressed: (_busy || _scanning) ? null : _findPc,
@@ -189,6 +241,19 @@ class _PairPageState extends State<PairPage> {
               else
                 ..._found!.map(_buildPcCard),
             ],
+            if (_approvalPending)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 16),
+                child: Column(
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 16),
+                    Text('Waiting for approval on the PC…'),
+                    SizedBox(height: 4),
+                    Text('Tap Allow in the dialog shown on your PC.'),
+                  ],
+                ),
+              ),
             if (_error != null) ...[
               const SizedBox(height: 12),
               Text(

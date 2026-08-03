@@ -14,6 +14,11 @@ class MainActivity : FlutterActivity() {
     // (MediaStore needs no permission on Android 10+).
     private val downloadsChannel = "pcocket/downloads"
 
+    // Native bridge for the H.264 screen stream: hardware MediaCodec
+    // decoder rendering into a Flutter texture.
+    private val videoChannel = "pcocket/video"
+    private var videoDecoder: VideoDecoder? = null
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, downloadsChannel)
@@ -35,6 +40,46 @@ class MainActivity : FlutterActivity() {
                     result.error("save_failed", e.message, null)
                 }
             }
+        val decoder = VideoDecoder(flutterEngine.renderer)
+        videoDecoder = decoder
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, videoChannel)
+            .setMethodCallHandler { call, result ->
+                try {
+                    when (call.method) {
+                        "start" -> {
+                            val w = call.argument<Int>("w") ?: 0
+                            val h = call.argument<Int>("h") ?: 0
+                            if (w <= 0 || h <= 0) {
+                                result.error("bad_args", "w and h are required", null)
+                            } else {
+                                result.success(decoder.start(w, h))
+                            }
+                        }
+                        "feed" -> {
+                            val bytes = call.argument<ByteArray>("bytes")
+                            if (bytes == null) {
+                                result.error("bad_args", "bytes are required", null)
+                            } else {
+                                decoder.feed(bytes)
+                                result.success(true)
+                            }
+                        }
+                        "stop" -> {
+                            decoder.stop()
+                            result.success(true)
+                        }
+                        else -> result.notImplemented()
+                    }
+                } catch (e: Exception) {
+                    result.error("video_decoder", e.message, null)
+                }
+            }
+    }
+
+    override fun onDestroy() {
+        videoDecoder?.release()
+        videoDecoder = null
+        super.onDestroy()
     }
 
     private fun saveToDownloads(name: String, src: File) {

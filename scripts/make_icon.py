@@ -13,9 +13,9 @@ OUT = ROOT / "app" / "assets" / "icon"
 OUT.mkdir(parents=True, exist_ok=True)
 
 S = 1024
-TEAL = (13, 148, 136)
-GREEN = (34, 197, 94)
-WHITE = (255, 255, 255, 255)
+BLACK = (5, 5, 5)        # true-black AMOLED
+BLACK2 = (16, 16, 16)    # subtle lift for the gradient
+GREEN = (0, 230, 118)    # terminal hacker green
 FONT_PATH = "C:/Windows/Fonts/consola.ttf"  # Consolas — terminal vibes
 
 
@@ -28,7 +28,7 @@ def gradient():
     px = g.load()
     for yy in range(256):
         for xx in range(256):
-            px[xx, yy] = lerp(TEAL, GREEN, (xx + yy) / 510)
+            px[xx, yy] = lerp(BLACK, BLACK2, (xx + yy) / 510)
     return g.resize((S, S), Image.BICUBIC)
 
 
@@ -38,7 +38,7 @@ def draw_glyph(d):
     bbox = d.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     d.text(((S - tw) / 2 - bbox[0], (S - th) / 2 - bbox[1]), text,
-           font=font, fill=WHITE)
+           font=font, fill=GREEN + (255,))
 
 
 icon = gradient().convert("RGBA")

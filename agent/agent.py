@@ -123,6 +123,11 @@ def load_config():
     return cfg
 
 
+def save_config(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
 # ---------------------------------------------------------------- screen
 
 _screen_size_cache = None
@@ -337,6 +342,140 @@ class CameraStreamer:
                         max(0.0, 1.0 / self.fps - (time.monotonic() - t0)))
             finally:
                 cap.release()
+
+
+class H264Streamer:
+    """Streams the screen as H.264 via an ffmpeg subprocess (NVENC when the
+    driver supports it, QSV, then libx264 as the always-works fallback).
+
+    Packets: [4B "H264"][4B LE header len][header JSON][Annex-B chunk].
+    The stream always starts with SPS/PPS, so the client's decoder can
+    configure itself from the first bytes."""
+
+    ENCODERS = [
+        ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ll",
+                        "-profile:v", "baseline", "-bf", "0"]),
+        ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast",
+                      "-profile:v", "baseline", "-bf", "0"]),
+        ("libx264", ["-c:v", "libx264", "-preset", "ultrafast",
+                     "-tune", "zerolatency", "-profile:v", "baseline",
+                     "-bf", "0"]),
+    ]
+
+    def __init__(self, agent, client_id, fps=30, max_width=1280, bitrate=2_000_000):
+        self.agent = agent
+        self.client_id = client_id
+        self.fps = max(5, min(int(fps), 60))
+        self.max_width = max(320, min(int(max_width), 1920))
+        self.bitrate = max(500_000, min(int(bitrate), 8_000_000))
+        self.task = None
+        self.proc = None
+        self.encoder = None
+        self._stopping = False
+
+    @staticmethod
+    def ffmpeg_path():
+        base = Path(getattr(sys, "_MEIPASS", HERE))
+        for cand in (base / "ffmpeg.exe", HERE / "ffmpeg.exe",
+                     HERE / "tools" / "ffmpeg.exe",
+                     HERE.parent / "tools" / "ffmpeg.exe"):
+            if cand.exists():
+                return str(cand)
+        return "ffmpeg"  # hope for PATH
+
+    def start(self):
+        self.task = asyncio.create_task(self._run())
+
+    async def stop(self):
+        self._stopping = True
+        if self.proc and self.proc.returncode is None:
+            try:
+                self.proc.kill()
+            except ProcessLookupError:
+                pass
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+    def _cmd(self, enc_name, enc_args):
+        w, h = screen_size()
+        scale_w = min(w, self.max_width)
+        return [
+            self.ffmpeg_path(), "-hide_banner", "-loglevel", "error",
+            "-f", "gdigrab", "-framerate", str(self.fps), "-i", "desktop",
+            "-vf", f"scale=w={scale_w}:h=-2,format=yuv420p",
+            *enc_args,
+            "-g", str(self.fps * 2),
+            "-b:v", str(self.bitrate), "-maxrate", str(self.bitrate),
+            "-bufsize", str(self.bitrate * 2),
+            "-f", "h264", "pipe:1",
+        ]
+
+    async def _run(self):
+        for enc_name, enc_args in self.ENCODERS:
+            try:
+                worked = await self._stream(enc_name, enc_args)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[agent] h264 {enc_name} failed to start: {e}")
+                continue  # next encoder in the chain
+            if not worked:
+                print(f"[agent] h264 {enc_name} unavailable, trying next")
+                continue
+            # It worked but died mid-stream: restart the same encoder a few
+            # times instead of leaving the client's video frozen.
+            restarts = 0
+            while worked and restarts < 3 and not self._stopping:
+                restarts += 1
+                print(f"[agent] h264 {enc_name} died, restart {restarts}/3")
+                await asyncio.sleep(0.5)
+                try:
+                    worked = await self._stream(enc_name, enc_args)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[agent] h264 {enc_name} restart failed: {e}")
+                    break
+            return
+        if not self._stopping:
+            await self.agent.send_to(self.client_id, {
+                "event": "screen.error",
+                "data": {"error": "no working h264 encoder found"},
+            })
+
+    async def _stream(self, enc_name, enc_args):
+        """Run one encoder until it dies. Returns True if it produced
+        output (i.e. it actually worked); False if it failed immediately."""
+        # CREATE_NO_WINDOW: ffmpeg is a console app — without this it pops a
+        # visible console window the user can close, killing the stream.
+        no_window = 0x08000000 if platform.system() == "Windows" else 0
+        self.proc = await asyncio.create_subprocess_exec(
+            *self._cmd(enc_name, enc_args),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            creationflags=no_window,
+        )
+        self.encoder = enc_name
+        produced = False
+        header = json.dumps({
+            "w": min(screen_size()[0], self.max_width),
+            "h": round(screen_size()[1]
+                       * min(screen_size()[0], self.max_width)
+                       / screen_size()[0]),
+            "codec": "h264", "encoder": enc_name, "fps": self.fps,
+        }).encode()
+        packet_head = b"H264" + len(header).to_bytes(4, "little") + header
+        while True:
+            chunk = await self.proc.stdout.read(65536)
+            if not chunk:  # encoder exited
+                return produced
+            produced = True
+            if not self.agent.congested():
+                await self.agent.send_bytes(packet_head + chunk)
 
 
 BUTTONS = {"left": Button.left, "right": Button.right, "middle": Button.middle}
@@ -598,13 +737,37 @@ class EmbeddedRelay:
                         await ws.send(json.dumps(
                             {"type": "error", "error": "pair first"}))
                         continue
-                    # Codeless pair: an empty code is accepted on a trusted
-                    # LAN; a non-empty one must match.
+                    # A non-empty code must match; codeless is fine on LAN.
                     code = str(msg.get("code") or "").strip().upper()
                     if code and code != self.agent.cfg["code"]:
                         await ws.send(json.dumps(
                             {"type": "error", "error": "wrong pairing code"}))
                         continue
+                    # Trust flow: an approved token pairs instantly; unknown
+                    # phones get a one-time Allow/Deny prompt ON THE PC.
+                    token = str(msg.get("token") or "")
+                    trusted = bool(token) and token in self.agent.cfg.get(
+                        "approved_tokens", [])
+                    if not trusted and self.agent.cfg.get(
+                            "require_approval", True) \
+                            and self.agent.approval is not None:
+                        await ws.send(
+                            json.dumps({"type": "approval.pending"}))
+                        peer = str(msg.get("name") or "").strip()
+                        if not peer:
+                            peer = (ws.remote_address[0]
+                                    if ws.remote_address else "unknown")
+                        allowed = await self.agent.approval.ask(peer)
+                        if not allowed:
+                            await ws.send(json.dumps(
+                                {"type": "error",
+                                 "error": "denied on this PC"}))
+                            await ws.close()
+                            return
+                        token = uuid.uuid4().hex
+                        self.agent.cfg.setdefault(
+                            "approved_tokens", []).append(token)
+                        save_config(self.agent.cfg)
                     paired = True
                     self.clients[client_id] = ws
                     await ws.send(json.dumps({
@@ -612,6 +775,7 @@ class EmbeddedRelay:
                         "deviceId": self.agent.cfg["device_id"],
                         "name": self.agent.cfg["name"],
                         "clientId": client_id,
+                        "token": token,
                     }))
                     self.agent._status("Phone connected")
                     continue
@@ -656,7 +820,9 @@ class Agent:
         self.on_status = None        # optional callback(str), used by the GUI
         self.loop = None             # set in run()
         self.camera_streamers = {}   # client_id -> CameraStreamer
+        self.video_streamers = {}    # client_id -> H264Streamer
         self.embedded = None         # EmbeddedRelay when running standalone
+        self.approval = None         # ApprovalManager (service mode)
 
     def _status(self, text):
         cb = self.on_status
@@ -809,6 +975,20 @@ class Agent:
         old = self.streamers.pop(client, None)
         if old:
             await old.stop()
+        old_v = self.video_streamers.pop(client, None)
+        if old_v:
+            await old_v.stop()
+        if str(msg.get("codec", "jpeg")).lower() == "h264":
+            streamer = H264Streamer(
+                self, client,
+                fps=msg.get("fps", 30),
+                max_width=msg.get("max_width", 1280),
+                bitrate=msg.get("bitrate", 2_000_000),
+            )
+            streamer.start()
+            self.video_streamers[client] = streamer
+            return {"streaming": True, "codec": "h264",
+                    "fps": streamer.fps}
         streamer = ScreenStreamer(
             self, client,
             fps=msg.get("fps", 10), quality=msg.get("quality", 50),
@@ -817,7 +997,7 @@ class Agent:
         )
         streamer.start()
         self.streamers[client] = streamer
-        return {"streaming": True, "fps": streamer.fps,
+        return {"streaming": True, "codec": "jpeg", "fps": streamer.fps,
                 "binary": streamer.binary}
 
     async def h_screen_stop(self, msg):
@@ -825,6 +1005,9 @@ class Agent:
         streamer = self.streamers.pop(client, None)
         if streamer:
             await streamer.stop()
+        video = self.video_streamers.pop(client, None)
+        if video:
+            await video.stop()
         return {"streaming": False}
 
     async def h_camera_start(self, msg):
@@ -935,6 +1118,9 @@ class Agent:
             streamer = self.streamers.pop(client_id, None)
             if streamer:
                 await streamer.stop()
+            video = self.video_streamers.pop(client_id, None)
+            if video:
+                await video.stop()
             cam = self.camera_streamers.pop(client_id, None)
             if cam:
                 await cam.stop()
@@ -949,6 +1135,9 @@ class Agent:
         if host in (None, "127.0.0.1", "localhost", "::1"):
             # Standalone: the relay is embedded — the phone connects straight
             # to this process. One exe is the whole PC side.
+            from approval import ApprovalManager
+            self.approval = ApprovalManager()
+            self.approval.start(self.loop)
             port = urlparse(self.cfg["relay"]).port or 8080
             self.embedded = EmbeddedRelay(self, port)
             await self.embedded.serve()
@@ -1115,9 +1304,6 @@ def main():
     print(f"  Relay : {cfg['relay']}")
     print("  Scan the QR or enter the code in the mobile app.")
     print("=" * 52)
-    # frozen build = headless service mode: no QR popups, no window
-    if not getattr(sys, "frozen", False):
-        show_pairing_qr(cfg)
     agent = Agent(cfg)
     try:
         asyncio.run(agent.run())

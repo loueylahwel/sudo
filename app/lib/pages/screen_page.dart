@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../client_registry.dart';
 import '../relay_client.dart';
@@ -46,6 +46,15 @@ class _ScreenPageState extends State<ScreenPage> {
   // `screen.frame` events (older agents).
   bool _binaryMode = false;
 
+  // H.264 hardware-decoded path (agents that answer `codec: 'h264'`): the
+  // chunks go to the platform MediaCodec decoder over this channel, which
+  // renders into the texture below. Anything else keeps the JPEG flow.
+  static const MethodChannel _videoChannel = MethodChannel('pcocket/video');
+  StreamSubscription<VideoChunk>? _videoSub;
+  bool _h264Mode = false;
+  bool _videoStartRequested = false;
+  int? _textureId;
+
   double _scrollAccum = 0;
   double _scrollAccumX = 0;
   static const double _scrollThreshold = 24;
@@ -72,6 +81,13 @@ class _ScreenPageState extends State<ScreenPage> {
   int? _secondPointerId;
   Offset _secondPos = Offset.zero;
   bool _twoFinger = false;
+  // Pinch-to-zoom: two-finger distance scales the view, anchored at the
+  // pinch midpoint. One finger = cursor, two-finger translate = scroll.
+  double _zoomScale = 1.0;
+  Offset _zoomOrigin = Offset.zero;
+  double _pinchStartDist = 0;
+  double _pinchStartScale = 1.0;
+  Offset _pinchImageFrac = Offset.zero; // image fraction under the midpoint
   Offset _downPos = Offset.zero;
   Offset _lastPos = Offset.zero;
   DateTime _downTime = DateTime.now();
@@ -104,6 +120,13 @@ class _ScreenPageState extends State<ScreenPage> {
     _eventSub?.cancel();
     _frameSub?.cancel();
     _connSub?.cancel();
+    _videoSub?.cancel();
+    if (_videoStartRequested) {
+      _videoStartRequested = false;
+      // Fire-and-forget: dispose cannot await, and the native side tears
+      // the codec down off the UI thread anyway.
+      unawaited(_videoChannel.invokeMethod<bool>('stop'));
+    }
     _keyboardCtrl.dispose();
     _client.send('screen.stop');
     super.dispose();
@@ -114,6 +137,8 @@ class _ScreenPageState extends State<ScreenPage> {
     _eventSub?.cancel();
     _frameSub?.cancel();
     _connSub?.cancel();
+    _videoSub?.cancel();
+    _videoSub = null;
     _client = client;
     _eventSub = client.events.listen(_onEvent);
     _frameSub = client.screenFrames.listen(_onFrame);
@@ -135,8 +160,24 @@ class _ScreenPageState extends State<ScreenPage> {
     _starting = true;
     try {
       final resp = await _client.request('screen.start',
-          {'fps': 10, 'quality': 50, 'max_width': 960, 'binary': true});
-      if (mounted) {
+          {'codec': 'h264', 'fps': 30, 'max_width': 1280, 'binary': true});
+      if (!mounted) return;
+      if (resp['codec'] == 'h264') {
+        // New agent: hardware-decoded H.264. A restart after a reconnect
+        // starts a fresh bytestream, so tear any old decoder down first.
+        await _stopVideoDecoder();
+        if (!mounted) return;
+        _h264Mode = true;
+        _videoSub ??= _client.videoChunks.listen(_onVideoChunk);
+        setState(() {
+          _streaming = true;
+          // Suppresses the legacy base64 event path; frames now arrive as
+          // H264 packets, never as screen.frame events.
+          _binaryMode = true;
+        });
+      } else {
+        // Old agent: keep the JPEG/PJF1 flow exactly as before.
+        _h264Mode = false;
         setState(() {
           _streaming = true;
           _binaryMode = resp['binary'] == true;
@@ -146,6 +187,58 @@ class _ScreenPageState extends State<ScreenPage> {
       if (mounted) showError(context, e);
     } finally {
       _starting = false;
+    }
+  }
+
+  /// Feeds one H.264 chunk to the platform decoder. The first chunk of a
+  /// stream also creates the decoder with the header's geometry; SPS/PPS
+  /// lead the bytestream, so MediaCodec syncs on that first feed.
+  void _onVideoChunk(VideoChunk chunk) {
+    if (!mounted || !_h264Mode) return;
+    if (!_videoStartRequested) {
+      final w = (chunk.header['w'] as num?)?.toInt() ?? 0;
+      final h = (chunk.header['h'] as num?)?.toInt() ?? 0;
+      if (w <= 0 || h <= 0) return;
+      _videoStartRequested = true;
+      _initVideoDecoder(w, h);
+    }
+    // Fire-and-forget: platform channel calls are dispatched in order, so
+    // this feed always reaches the decoder after the `start` above.
+    unawaited(_videoChannel.invokeMethod<void>('feed', {'bytes': chunk.data}));
+  }
+
+  Future<void> _initVideoDecoder(int w, int h) async {
+    try {
+      final id =
+          await _videoChannel.invokeMethod<int>('start', {'w': w, 'h': h});
+      if (!mounted || id == null) return;
+      setState(() {
+        _textureId = id;
+        // The texture drives the layout aspect ratio now — the same fields
+        // the JPEG path uses, so the zoom/pinch math is unchanged.
+        _frameW = w;
+        _frameH = h;
+        // First chunk after a reconnect: the stream is back.
+        _connectionLost = false;
+      });
+    } on PlatformException catch (e) {
+      // Decoder failed to come up; allow a retry on the next chunk.
+      _videoStartRequested = false;
+      if (mounted) showError(context, e.message ?? 'Video decoder failed');
+    }
+  }
+
+  /// Tears down the platform decoder (stream restart or page dispose).
+  Future<void> _stopVideoDecoder() async {
+    if (!_videoStartRequested) return;
+    _videoStartRequested = false;
+    try {
+      await _videoChannel.invokeMethod<bool>('stop');
+    } on PlatformException {
+      // Decoder already gone; nothing to clean up.
+    }
+    if (mounted && _textureId != null) {
+      setState(() => _textureId = null);
     }
   }
 
@@ -266,6 +359,21 @@ class _ScreenPageState extends State<ScreenPage> {
     }
   }
 
+  /// Recomputes zoom from the current finger distance, keeping the image
+  /// point under the pinch midpoint stationary.
+  void _pinchUpdate() {
+    if (_imageRect.isEmpty || _pinchStartDist < 1) return;
+    final mid = (_lastPos + _secondPos) / 2;
+    final dist = (_secondPos - _lastPos).distance;
+    final scale = (_pinchStartScale * dist / _pinchStartDist).clamp(1.0, 5.0);
+    setState(() {
+      _zoomScale = scale.toDouble();
+      _zoomOrigin = mid -
+          Offset(_pinchImageFrac.dx * _imageRect.width * _zoomScale,
+              _pinchImageFrac.dy * _imageRect.height * _zoomScale);
+    });
+  }
+
   void _onPointerDown(PointerDownEvent event) {
     // A new touch while idle always takes control. Fingers that went down
     // mid-gesture (a resting palm) are simply ignored, so they can never
@@ -279,7 +387,7 @@ class _ScreenPageState extends State<ScreenPage> {
       _lpTimer = Timer(_longPressDelay, _onLongPressTimer);
       return;
     }
-    // Second finger mid-gesture → laptop-style two-finger scroll.
+    // Second finger mid-gesture → laptop-style two-finger scroll + pinch.
     if (!_twoFinger && _secondPointerId == null) {
       _secondPointerId = event.pointer;
       _secondPos = event.localPosition;
@@ -287,6 +395,19 @@ class _ScreenPageState extends State<ScreenPage> {
       _cancelLpTimer();
       _scrollAccum = 0;
       _scrollAccumX = 0;
+      // Pinch anchor: the image fraction currently under the midpoint.
+      if (!_imageRect.isEmpty) {
+        final mid = (_lastPos + _secondPos) / 2;
+        _pinchStartDist = (_secondPos - _lastPos).distance;
+        _pinchStartScale = _zoomScale;
+        final base = _zoomScale > 1.0 ? _zoomOrigin : _imageRect.topLeft;
+        _pinchImageFrac = Offset(
+          ((mid.dx - base.dx) / (_imageRect.width * _zoomScale))
+              .clamp(0.0, 1.0),
+          ((mid.dy - base.dy) / (_imageRect.height * _zoomScale))
+              .clamp(0.0, 1.0),
+        );
+      }
       // A not-yet-committed primary can't turn into tap/long-press anymore.
       if (_gesture == _GestureState.pressing ||
           _gesture == _GestureState.longPressPending) {
@@ -315,6 +436,7 @@ class _ScreenPageState extends State<ScreenPage> {
       } else {
         return;
       }
+      _pinchUpdate();
       _applyTwoFingerDelta(delta);
       return;
     }
@@ -524,22 +646,27 @@ class _ScreenPageState extends State<ScreenPage> {
             );
             return Stack(
               children: [
-                Positioned.fromRect(
-                  rect: _imageRect,
-                  child: _frame != null
-                      ? Image.memory(
-                          _frame!,
-                          gaplessPlayback: true,
-                          fit: BoxFit.fill,
-                        )
-                      : Center(
-                          child: Text(
-                            _streaming
-                                ? 'Waiting for frames…'
-                                : 'Starting stream…',
-                            style: const TextStyle(color: Colors.white54),
-                          ),
-                        ),
+                Positioned(
+                  left: _zoomScale > 1.0 ? _zoomOrigin.dx : _imageRect.left,
+                  top: _zoomScale > 1.0 ? _zoomOrigin.dy : _imageRect.top,
+                  width: _imageRect.width * _zoomScale,
+                  height: _imageRect.height * _zoomScale,
+                  child: _textureId != null
+                      ? Texture(textureId: _textureId!)
+                      : _frame != null
+                          ? Image.memory(
+                              _frame!,
+                              gaplessPlayback: true,
+                              fit: BoxFit.fill,
+                            )
+                          : Center(
+                              child: Text(
+                                _streaming
+                                    ? 'Waiting for frames…'
+                                    : 'Starting stream…',
+                                style: const TextStyle(color: Colors.white54),
+                              ),
+                            ),
                 ),
                 Positioned.fill(
                   child: Listener(
@@ -571,6 +698,15 @@ class _ScreenPageState extends State<ScreenPage> {
                       ),
                     ),
                   ),
+                if (_zoomScale > 1.01)
+                  Positioned(
+                    right: 12,
+                    bottom: 44,
+                    child: ActionChip(
+                      label: Text('${(_zoomScale * 100).round()}% — reset'),
+                      onPressed: () => setState(() => _zoomScale = 1.0),
+                    ),
+                  ),
                 Positioned(
                   left: 0,
                   right: 0,
@@ -586,7 +722,7 @@ class _ScreenPageState extends State<ScreenPage> {
                           padding: const EdgeInsets.symmetric(
                               horizontal: 14, vertical: 6),
                           child: Text(
-                            'Drag to move cursor • Two fingers to scroll • Tap to click • Hold for right-click',
+                            'Drag: cursor • Two fingers: scroll • Pinch: zoom • Tap: click',
                             style: const TextStyle(
                                 color: Colors.white70, fontSize: 12),
                           ),

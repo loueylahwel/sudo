@@ -125,6 +125,11 @@ def main():
     if not ensure_single_instance():
         # Another agent (service or GUI) is already running — nothing to do.
         return
+    # The GUI agent means the user is sitting at this PC already — approval
+    # prompts are unnecessary here (and a second Tk interpreter would
+    # conflict with this window).
+    cfg = load_config()
+    cfg["require_approval"] = False
     root = tk.Tk()
     # bundled app icon (works both frozen and from source)
     ico = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) \

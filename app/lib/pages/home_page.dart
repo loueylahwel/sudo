@@ -1,11 +1,13 @@
 import 'dart:async';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../client_registry.dart';
 import '../device_store.dart';
 import '../discovery.dart';
+import '../pc_widget.dart';
 import '../relay_client.dart';
 import '../util.dart';
 import 'camera_page.dart';
@@ -56,6 +58,45 @@ class _HomePageState extends State<HomePage> {
   static const int _maxReconnectAttempts = 5;
   static const int _maxReconnectDelaySecs = 30;
 
+  // Instant reconnect after a network switch: instead of waiting for the OS
+  // to notice the dead socket (10-30s), connectivity_plus tells us the moment
+  // the networks change. On loss the socket is treated as dead right away;
+  // on return the raced reconnect (saved address vs discovery) fires
+  // immediately, skipping any pending backoff.
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+  // Guards against stacking a connectivity-triggered reconnect on top of one
+  // that is still in flight.
+  bool _instantReconnecting = false;
+
+  // Hardware volume keys, forwarded by MainActivity while the app is in the
+  // foreground ("up"/"down" string messages).
+  static const _volumeKeysChannel = MethodChannel('pcocket/volume_keys');
+  // Lock tap on the home screen widget, forwarded by WidgetActionReceiver.
+  static const _widgetActionsChannel = MethodChannel('pcocket/widget_actions');
+
+  // Media sleep timer: pauses whatever plays on the PC when it expires. One
+  // timer at a time; _sleepTick just refreshes the countdown chip once a
+  // second, _sleepTimer does the actual firing.
+  Timer? _sleepTimer;
+  Timer? _sleepTick;
+  DateTime? _sleepEnd;
+
+  // Now Playing: the dashboard polls `media.info` every 3s while connected.
+  // Between polls the position is interpolated forward from the last sample
+  // (while playing), refreshed once a second by _mediaTick. While the seek
+  // slider is being dragged the interpolation freezes and the slider shows
+  // _dragValue instead, so poll updates never fight the user's thumb.
+  Timer? _mediaPollTimer;
+  Timer? _mediaTick;
+  String _mediaTitle = '';
+  String _mediaArtist = '';
+  double _mediaPosition = 0;
+  double _mediaDuration = 0;
+  bool _mediaPlaying = false;
+  DateTime? _mediaInfoAt;
+  bool _seekDragging = false;
+  double? _dragValue;
+
   // Temporary diagnostics for the network-switch bug (visible in logcat).
   void _dbg(String msg) => debugPrint('[Sudo] $msg');
 
@@ -63,13 +104,94 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _loadDevices();
+    _connectivitySub =
+        Connectivity().onConnectivityChanged.listen(_onConnectivityChanged);
+    _volumeKeysChannel.setMethodCallHandler((call) async {
+      if (call.method == 'volumeKey' && call.arguments is String) {
+        _onVolumeKey(call.arguments as String);
+      }
+    });
+    _widgetActionsChannel.setMethodCallHandler((call) async {
+      if (call.method == 'lock') _lockFromWidget();
+    });
   }
 
   @override
   void dispose() {
+    _connectivitySub?.cancel();
+    _volumeKeysChannel.setMethodCallHandler(null);
+    _widgetActionsChannel.setMethodCallHandler(null);
+    _cancelSleepTimer(update: false);
     _cancelReconnect();
     _tearDownClient();
     super.dispose();
+  }
+
+  /// Network-switch fast path. The stream emits the full list of active
+  /// connectivity types; anything usable (wifi/mobile/ethernet/vpn) counts
+  /// as online.
+  void _onConnectivityChanged(List<ConnectivityResult> results) {
+    final online = results.any((r) =>
+        r == ConnectivityResult.wifi ||
+        r == ConnectivityResult.mobile ||
+        r == ConnectivityResult.ethernet ||
+        r == ConnectivityResult.vpn);
+    if (!mounted) return;
+    if (!online) {
+      // Connectivity lost: force the same state a socket close would have
+      // produced instead of waiting for OS-level TCP timeouts.
+      if (_socketUp) {
+        _dbg('connectivity lost — treating socket as dead');
+        setState(() => _socketUp = false);
+        _scheduleReconnect();
+      }
+      return;
+    }
+    // Connectivity is back and we have a PC to reach: cancel any pending
+    // backoff and run the raced reconnect (direct vs discovery) right now.
+    if (_selected != null &&
+        !_socketUp &&
+        !_connecting &&
+        !_instantReconnecting) {
+      _dbg('connectivity back — reconnecting immediately');
+      _cancelReconnect();
+      _instantReconnecting = true;
+      unawaited(_connect(_selected!, auto: true)
+          .whenComplete(() => _instantReconnecting = false));
+    }
+  }
+
+  /// Hardware volume key while the app is in the foreground: adjust the PC's
+  /// volume, fire-and-forget (the phone's own volume stays untouched — the
+  /// key event is consumed on the native side).
+  void _onVolumeKey(String direction) {
+    final client = _client;
+    if (client == null || !_socketUp) return;
+    unawaited(client
+        .request('media', {
+          'action':
+              direction == 'up' ? 'media_volume_up' : 'media_volume_down',
+        })
+        .then((_) => true, onError: (_) => false));
+  }
+
+  /// Lock tap on the home screen widget. The native receiver only forwards
+  /// here while the app is alive; otherwise it just launches the app.
+  void _lockFromWidget() {
+    final client = _client;
+    if (client == null || !_socketUp) return;
+    unawaited(client
+        .request('power', {'action': 'lock'})
+        .then((_) => true, onError: (_) => false));
+  }
+
+  /// Pushes the current PC name + connection state to the home screen widget.
+  void _syncWidget({required bool connected}) {
+    final device = _selected ?? (_devices.isNotEmpty ? _devices.last : null);
+    final name = device == null
+        ? ''
+        : (device.name.isEmpty ? device.code : device.name);
+    unawaited(PcWidget.sync(pcName: name, connected: connected));
   }
 
   Future<void> _loadDevices() async {
@@ -85,9 +207,12 @@ class _HomePageState extends State<HomePage> {
         unawaited(_connect(devices.last));
       }
     }
+    // The saved device may have changed — refresh the widget's name/dot.
+    if (_selected == null) _syncWidget(connected: false);
   }
 
   void _tearDownClient() {
+    _stopMediaPoll();
     _eventSub?.cancel();
     _connSub?.cancel();
     _eventSub = null;
@@ -321,6 +446,13 @@ class _HomePageState extends State<HomePage> {
     _connSub = client.connectionState.listen((up) {
       if (!mounted) return;
       setState(() => _socketUp = up);
+      _syncWidget(connected: up);
+      // The Now Playing poll only runs while the socket is up.
+      if (up) {
+        _startMediaPoll();
+      } else {
+        _stopMediaPoll();
+      }
       // Only the live client can trigger a reconnect: a drop reported while
       // a (re)connect is still in flight (client not yet assigned to
       // _client) is handled by that attempt's own failure path.
@@ -355,11 +487,13 @@ class _HomePageState extends State<HomePage> {
       _socketUp = true;
       _viaText = 'via $usedHost';
     });
+    _syncWidget(connected: true);
     // Best effort: mirror PC clipboard changes onto the phone.
     unawaited(client
         .request('clipboard.watch', {'enabled': true})
         .then((_) => true, onError: (_) => false));
     unawaited(_refreshSysInfo());
+    _startMediaPoll();
   }
 
   /// Runs LAN discovery once and, when a PC with the same name as [device]
@@ -434,6 +568,7 @@ class _HomePageState extends State<HomePage> {
       _selected = null;
       _sysInfo = null;
     });
+    _syncWidget(connected: false);
     _loadDevices();
   }
 
@@ -538,6 +673,157 @@ class _HomePageState extends State<HomePage> {
     if (confirmed != true) return;
     await _runCommand('power', {'action': action});
     if (mounted) showMessage(context, '$label command sent');
+  }
+
+  /// Preset picker for the media sleep timer (AlertDialog house style).
+  Future<void> _showSleepTimerDialog() async {
+    final minutes = await showDialog<int>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Sleep timer'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Pause media on the PC after…'),
+            for (final m in const [15, 30, 45, 60])
+              ListTile(
+                dense: true,
+                title: Text('$m minutes'),
+                onTap: () => Navigator.pop(ctx, m),
+              ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+    if (minutes != null) _startSleepTimer(minutes);
+  }
+
+  void _startSleepTimer(int minutes) {
+    _cancelSleepTimer(update: false);
+    setState(
+        () => _sleepEnd = DateTime.now().add(Duration(minutes: minutes)));
+    _sleepTimer = Timer(Duration(minutes: minutes), _onSleepTimerExpired);
+    // Refreshes the countdown chip; stops itself once the end is reached.
+    _sleepTick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final end = _sleepEnd;
+      if (end == null || !end.isAfter(DateTime.now())) return;
+      setState(() {});
+    });
+  }
+
+  void _cancelSleepTimer({bool update = true}) {
+    _sleepTimer?.cancel();
+    _sleepTick?.cancel();
+    _sleepTimer = null;
+    _sleepTick = null;
+    _sleepEnd = null;
+    if (update && mounted) setState(() {});
+  }
+
+  /// Expiry: pause whatever is playing on the PC, once, fire-and-forget.
+  void _onSleepTimerExpired() {
+    _cancelSleepTimer();
+    final client = _client;
+    if (client != null && _socketUp) {
+      unawaited(client
+          .request('media', {'action': 'media_play_pause'})
+          .then((_) => true, onError: (_) => false));
+    }
+  }
+
+  /// Starts the 3s `media.info` poll + the 1s interpolation tick. Called
+  /// once the dashboard is connected; idempotent.
+  void _startMediaPoll() {
+    _stopMediaPoll();
+    _mediaPollTimer = Timer.periodic(
+        const Duration(seconds: 3), (_) => unawaited(_pollMediaInfo()));
+    _mediaTick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || !_mediaPlaying || _seekDragging) return;
+      setState(() {}); // advance the interpolated position
+    });
+    unawaited(_pollMediaInfo());
+  }
+
+  /// Stops the poll and drops the last known track, so a reconnect does not
+  /// show stale metadata.
+  void _stopMediaPoll() {
+    _mediaPollTimer?.cancel();
+    _mediaTick?.cancel();
+    _mediaPollTimer = null;
+    _mediaTick = null;
+    _mediaTitle = '';
+    _mediaArtist = '';
+    _mediaPlaying = false;
+    _seekDragging = false;
+    _dragValue = null;
+  }
+
+  Future<void> _pollMediaInfo() async {
+    final client = _client;
+    if (client == null || !_socketUp) return;
+    try {
+      final info = await client.request('media.info');
+      if (!mounted) return;
+      setState(() {
+        _mediaTitle = '${info['title'] ?? ''}';
+        _mediaArtist = '${info['artist'] ?? ''}';
+        _mediaDuration = ((info['duration_s'] as num?) ?? 0).toDouble();
+        _mediaPosition = ((info['position_s'] as num?) ?? 0).toDouble();
+        _mediaPlaying = info['playing'] == true;
+        _mediaInfoAt = DateTime.now();
+        if (!_seekDragging) _dragValue = null;
+      });
+    } catch (_) {
+      // Poll failures are transient (socket blip, player gone); the next
+      // tick retries — never surface an error popup for these.
+    }
+  }
+
+  /// Position to show on the seek slider: the drag value while dragging,
+  /// otherwise the last polled position advanced by wall-clock time when
+  /// playing (clamped to the track duration).
+  double get _displayPosition {
+    if (_seekDragging && _dragValue != null) return _dragValue!;
+    var pos = _mediaPosition;
+    final at = _mediaInfoAt;
+    if (_mediaPlaying && at != null) {
+      pos += DateTime.now().difference(at).inMilliseconds / 1000.0;
+    }
+    if (_mediaDuration > 0 && pos > _mediaDuration) pos = _mediaDuration;
+    if (pos < 0) pos = 0;
+    return pos;
+  }
+
+  /// Slider release: jump locally (no waiting for the next poll) and send
+  /// the seek, fire-and-forget.
+  void _seekTo(double seconds) {
+    setState(() {
+      _seekDragging = false;
+      _dragValue = null;
+      _mediaPosition = seconds;
+      _mediaInfoAt = DateTime.now();
+    });
+    final client = _client;
+    if (client == null || !_socketUp) return;
+    unawaited(client
+        .request('media.seek', {'seconds': seconds.round()})
+        .then((_) => true, onError: (_) => false));
+  }
+
+  /// Remaining time as `m:ss` for the countdown chip.
+  String get _sleepTimerLabel {
+    final end = _sleepEnd;
+    if (end == null) return '';
+    var secs = end.difference(DateTime.now()).inSeconds;
+    if (secs < 0) secs = 0;
+    return '${secs ~/ 60}:${(secs % 60).toString().padLeft(2, '0')}';
   }
 
   @override
@@ -792,13 +1078,14 @@ class _HomePageState extends State<HomePage> {
     required IconData icon,
     required String tooltip,
     required VoidCallback onPressed,
+    Color? color,
   }) {
     return IconButton(
       tooltip: tooltip,
       iconSize: 22,
       padding: const EdgeInsets.all(4),
       visualDensity: VisualDensity.compact,
-      icon: Icon(icon),
+      icon: Icon(icon, color: color),
       onPressed: onPressed,
     );
   }
@@ -817,51 +1104,133 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _buildMediaCard(ThemeData theme) {
+    final hasTrack = _mediaTitle.isNotEmpty;
+    // Seeking only makes sense when the track reports a real duration.
+    final seekable = hasTrack && _mediaDuration > 0;
     return Card(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Media', style: theme.textTheme.titleSmall),
-            _oneLineRow([
-              _quickAction(
-                tooltip: 'Previous',
-                icon: Icons.skip_previous,
-                onPressed: () =>
-                    _runCommand('media', {'action': 'media_previous'}),
+            Row(
+              children: [
+                Text('Media', style: theme.textTheme.titleSmall),
+                const Spacer(),
+                if (_sleepEnd != null)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: ActionChip(
+                      avatar: const Icon(Icons.timer, size: 16),
+                      label: Text(_sleepTimerLabel),
+                      tooltip: 'Cancel sleep timer',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: _cancelSleepTimer,
+                    ),
+                  ),
+                _quickAction(
+                  tooltip: 'Sleep timer',
+                  icon: Icons.timer_outlined,
+                  onPressed: _showSleepTimerDialog,
+                ),
+              ],
+            ),
+            if (hasTrack) ...[
+              const SizedBox(height: 4),
+              Text(
+                _mediaTitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodyLarge,
               ),
-              _quickAction(
-                tooltip: 'Play / pause',
-                icon: Icons.play_arrow,
-                onPressed: () =>
-                    _runCommand('media', {'action': 'media_play_pause'}),
+              if (_mediaArtist.isNotEmpty)
+                Text(
+                  _mediaArtist,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.hintColor),
+                ),
+              // Seek bar: shows the polled position interpolated forward
+              // between polls; dragging freezes interpolation and the
+              // release sends media.seek.
+              Slider(
+                value: seekable ? _displayPosition : 0,
+                max: seekable ? _mediaDuration : 1,
+                onChangeStart: seekable
+                    ? (_) => setState(() => _seekDragging = true)
+                    : null,
+                onChanged: seekable
+                    ? (v) => setState(() => _dragValue = v)
+                    : null,
+                onChangeEnd: seekable ? _seekTo : null,
               ),
-              _quickAction(
-                tooltip: 'Next',
-                icon: Icons.skip_next,
-                onPressed: () =>
-                    _runCommand('media', {'action': 'media_next'}),
+              _oneLineRow([
+                _quickAction(
+                  tooltip: 'Previous',
+                  icon: Icons.skip_previous,
+                  onPressed: () =>
+                      _runCommand('media', {'action': 'media_previous'}),
+                ),
+                _quickAction(
+                  tooltip: 'Play / pause',
+                  icon: _mediaPlaying ? Icons.pause : Icons.play_arrow,
+                  onPressed: () =>
+                      _runCommand('media', {'action': 'media_play_pause'}),
+                ),
+                _quickAction(
+                  tooltip: 'Next',
+                  icon: Icons.skip_next,
+                  onPressed: () =>
+                      _runCommand('media', {'action': 'media_next'}),
+                ),
+                _quickAction(
+                  tooltip: 'Volume down',
+                  icon: Icons.volume_down,
+                  onPressed: () =>
+                      _runCommand('media', {'action': 'media_volume_down'}),
+                ),
+                _quickAction(
+                  tooltip: 'Volume up',
+                  icon: Icons.volume_up,
+                  onPressed: () =>
+                      _runCommand('media', {'action': 'media_volume_up'}),
+                ),
+                _quickAction(
+                  tooltip: 'Mute',
+                  icon: Icons.volume_off,
+                  onPressed: () =>
+                      _runCommand('media', {'action': 'media_volume_mute'}),
+                ),
+              ]),
+            ] else ...[
+              const SizedBox(height: 8),
+              Text(
+                'Nothing playing',
+                style: theme.textTheme.bodyMedium
+                    ?.copyWith(color: theme.hintColor),
               ),
-              _quickAction(
-                tooltip: 'Volume down',
-                icon: Icons.volume_down,
-                onPressed: () =>
-                    _runCommand('media', {'action': 'media_volume_down'}),
-              ),
-              _quickAction(
-                tooltip: 'Volume up',
-                icon: Icons.volume_up,
-                onPressed: () =>
-                    _runCommand('media', {'action': 'media_volume_up'}),
-              ),
-              _quickAction(
-                tooltip: 'Mute',
-                icon: Icons.volume_off,
-                onPressed: () =>
-                    _runCommand('media', {'action': 'media_volume_mute'}),
-              ),
-            ]),
+              _oneLineRow([
+                _quickAction(
+                  tooltip: 'Volume down',
+                  icon: Icons.volume_down,
+                  onPressed: () =>
+                      _runCommand('media', {'action': 'media_volume_down'}),
+                ),
+                _quickAction(
+                  tooltip: 'Volume up',
+                  icon: Icons.volume_up,
+                  onPressed: () =>
+                      _runCommand('media', {'action': 'media_volume_up'}),
+                ),
+                _quickAction(
+                  tooltip: 'Mute',
+                  icon: Icons.volume_off,
+                  onPressed: () =>
+                      _runCommand('media', {'action': 'media_volume_mute'}),
+                ),
+              ]),
+            ],
           ],
         ),
       ),

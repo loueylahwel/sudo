@@ -8,8 +8,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../file_transfer.dart';
 import '../relay_client.dart';
 import '../util.dart';
+import 'file_preview_page.dart';
 
 class FsEntry {
   FsEntry({
@@ -61,8 +63,6 @@ class FilesPage extends StatefulWidget {
 }
 
 class _FilesPageState extends State<FilesPage> {
-  static const int _chunkSize = 256 * 1024;
-
   String _path = ''; // Empty = drive list.
   List<FsEntry> _entries = [];
   List<FsShortcut> _shortcuts = [];
@@ -201,25 +201,13 @@ class _FilesPageState extends State<FilesPage> {
       tempFile =
           File('${tempDir.path}${Platform.pathSeparator}${entry.name}');
       if (await tempFile.exists()) await tempFile.delete();
-      var offset = 0;
-      var total = 0;
-      while (true) {
-        final data = await widget.client.request('fs.download', {
-          'path': entry.path,
-          'offset': offset,
-          'length': _chunkSize,
-        });
-        total = (data['size'] as num?)?.toInt() ?? total;
-        final bytes = base64Decode('${data['data'] ?? ''}');
-        if (bytes.isNotEmpty) {
-          await tempFile.writeAsBytes(bytes,
-              mode: FileMode.append, flush: true);
-        }
-        offset += bytes.length;
+      final file = tempFile;
+      await fetchFileChunks(widget.client, entry.path,
+          onChunk: (chunk, received, total) async {
+        await file.writeAsBytes(chunk, mode: FileMode.append, flush: true);
         progress.value =
-            total > 0 ? (offset / total).clamp(0.0, 1.0) : 0;
-        if (data['eof'] == true) break;
-      }
+            total > 0 ? (received / total).clamp(0.0, 1.0) : 0;
+      });
       savedMessage = await _saveToDownloads(tempFile, entry.name);
     } catch (e) {
       failure = e;
@@ -304,7 +292,7 @@ class _FilesPageState extends State<FilesPage> {
       final target = _join(_path, picked.name);
       var offset = 0;
       do {
-        final end = math.min(offset + _chunkSize, bytes.length);
+        final end = math.min(offset + kFsChunkSize, bytes.length);
         await widget.client.request('fs.upload', {
           'path': target,
           'data': base64Encode(bytes.sublist(offset, end)),
@@ -406,6 +394,24 @@ class _FilesPageState extends State<FilesPage> {
       if (mounted) unawaited(_load(_path));
     } catch (e) {
       if (mounted) showError(context, e);
+    }
+  }
+
+  /// Tapping a previewable file (image, or text up to 2MB) opens it in the
+  /// in-app preview page; anything else gets the action menu.
+  void _onFileTap(FsEntry entry) {
+    if (isPreviewable(entry.name, entry.size)) {
+      Navigator.of(context).push(MaterialPageRoute<void>(
+        builder: (_) => FilePreviewPage(
+          client: widget.client,
+          name: entry.name,
+          path: entry.path,
+          size: entry.size,
+          onDownload: () => unawaited(_download(entry)),
+        ),
+      ));
+    } else {
+      _showEntryMenu(entry);
     }
   }
 
@@ -578,7 +584,9 @@ class _FilesPageState extends State<FilesPage> {
                     icon: const Icon(Icons.more_vert),
                     onPressed: () => _showEntryMenu(e),
                   ),
-                  onTap: e.isDirLike ? () => unawaited(_load(e.path)) : null,
+                  onTap: e.isDirLike
+                      ? () => unawaited(_load(e.path))
+                      : () => _onFileTap(e),
                   onLongPress: () => _showEntryMenu(e),
                 );
               },

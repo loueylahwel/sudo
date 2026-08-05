@@ -701,6 +701,40 @@ def power(action):
     return {"action": action, "scheduled": True}
 
 
+# ---------------------------------------------------------------- media
+
+_MEDIA_PS1_CANDIDATES = (
+    Path(getattr(sys, "_MEIPASS", HERE)) / "media_info.ps1",
+    HERE / "media_info.ps1",
+)
+
+
+def _media_ps1():
+    for cand in _MEDIA_PS1_CANDIDATES:
+        if cand.exists():
+            return str(cand)
+    return str(_MEDIA_PS1_CANDIDATES[-1])
+
+
+def _run_media_ps1(extra_args):
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-File", _media_ps1(), *extra_args],
+        capture_output=True, text=True, timeout=15, errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    out = proc.stdout.strip()
+    return json.loads(out) if out else {}
+
+
+def _media_info():
+    return _run_media_ps1([])
+
+
+def _media_seek(seconds):
+    return _run_media_ps1(["-Seek", str(seconds)])
+
+
 # ---------------------------------------------------------------- agent
 
 class EmbeddedRelay:
@@ -957,6 +991,12 @@ class Agent:
         do_key(msg.get("action", "media_play_pause"))
         return {}
 
+    async def h_media_info(self, msg):
+        return await asyncio.to_thread(_media_info)
+
+    async def h_media_seek(self, msg):
+        return await asyncio.to_thread(_media_seek, float(msg.get("seconds", 0)))
+
     async def h_clipboard_get(self, msg):
         return {"text": pyperclip.paste()}
 
@@ -983,7 +1023,7 @@ class Agent:
                 self, client,
                 fps=msg.get("fps", 30),
                 max_width=msg.get("max_width", 1280),
-                bitrate=msg.get("bitrate", 2_000_000),
+                bitrate=msg.get("bitrate", 4_000_000),
             )
             streamer.start()
             self.video_streamers[client] = streamer
@@ -1051,6 +1091,8 @@ class Agent:
         "input": h_input,
         "power": h_power,
         "media": h_media,
+        "media.info": h_media_info,
+        "media.seek": h_media_seek,
         "clipboard.get": h_clipboard_get,
         "clipboard.set": h_clipboard_set,
         "clipboard.watch": h_clipboard_watch,
@@ -1081,7 +1123,7 @@ class Agent:
         msg = f"SUDO|{self.cfg['name']}|{port}".encode()
         while True:
             transport.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)  # fast rediscovery after network switches
 
     async def cursor_watcher(self):
         """Poll the cursor position (~16x/s) and wake screen streamers when

@@ -31,11 +31,17 @@ class VideoDecoder(private val textures: TextureRegistry) {
     private val thread = HandlerThread("sudo-video-decoder").apply { start() }
     private val handler = Handler(thread.looper)
 
+    /** Called on the codec thread when a decode error killed the codec —
+     * Dart uses it to restart the stream (fresh SPS/PPS + IDR). */
+    var onCodecError: (() -> Unit)? = null
+
     // Written on the codec thread / platform thread, read on both.
     @Volatile private var codec: MediaCodec? = null
     @Volatile private var surface: Surface? = null
     @Volatile private var textureEntry: TextureRegistry.SurfaceTextureEntry? = null
     private var ptsUs = 0L
+    private var lastWidth = 0
+    private var lastHeight = 0
 
     /**
      * Creates the decoder and its output texture. Called from the platform
@@ -72,6 +78,8 @@ class VideoDecoder(private val textures: TextureRegistry) {
         }
         textureEntry = entry
         surface = outSurface
+        lastWidth = width
+        lastHeight = height
         return entry.id()
     }
 
@@ -88,10 +96,26 @@ class VideoDecoder(private val textures: TextureRegistry) {
                 feedInternal(decoder, chunk)
                 drainInternal(decoder)
             } catch (_: Exception) {
-                // A transient codec error must not kill the thread; the
-                // stream resyncs on the next IDR.
+                // Never feed a wedged codec mid-GOP (that is the green
+                // corruption): release it and let Dart restart the stream —
+                // a fresh SPS/PPS + IDR sequence resyncs cleanly.
+                errorRelease()
             }
         }
+    }
+
+    /** Releases a broken codec and notifies Dart to restart the stream. */
+    private fun errorRelease() {
+        codec?.let {
+            try {
+                it.stop()
+            } catch (_: Exception) {
+                // Already errored; force release below.
+            }
+            it.release()
+        }
+        codec = null
+        onCodecError?.invoke()
     }
 
     /**
@@ -148,8 +172,18 @@ class VideoDecoder(private val textures: TextureRegistry) {
     private fun feedInternal(decoder: MediaCodec, data: ByteArray) {
         var offset = 0
         while (offset < data.size) {
-            val inputIndex = decoder.dequeueInputBuffer(INPUT_TIMEOUT_US)
-            if (inputIndex < 0) return // no input buffer in time; drop the chunk
+            var inputIndex = decoder.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            var retries = 0
+            while (inputIndex < 0 && retries < INPUT_RETRIES) {
+                // Queue full: free output and retry instead of dropping the
+                // chunk — a dropped chunk corrupts the whole GOP and wedges
+                // the picture.
+                drainInternal(decoder)
+                Thread.sleep(2)
+                inputIndex = decoder.dequeueInputBuffer(INPUT_TIMEOUT_US)
+                retries++
+            }
+            if (inputIndex < 0) throw IllegalStateException("decoder input starved")
             val buffer = decoder.getInputBuffer(inputIndex) ?: return
             buffer.clear()
             val count = minOf(buffer.remaining(), data.size - offset)
@@ -178,6 +212,7 @@ class VideoDecoder(private val textures: TextureRegistry) {
 
     private companion object {
         const val INPUT_TIMEOUT_US = 10_000L
+        const val INPUT_RETRIES = 5
         const val FRAME_INTERVAL_US = 33_333L
         const val CODEC_OP_TIMEOUT_SEC = 10L
     }

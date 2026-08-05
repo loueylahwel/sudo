@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="accessibility_service_description">Sudo Touch Control — lets your PC tap, swipe and press navigation buttons on this phone while you share your screen to it.</string>
+    <string name="widget_no_pc">No PC saved</string>
+    <string name="widget_lock">Lock</string>
 </resources>

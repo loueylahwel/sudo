@@ -3,12 +3,15 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 import '../client_registry.dart';
 import '../relay_client.dart';
 import '../util.dart';
 
 enum _GestureState { idle, pressing, dragging, longPressPending, dragSelect }
+
+enum _TwoFingerMode { pinch, scroll }
 
 class ScreenPage extends StatefulWidget {
   const ScreenPage({super.key, required this.client});
@@ -19,7 +22,8 @@ class ScreenPage extends StatefulWidget {
   State<ScreenPage> createState() => _ScreenPageState();
 }
 
-class _ScreenPageState extends State<ScreenPage> {
+class _ScreenPageState extends State<ScreenPage>
+    with SingleTickerProviderStateMixin {
   // The client frames/inputs currently flow over. Swapped for the registry's
   // client when HomePage's auto-reconnect replaces it, so the page keeps
   // working instead of staying bound to a dead client.
@@ -53,6 +57,7 @@ class _ScreenPageState extends State<ScreenPage> {
   StreamSubscription<VideoChunk>? _videoSub;
   bool _h264Mode = false;
   bool _videoStartRequested = false;
+  bool _restartingOnCodecError = false;
   int? _textureId;
 
   double _scrollAccum = 0;
@@ -87,7 +92,12 @@ class _ScreenPageState extends State<ScreenPage> {
   Offset _zoomOrigin = Offset.zero;
   double _pinchStartDist = 0;
   double _pinchStartScale = 1.0;
+  Offset _pinchStartMid = Offset.zero;
   Offset _pinchImageFrac = Offset.zero; // image fraction under the midpoint
+  // Two-finger intent: pinch vs scroll is decided once per gesture after a
+  // small deadband — fingers moving apart/together = pinch, moving in the
+  // same direction = scroll. Never both at once (that was the confusion).
+  _TwoFingerMode? _twoFingerMode;
   Offset _downPos = Offset.zero;
   Offset _lastPos = Offset.zero;
   DateTime _downTime = DateTime.now();
@@ -100,16 +110,46 @@ class _ScreenPageState extends State<ScreenPage> {
 
   final _keyboardCtrl = TextEditingController();
 
+  // Voice dictation: hold the app-bar mic to talk. speech_to_text requests
+  // the RECORD_AUDIO runtime permission itself inside initialize(). Only
+  // FINAL results are typed at the PC cursor; partials just render in the
+  // "Listening…" overlay. _pulseCtrl drives the red pulsing mic icon.
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  bool _speechAvailable = false;
+  bool _listening = false;
+  String _dictationText = '';
+  late final AnimationController _pulseCtrl = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 900));
+
   @override
   void initState() {
     super.initState();
     _bindClient(_client);
     _registrySub = ClientRegistry.instance.onChange.listen(_onRegistryClient);
+    _videoChannel.setMethodCallHandler(_onVideoChannelCall);
     // If a reconnect already replaced the client before this page opened,
     // the passed-in one is stale: switch to the registry's live one.
     final current = ClientRegistry.instance.client;
     if (current != null) _onRegistryClient(current);
     _startStream();
+  }
+
+  /// The native decoder wedged (usually a corrupt frame after a hiccup):
+  /// restart the stream from the agent — fresh SPS/PPS + IDR resyncs the
+  /// picture cleanly instead of the green corruption of a mid-GOP decode.
+  Future<void> _onVideoChannelCall(MethodCall call) async {
+    if (call.method != 'onCodecError' || _restartingOnCodecError) return;
+    _restartingOnCodecError = true;
+    try {
+      try {
+        await _client.request('screen.stop');
+      } catch (_) {
+        // Agent unreachable; _startStream's own error path handles it.
+      }
+      await _startStream();
+    } finally {
+      _restartingOnCodecError = false;
+    }
   }
 
   @override
@@ -121,6 +161,7 @@ class _ScreenPageState extends State<ScreenPage> {
     _frameSub?.cancel();
     _connSub?.cancel();
     _videoSub?.cancel();
+    _videoChannel.setMethodCallHandler(null);
     if (_videoStartRequested) {
       _videoStartRequested = false;
       // Fire-and-forget: dispose cannot await, and the native side tears
@@ -128,6 +169,8 @@ class _ScreenPageState extends State<ScreenPage> {
       unawaited(_videoChannel.invokeMethod<bool>('stop'));
     }
     _keyboardCtrl.dispose();
+    _pulseCtrl.dispose();
+    unawaited(_speech.stop());
     _client.send('screen.stop');
     super.dispose();
   }
@@ -160,7 +203,8 @@ class _ScreenPageState extends State<ScreenPage> {
     _starting = true;
     try {
       final resp = await _client.request('screen.start',
-          {'codec': 'h264', 'fps': 30, 'max_width': 1280, 'binary': true});
+          {'codec': 'jpeg', 'fps': 12, 'quality': 55, 'max_width': 1152,
+           'binary': true});
       if (!mounted) return;
       if (resp['codec'] == 'h264') {
         // New agent: hardware-decoded H.264. A restart after a reconnect
@@ -344,17 +388,17 @@ class _ScreenPageState extends State<ScreenPage> {
     _queueMoveRel(delta);
   }
 
-  /// Two-finger drag, like a laptop touchpad: finger down = content up
-  /// (wheel up), on both axes.
+  /// Two-finger drag, natural scrolling (content follows the fingers, like
+  /// a Windows touchpad): finger down = content down, on both axes.
   void _applyTwoFingerDelta(Offset delta) {
     _scrollAccum += delta.dy;
     _scrollAccumX += delta.dx;
     while (_scrollAccum.abs() >= _scrollThreshold) {
-      _scroll(0, _scrollAccum > 0 ? -1 : 1);
+      _scroll(0, _scrollAccum > 0 ? 1 : -1);
       _scrollAccum -= _scrollThreshold * _scrollAccum.sign;
     }
     while (_scrollAccumX.abs() >= _scrollThreshold) {
-      _scroll(_scrollAccumX > 0 ? -1 : 1, 0);
+      _scroll(_scrollAccumX > 0 ? 1 : -1, 0);
       _scrollAccumX -= _scrollThreshold * _scrollAccumX.sign;
     }
   }
@@ -372,6 +416,40 @@ class _ScreenPageState extends State<ScreenPage> {
           Offset(_pinchImageFrac.dx * _imageRect.width * _zoomScale,
               _pinchImageFrac.dy * _imageRect.height * _zoomScale);
     });
+  }
+
+  /// Decides once per two-finger gesture whether it's a pinch or a scroll:
+  /// compare how much the finger DISTANCE changed vs how much the MIDPOINT
+  /// moved, after a small deadband that eats contact jitter. Re-anchors the
+  /// pinch reference on decision so the deadband itself causes no zoom jump.
+  void _classifyTwoFinger() {
+    if (_twoFingerMode != null || _secondPointerId == null) return;
+    final dist = (_secondPos - _lastPos).distance;
+    final mid = (_lastPos + _secondPos) / 2;
+    final dDist = (dist - _pinchStartDist).abs();
+    final dMid = (mid - _pinchStartMid).distance;
+    const deadband = 10.0;
+    if (dDist < deadband && dMid < deadband) return;
+    if (dDist > dMid) {
+      _twoFingerMode = _TwoFingerMode.pinch;
+      // Re-anchor: pinch math starts from NOW.
+      _pinchStartDist = dist;
+      _pinchStartMid = mid;
+      _pinchStartScale = _zoomScale;
+      if (!_imageRect.isEmpty) {
+        final base = _zoomScale > 1.0 ? _zoomOrigin : _imageRect.topLeft;
+        _pinchImageFrac = Offset(
+          ((mid.dx - base.dx) / (_imageRect.width * _zoomScale))
+              .clamp(0.0, 1.0),
+          ((mid.dy - base.dy) / (_imageRect.height * _zoomScale))
+              .clamp(0.0, 1.0),
+        );
+      }
+    } else {
+      _twoFingerMode = _TwoFingerMode.scroll;
+      _scrollAccum = 0;
+      _scrollAccumX = 0;
+    }
   }
 
   void _onPointerDown(PointerDownEvent event) {
@@ -392,13 +470,15 @@ class _ScreenPageState extends State<ScreenPage> {
       _secondPointerId = event.pointer;
       _secondPos = event.localPosition;
       _twoFinger = true;
+      _twoFingerMode = null; // intent decided after the deadband
       _cancelLpTimer();
       _scrollAccum = 0;
       _scrollAccumX = 0;
-      // Pinch anchor: the image fraction currently under the midpoint.
+      // Record the pinch anchor — distance and midpoint at gesture start.
       if (!_imageRect.isEmpty) {
         final mid = (_lastPos + _secondPos) / 2;
         _pinchStartDist = (_secondPos - _lastPos).distance;
+        _pinchStartMid = mid;
         _pinchStartScale = _zoomScale;
         final base = _zoomScale > 1.0 ? _zoomOrigin : _imageRect.topLeft;
         _pinchImageFrac = Offset(
@@ -436,8 +516,14 @@ class _ScreenPageState extends State<ScreenPage> {
       } else {
         return;
       }
-      _pinchUpdate();
-      _applyTwoFingerDelta(delta);
+      _classifyTwoFinger();
+      if (_twoFingerMode == _TwoFingerMode.pinch) {
+        _pinchUpdate();
+      } else if (_twoFingerMode == _TwoFingerMode.scroll) {
+        _applyTwoFingerDelta(delta);
+      }
+      // Undecided yet (inside the deadband): swallow the motion so a pinch
+      // can't leak into scroll and vice versa.
       return;
     }
     if (event.pointer != _pointerId) return;
@@ -507,6 +593,7 @@ class _ScreenPageState extends State<ScreenPage> {
   /// One of the two fingers lifted during a two-finger scroll: the gesture
   /// continues with the remaining finger (rebaselined, so no cursor jump).
   void _endTwoFinger(int pointer) {
+    _twoFingerMode = null;
     if (pointer == _secondPointerId) {
       _secondPointerId = null;
       _twoFinger = false;
@@ -614,12 +701,93 @@ class _ScreenPageState extends State<ScreenPage> {
     }
   }
 
+  /// Hold-to-talk start. The first call initializes speech_to_text, which
+  /// asks for the mic permission; a denial ends the gesture with a snackbar.
+  Future<void> _startDictation() async {
+    if (_listening) return;
+    if (!_speechAvailable) {
+      try {
+        _speechAvailable = await _speech.initialize(
+          onError: (_) => _endDictationUi(),
+        );
+      } catch (_) {
+        _speechAvailable = false;
+      }
+      if (!_speechAvailable) {
+        if (mounted) {
+          showMessage(context, 'Microphone permission needed for dictation');
+        }
+        return;
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _listening = true;
+      _dictationText = '';
+    });
+    _pulseCtrl.repeat(reverse: true);
+    unawaited(_speech.listen(
+      onResult: (result) {
+        if (!mounted) return;
+        setState(() => _dictationText = result.recognizedWords);
+        // Partials only update the overlay; the FINAL result is typed at
+        // the PC cursor (trailing space separates consecutive utterances).
+        if (result.finalResult && result.recognizedWords.isNotEmpty) {
+          _client.send('input',
+              {'action': 'text', 'text': '${result.recognizedWords} '});
+        }
+      },
+      // Device default locale (localeId omitted), partial results on.
+      listenOptions: stt.SpeechListenOptions(partialResults: true),
+    ));
+  }
+
+  /// Hold-to-talk release. stop() still lets the in-flight utterance deliver
+  /// its final result to onResult, so the last words are not lost.
+  Future<void> _stopDictation() async {
+    if (!_listening) return;
+    _endDictationUi();
+    await _speech.stop();
+  }
+
+  /// Drops the dictation UI state (used on release and on recognizer
+  /// errors). The overlay only renders while _listening, so clearing the
+  /// text here never hides a final result that arrives just after.
+  void _endDictationUi() {
+    _pulseCtrl
+      ..stop()
+      ..reset();
+    if (mounted) {
+      setState(() {
+        _listening = false;
+        _dictationText = '';
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Screen'),
         actions: [
+          // Hold-to-talk dictation. A GestureDetector (not IconButton) so
+          // long-press start/end drive listen/stop.
+          Tooltip(
+            message: 'Hold to dictate',
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onLongPressStart: (_) => unawaited(_startDictation()),
+              onLongPressEnd: (_) => unawaited(_stopDictation()),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Icon(
+                  _listening ? Icons.mic : Icons.mic_none,
+                  color: _listening ? Colors.redAccent : null,
+                ),
+              ),
+            ),
+          ),
           IconButton(
             tooltip: 'Keyboard',
             icon: const Icon(Icons.keyboard),
@@ -705,6 +873,62 @@ class _ScreenPageState extends State<ScreenPage> {
                     child: ActionChip(
                       label: Text('${(_zoomScale * 100).round()}% — reset'),
                       onPressed: () => setState(() => _zoomScale = 1.0),
+                    ),
+                  ),
+                // Dictation overlay: red pulsing mic + live partial text.
+                // IgnorePointer keeps every gesture flowing to the Listener.
+                if (_listening)
+                  Positioned(
+                    left: 24,
+                    right: 24,
+                    top: 16,
+                    child: IgnorePointer(
+                      child: Center(
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            color: Colors.black87,
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 16, vertical: 10),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    ScaleTransition(
+                                      scale: Tween(begin: 1.0, end: 1.3)
+                                          .animate(CurvedAnimation(
+                                              parent: _pulseCtrl,
+                                              curve: Curves.easeInOut)),
+                                      child: const Icon(Icons.mic,
+                                          color: Colors.redAccent, size: 18),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    const Text(
+                                      'Listening…',
+                                      style: TextStyle(color: Colors.white70),
+                                    ),
+                                  ],
+                                ),
+                                if (_dictationText.isNotEmpty) ...[
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    _dictationText,
+                                    textAlign: TextAlign.center,
+                                    maxLines: 3,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                        color: Colors.white, fontSize: 13),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                 Positioned(

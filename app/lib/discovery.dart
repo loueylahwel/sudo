@@ -23,12 +23,13 @@ class DiscoveredPc {
 /// PCs that announced themselves, deduplicated by sender IP.
 ///
 /// The agent broadcasts `SUDO|<pc-name>|<relay-port>` (plain UTF-8) to
-/// 255.255.255.255:[port] every few seconds. Receiving broadcasts needs no
-/// extra Android permission. Returns an empty list when the socket cannot be
-/// opened or nothing answers in time; the socket is always closed.
+/// 255.255.255.255:[port] once per second, so the default 2.5s window always
+/// covers at least two beacons. Receiving broadcasts needs no extra Android
+/// permission. Returns an empty list when the socket cannot be opened or
+/// nothing answers in time; the socket is always closed.
 Future<List<DiscoveredPc>> discoverPcs({
   int port = 47809,
-  Duration duration = const Duration(seconds: 4),
+  Duration duration = const Duration(milliseconds: 2500),
 }) async {
   RawDatagramSocket socket;
   try {

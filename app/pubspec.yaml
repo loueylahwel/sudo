@@ -38,6 +38,9 @@ dependencies:
   shared_preferences: ^2.3.2
   path_provider: ^2.1.4
   file_picker: ^8.1.2
+  connectivity_plus: ^6.1.0
+  home_widget: 0.7.0+1
+  speech_to_text: ^7.4.0
 
 # file_picker 8.x compiles its Android code against API 34, but it resolves
 # flutter_plugin_android_lifecycle to the newest 2.x which is compiled against

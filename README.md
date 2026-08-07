@@ -1,5 +1,7 @@
 # Sudo
 
+![demo](docs/demo.gif)
+
 [![Latest release](https://img.shields.io/github/v/release/loueylahwel/sudo?label=release)](https://github.com/loueylahwel/sudo/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%E2%80%A2%20Android-blue)](#setup-2-minutes)

@@ -161,7 +161,7 @@ def draw_cursor(img, mon):
     return int(cx // 2), int(cy // 2)
 
 
-def capture_jpeg(max_width=960, quality=50):
+def capture_jpeg(max_width=960, quality=50, last_thumb=None):
     with mss.mss() as sct:
         mon = sct.monitors[1]
         shot = sct.grab(mon)
@@ -173,6 +173,12 @@ def capture_jpeg(max_width=960, quality=50):
     # tiny grayscale thumb + cursor position used to skip unchanged frames
     thumb = img.resize((32, 18), Image.NEAREST).convert("L").tobytes()
     thumb += qpos[0].to_bytes(2, "little") + qpos[1].to_bytes(2, "little")
+    if thumb == last_thumb:
+        # Identical to the last frame we actually sent: skip the JPEG
+        # encode too, not just the network send — profiling shows grab+
+        # resize dominate (~30ms) but the encode is still ~1.5ms of pure
+        # waste on every idle tick when nothing changed.
+        return None, img.width, img.height, thumb
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=quality)
     return buf.getvalue(), img.width, img.height, thumb
@@ -220,13 +226,15 @@ class ScreenStreamer:
             changed = False
             try:
                 jpeg, w, h, thumb = await asyncio.to_thread(
-                    capture_jpeg, self.max_width, self.quality
+                    capture_jpeg, self.max_width, self.quality, self._last_thumb
                 )
-                # Drop frames when the link is congested instead of letting
+                # capture_jpeg already skipped the JPEG encode if thumb
+                # matched last_thumb (jpeg is None in that case). Drop
+                # frames when the link is congested instead of letting
                 # backpressure stall the agent; the thumb is only consumed
                 # when a frame actually goes out, so the accumulated change
                 # is sent once the link drains.
-                if thumb != self._last_thumb and not self.agent.congested():
+                if jpeg is not None and not self.agent.congested():
                     self._last_thumb = thumb
                     changed = True
                     # Stay hot for a second after the last change so
@@ -357,6 +365,10 @@ class H264Streamer:
                         "-profile:v", "baseline", "-bf", "0"]),
         ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast",
                       "-profile:v", "baseline", "-bf", "0"]),
+        # h264_amf was tried here as a third hardware tier but produces
+        # visibly wrong chroma (green-tinted regions) on-device with this
+        # gdigrab+lowlatency pipeline — worse than the libx264 fallback it
+        # was meant to avoid, so it's intentionally left out.
         ("libx264", ["-c:v", "libx264", "-preset", "ultrafast",
                      "-tune", "zerolatency", "-profile:v", "baseline",
                      "-bf", "0"]),
@@ -474,8 +486,13 @@ class H264Streamer:
             if not chunk:  # encoder exited
                 return produced
             produced = True
-            if not self.agent.congested():
-                await self.agent.send_bytes(packet_head + chunk)
+            # Unlike JPEG/camera frames, H.264 chunks are arbitrary slices of
+            # ONE continuous bytestream — dropping one under congestion (as
+            # the JPEG path does) corrupts everything after it until the next
+            # keyframe. Always send; the awaited write itself is the
+            # backpressure, naturally pacing this loop to the client's real
+            # receive rate instead of desyncing its decoder.
+            await self.agent.send_bytes(packet_head + chunk)
 
 
 BUTTONS = {"left": Button.left, "right": Button.right, "middle": Button.middle}
@@ -655,6 +672,95 @@ def list_processes():
 def kill_process(pid):
     psutil.Process(int(pid)).terminate()
     return {"killed": int(pid)}
+
+
+def list_windows():
+    """Top-level, user-facing windows — what Alt-Tab would show. Windows
+    only; no equivalent wired up for other platforms yet."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    dwmapi = ctypes.windll.dwmapi
+    GW_OWNER = 4
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW = 0x00000080
+    DWMWA_CLOAKED = 14
+
+    windows = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_proc(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if user32.GetWindow(hwnd, GW_OWNER):
+            return True  # dialogs/tooltips, not top-level apps
+        if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
+            return True
+        cloaked = ctypes.c_int(0)
+        dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+        if cloaked.value:
+            return True  # UWP frame on another virtual desktop / suspended
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.strip()
+        if not title or title == "Program Manager":
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        try:
+            process = psutil.Process(pid.value).name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            process = ""
+        windows.append({
+            "id": int(hwnd), "title": title, "pid": pid.value, "process": process,
+        })
+        return True
+
+    user32.EnumWindows(enum_proc, 0)
+    return {"windows": windows}
+
+
+def activate_window(window_id):
+    """Bring a window to the foreground. Windows enforces a "foreground
+    lock" that blocks a background process from stealing focus outright;
+    briefly attaching this thread's input queue to both the current
+    foreground window's and the target's threads is the standard way
+    around it."""
+    import ctypes
+
+    hwnd = int(window_id)
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    if not user32.IsWindow(hwnd):
+        raise ValueError("window no longer exists")
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+
+    fg_hwnd = user32.GetForegroundWindow()
+    fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
+    target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+    current_thread = kernel32.GetCurrentThreadId()
+
+    attached_fg = attached_target = False
+    if fg_thread and fg_thread != current_thread:
+        attached_fg = bool(user32.AttachThreadInput(current_thread, fg_thread, True))
+    if target_thread and target_thread != current_thread:
+        attached_target = bool(
+            user32.AttachThreadInput(current_thread, target_thread, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached_fg:
+            user32.AttachThreadInput(current_thread, fg_thread, False)
+        if attached_target:
+            user32.AttachThreadInput(current_thread, target_thread, False)
+    return {"activated": True}
 
 
 def sys_info():
@@ -1070,6 +1176,16 @@ class Agent:
             await streamer.stop()
         return {"streaming": False}
 
+    async def h_wm_list(self, msg):
+        if platform.system() != "Windows":
+            raise ValueError("window list is only supported on Windows")
+        return await asyncio.to_thread(list_windows)
+
+    async def h_wm_activate(self, msg):
+        if platform.system() != "Windows":
+            raise ValueError("window activation is only supported on Windows")
+        return await asyncio.to_thread(activate_window, msg["id"])
+
     async def h_notify_subscribe(self, msg):
         raise ValueError(
             "notification mirroring is not implemented yet "
@@ -1100,6 +1216,8 @@ class Agent:
         "screen.stop": h_screen_stop,
         "camera.start": h_camera_start,
         "camera.stop": h_camera_stop,
+        "wm.list": h_wm_list,
+        "wm.activate": h_wm_activate,
         "notify.subscribe": h_notify_subscribe,
     }
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import websockets
 
 CFG = json.loads(
-    (Path.home() / "AppData/Roaming/Rein/config.json").read_text())
+    (Path.home() / "AppData/Roaming/Sudo/config.json").read_text())
 
 CMD = ('powershell -NoProfile -Command '
        '"(New-Object -ComObject Shell.Application).MinimizeAll()"')

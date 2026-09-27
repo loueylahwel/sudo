@@ -100,6 +100,8 @@ Events are pushed without an `id`:
 | `screen.stop` | – | `{ streaming: false }` |
 | `camera.start` | `fps?` (dflt 10), `max_width?` (dflt 640) | `{ streaming: true }` – webcam frames stream as PJF1 packets |
 | `camera.stop` | – | `{ streaming: false }` |
+| `wm.list` | – | `{ windows: [{id, title, pid, process}] }` – top-level windows, what Alt-Tab would show (Windows only) |
+| `wm.activate` | `id` (a `wm.list` window id) | `{ activated: true }` – brings that window to the foreground |
 | `input` | see below | `{}` |
 | `notify.subscribe` | – | currently returns `ok:false` (not implemented yet) |
 

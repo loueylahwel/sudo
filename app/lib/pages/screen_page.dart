@@ -203,7 +203,7 @@ class _ScreenPageState extends State<ScreenPage>
     _starting = true;
     try {
       final resp = await _client.request('screen.start',
-          {'codec': 'jpeg', 'fps': 12, 'quality': 55, 'max_width': 1152,
+          {'codec': 'jpeg', 'fps': 15, 'quality': 65, 'max_width': 1152,
            'binary': true});
       if (!mounted) return;
       if (resp['codec'] == 'h264') {
@@ -642,6 +642,19 @@ class _ScreenPageState extends State<ScreenPage>
     _pointerId = null;
   }
 
+  void _showWindowSwitcher() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.6,
+        builder: (ctx, scrollCtrl) =>
+            WindowSwitcherSheet(client: _client, scrollController: scrollCtrl),
+      ),
+    );
+  }
+
   void _openKeyboard() {
     showModalBottomSheet<void>(
       context: context,
@@ -787,6 +800,11 @@ class _ScreenPageState extends State<ScreenPage>
                 ),
               ),
             ),
+          ),
+          IconButton(
+            tooltip: 'Switch app',
+            icon: const Icon(Icons.apps),
+            onPressed: _showWindowSwitcher,
           ),
           IconButton(
             tooltip: 'Keyboard',
@@ -960,6 +978,124 @@ class _ScreenPageState extends State<ScreenPage>
           },
         ),
       ),
+    );
+  }
+}
+
+/// Lists the PC's top-level windows (what Alt-Tab would show) and switches
+/// to one with a tap.
+class WindowSwitcherSheet extends StatefulWidget {
+  const WindowSwitcherSheet({
+    super.key,
+    required this.client,
+    required this.scrollController,
+  });
+
+  final RelayClient client;
+  final ScrollController scrollController;
+
+  @override
+  State<WindowSwitcherSheet> createState() => _WindowSwitcherSheetState();
+}
+
+class _WindowSwitcherSheetState extends State<WindowSwitcherSheet> {
+  List<Map<String, dynamic>>? _windows;
+  String? _error;
+  // The id of the window currently being switched to, so the tile shows a
+  // spinner and every other tile is disabled until the switch resolves.
+  Object? _switchingId;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    try {
+      final data = await widget.client.request('wm.list');
+      final list = (data['windows'] as List? ?? [])
+          .map((e) => (e as Map).cast<String, dynamic>())
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _windows = list;
+        _error = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = '$e');
+    }
+  }
+
+  Future<void> _activate(Map<String, dynamic> win) async {
+    final id = win['id'];
+    if (id == null || _switchingId != null) return;
+    setState(() => _switchingId = id);
+    try {
+      await widget.client.request('wm.activate', {'id': id});
+      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _switchingId = null);
+      showError(context, e);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final wins = _windows;
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Text('Switch app', style: Theme.of(context).textTheme.titleMedium),
+              const Spacer(),
+              IconButton(
+                tooltip: 'Refresh',
+                icon: const Icon(Icons.refresh),
+                onPressed: () => unawaited(_load()),
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: _error != null
+              ? Center(child: Text(_error!))
+              : wins == null
+                  ? const Center(child: CircularProgressIndicator())
+                  : wins.isEmpty
+                      ? const Center(child: Text('No open windows'))
+                      : ListView.builder(
+                          controller: widget.scrollController,
+                          itemCount: wins.length,
+                          itemBuilder: (context, i) {
+                            final w = wins[i];
+                            final id = w['id'];
+                            final busy = _switchingId != null && _switchingId == id;
+                            return ListTile(
+                              enabled: _switchingId == null,
+                              leading: const Icon(Icons.window_outlined),
+                              title: Text('${w['title'] ?? '?'}',
+                                  overflow: TextOverflow.ellipsis),
+                              subtitle: Text('${w['process'] ?? '?'}'),
+                              trailing: busy
+                                  ? const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child:
+                                          CircularProgressIndicator(strokeWidth: 2),
+                                    )
+                                  : null,
+                              onTap: () => unawaited(_activate(w)),
+                            );
+                          },
+                        ),
+        ),
+      ],
     );
   }
 }

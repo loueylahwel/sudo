@@ -20,12 +20,24 @@ Shipped to the phone and the Windows PC, and tested:
 - The router has no NAT loopback, so the public IP can't be tested from inside the LAN.
 - **Residual:** the first token is still issued over plain ws on the LAN. Rotating the token over TLS would close that.
 
-## Next: Linux
+## Linux (the owner chose Kubuntu 26.04, KDE Plasma)
 
-The owner is formatting the PC and moving to Linux. The agent does NOT run on Linux yet.
-- The plan is in docs/linux-port-plan.md (feature matrix, phases 0-5). It recommends Ubuntu 26.04 LTS with GNOME on Wayland.
-- remote_access.py itself is portable (stdlib + cryptography).
-- Still open with the owner: which distro and desktop, whether it must work with nobody at the PC, and the other questions at the end of the plan.
+The relay/middle-server idea was dropped by the owner. Direct remote access stays in the code; it does nothing while Ooredoo blocks inbound.
+
+The agent is Linux-ready:
+- **Install** with `bash agent/linux/install.sh`. It installs the apt packages, copies the agent to ~/.local/share/sudo-agent with a venv, and enables a systemd user unit tied to graphical-session.target. The unit restarts the agent until the display is reachable.
+- **Tested** with the real installer on Ubuntu 26.04 under WSL. Everything passed over the protocol: pairing, sys.info, fs.shortcuts (Home / Computer=/), fs.list, sys.exec (bash), processes, clipboard (xclip), media.info (playerctl/MPRIS), power (dry run), remote.info and screen capture with X11 forced.
+- **Wayland session:** screen.start answers with a clear message. The agent can't capture yet.
+- **Screen and mouse on Kubuntu 26.04 (Wayland-only by default):** install `plasma-session-x11` and pick "Plasma (X11)" at login. mss and pynput then work.
+- **App:** the Files page joins paths with '/' on Linux PCs.
+
+Next on the real Kubuntu machine, in order:
+1. Install, pair and smoke-test on Plasma (X11).
+2. Native KDE Wayland: xdg-desktop-portal RemoteDesktop + ScreenCast (one Allow click, restore_token), PipeWire frames via GStreamer pipewiresrc, and portal Notify* input. See linux-port-plan.md.
+3. Brightness via powerdevil (org.kde.ScreenBrightness).
+4. Window switcher and dock via KWin scripts.
+5. Phone as second monitor via a portal VIRTUAL source.
+6. Phone audio via a PipeWire null sink.
 
 After reinstalling:
 1. The PC gets a new TLS certificate, so on the phone remove the PC and pair again on the LAN. The pin is trust-on-first-use, and a re-pair resets it.

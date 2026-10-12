@@ -46,8 +46,14 @@ import psutil
 import pyperclip
 import websockets
 from PIL import Image, ImageDraw
-from pynput.keyboard import Controller as KbController, Key
-from pynput.mouse import Button, Controller as MouseController
+try:
+    from pynput.keyboard import Controller as KbController, Key
+    from pynput.mouse import Button, Controller as MouseController
+except Exception as _input_error:  # Linux with no X display reachable
+    raise SystemExit(
+        f"[agent] can't reach the desktop for mouse/keyboard control "
+        f"({_input_error}). Start the agent inside the desktop session "
+        "(the systemd user unit from agent/linux/install.sh does).")
 
 from brightness import BrightnessControl
 from remote_access import is_lan_address
@@ -71,6 +77,16 @@ def ensure_single_instance():
     exits quietly instead of fighting over the relay registration."""
     global _MUTEX_HANDLE
     if platform.system() != "Windows":
+        # Linux/macOS: an exclusive lock on a file in the config folder,
+        # released by the OS when the process dies.
+        import fcntl
+        path = _default_config_path().parent / "agent.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _MUTEX_HANDLE = open(path, "w")
+        try:
+            fcntl.flock(_MUTEX_HANDLE, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
         return True
     import ctypes
     _MUTEX_HANDLE = ctypes.windll.kernel32.CreateMutexW(
@@ -161,6 +177,16 @@ def save_config(cfg):
 MONITORS_TTL = 3.0  # seconds a queried monitor list is trusted
 _monitors_lock = threading.Lock()
 _monitors_cache = None  # (monotonic time, [mss monitor dicts])
+
+
+def wayland_session():
+    """True on a Linux Wayland session: X11 capture and input (mss, pynput)
+    only reach Xwayland windows there. SUDO_FORCE_X11=1 overrides (tests,
+    or a compositor that mirrors the desktop into Xwayland)."""
+    if platform.system() != "Linux" or os.environ.get("SUDO_FORCE_X11"):
+        return False
+    return (os.environ.get("XDG_SESSION_TYPE") == "wayland"
+            or bool(os.environ.get("WAYLAND_DISPLAY")))
 
 
 def new_mss():
@@ -1620,8 +1646,11 @@ def delete_path(path):
 # ---------------------------------------------------------------- system
 
 def run_command(cmd, cwd=None, timeout=30):
+    # Linux: bash, not /bin/sh (dash), so commands behave like a terminal.
+    bash = "/bin/bash" if platform.system() == "Linux" \
+        and os.path.exists("/bin/bash") else None
     proc = subprocess.run(
-        cmd, shell=True, cwd=cwd or None,
+        cmd, shell=True, cwd=cwd or None, executable=bash,
         capture_output=True, text=True, timeout=int(timeout),
         errors="replace",
     )
@@ -1718,7 +1747,11 @@ POWER_CMDS = {
         "hibernate": "shutdown /h",
     },
     "Linux": {
-        "lock": "loginctl lock-session",
+        # loginctl needs a session id, which a systemd user service lacks;
+        # the desktop's screensaver D-Bus API (KDE, GNOME) always works.
+        "lock": "loginctl lock-session 2>/dev/null || dbus-send --session "
+                "--dest=org.freedesktop.ScreenSaver --type=method_call "
+                "/ScreenSaver org.freedesktop.ScreenSaver.Lock",
         "shutdown": "systemctl poweroff",
         "restart": "systemctl reboot",
         "sleep": "systemctl suspend",
@@ -1847,11 +1880,42 @@ def _run_media_ps1(extra_args):
     return json.loads(out) if out else {}
 
 
+def _playerctl(*args):
+    """playerctl (MPRIS, any Linux media player) output, or None when it
+    isn't installed or no player is running."""
+    try:
+        proc = subprocess.run(["playerctl", *args], capture_output=True,
+                              text=True, timeout=3, errors="replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
 def _media_info():
+    if platform.system() != "Windows":
+        out = _playerctl("metadata", "--format",
+                         "{{status}}\t{{title}}\t{{artist}}\t"
+                         "{{position}}\t{{mpris:length}}")
+        if not out:
+            return {}
+        status, title, artist, pos, length = (out.split("\t") + [""] * 5)[:5]
+
+        def seconds(us):
+            try:
+                return int(us) / 1e6
+            except ValueError:
+                return 0.0
+
+        return {"title": title, "artist": artist,
+                "playing": status == "Playing",
+                "position_s": seconds(pos), "duration_s": seconds(length)}
     return _run_media_ps1([])
 
 
 def _media_seek(seconds):
+    if platform.system() != "Windows":
+        _playerctl("position", str(max(0.0, float(seconds))))
+        return _media_info()
     return _run_media_ps1(["-Seek", str(seconds)])
 
 
@@ -2276,7 +2340,10 @@ class Agent:
             p = home / name
             if p.exists():
                 items.append((name, str(p)))
-        items.append(("Drives", ""))
+        if platform.system() == "Windows":
+            items.append(("Drives", ""))
+        else:
+            items.append(("Computer", "/"))
         return {"shortcuts": [{"name": n, "path": p} for n, p in items]}
 
     async def h_fs_download(self, msg):
@@ -2450,6 +2517,11 @@ class Agent:
         # Validate everything before touching the running stream: a bad
         # request must fail without freezing the phone's current picture.
         # max_age=0: monitors may have changed since the last query.
+        if wayland_session():
+            raise ValueError(
+                "This PC is in a Wayland session, which Sudo can't capture "
+                "yet. On Kubuntu: install plasma-session-x11, log out and "
+                "pick 'Plasma (X11)' on the login screen.")
         rect = await asyncio.to_thread(self.resolve_monitor, spec, 0)
         settings = None
         if codec != "h264":

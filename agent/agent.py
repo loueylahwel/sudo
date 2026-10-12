@@ -56,6 +56,7 @@ except Exception as _input_error:  # Linux with no X display reachable
         "(the systemd user unit from agent/linux/install.sh does).")
 
 from brightness import BrightnessControl
+import kdeapps
 from remote_access import is_lan_address
 
 if getattr(sys, "frozen", False) and sys.stdout is None:
@@ -2185,6 +2186,10 @@ class Agent:
         self.embedded = None         # EmbeddedRelay when running standalone
         self.approval = None         # ApprovalManager (service mode)
         self.brightness = BrightnessControl()
+        # wm.* / apps.* on KDE Plasma (X11 and Wayland) go through KWin
+        # scripts (kdeapps.py); on Windows through winapps.py.
+        self.kde_apps = kdeapps.KdeApps(list_monitors) \
+            if platform.system() == "Linux" and kdeapps.available() else None
         # Scheduled power action: {"action", "at" (unix s)} or None. Kept
         # in cfg["power_schedule"] too, so power.status survives a restart.
         self.power_sched = None
@@ -2649,6 +2654,8 @@ class Agent:
         return {"streaming": False}
 
     async def h_wm_list(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.list_windows(bool(msg.get("icons", True)))
         winapps = _winapps()
         # The phone lists windows as the Screen page opens and its switcher
         # asks for the Start-menu apps soon after: load those in the
@@ -2661,39 +2668,58 @@ class Agent:
             winapps.list_windows, bool(msg.get("icons", True)))
 
     async def h_wm_thumb(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.window_thumb(
+                _target(msg, "window"), msg.get("max_width", 360))
         return await asyncio.to_thread(
             _winapps().window_thumb, _target(msg, "window"),
             msg.get("max_width", 360))
 
     async def h_wm_activate(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.activate_window(_target(msg, "window"))
         return await asyncio.to_thread(
             _winapps().activate_window, _target(msg, "window"))
 
     async def h_wm_close(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.close_window(_target(msg, "window"))
         return await asyncio.to_thread(
             _winapps().close_window, _target(msg, "window"))
 
     async def h_wm_minimize(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.minimize_window(_target(msg, "window"))
         return await asyncio.to_thread(
             _winapps().minimize_window, _target(msg, "window"))
 
     async def h_wm_maximize(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.maximize_window(_target(msg, "window"))
         return await asyncio.to_thread(
             _winapps().maximize_window, _target(msg, "window"))
 
     async def h_wm_restore(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.restore_window(_target(msg, "window"))
         return await asyncio.to_thread(
             _winapps().restore_window, _target(msg, "window"))
 
     async def h_apps_list(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.list_start_apps(bool(msg.get("refresh", False)))
         return await asyncio.to_thread(
             _winapps().list_start_apps, bool(msg.get("refresh", False)))
 
     async def h_apps_icon(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.start_app_icon(_target(msg, "app"))
         return await asyncio.to_thread(
             _winapps().start_app_icon, _target(msg, "app"))
 
     async def h_apps_launch(self, msg):
+        if self.kde_apps:
+            return await self.kde_apps.launch_start_app(_target(msg, "app"))
         return await asyncio.to_thread(
             _winapps().launch_start_app, _target(msg, "app"))
 

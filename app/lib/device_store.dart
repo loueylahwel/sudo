@@ -10,6 +10,9 @@ class SavedDevice {
       {required this.relayUrl,
       this.code = '',
       this.token = '',
+      this.remoteUrl = '',
+      this.certSha256 = '',
+      this.tlsPort = 0,
       required this.name});
 
   final String relayUrl;
@@ -21,6 +24,36 @@ class SavedDevice {
   /// devices paired before the agent supported approval (or older agents).
   final String token;
 
+  /// The PC's TLS port and the SHA-256 of its certificate (pinned), learned
+  /// from `remote.info` on the first connection. Once known, every
+  /// connection — LAN included — goes through that port, so the token never
+  /// travels in clear text again. Kept until the PC is paired anew.
+  final String certSha256;
+  final int tlsPort;
+
+  /// How to reach the PC from outside the home network
+  /// (`wss://<public ip>:<tlsPort>`); empty until the PC's router forward
+  /// works.
+  final String remoteUrl;
+
+  bool get hasPin => certSha256.length == 64 && tlsPort > 0;
+  bool get hasRemote => hasPin && remoteUrl.isNotEmpty;
+
+  SavedDevice copyWith(
+          {String? relayUrl,
+          String? token,
+          String? remoteUrl,
+          String? certSha256,
+          int? tlsPort}) =>
+      SavedDevice(
+          relayUrl: relayUrl ?? this.relayUrl,
+          code: code,
+          name: name,
+          token: token ?? this.token,
+          remoteUrl: remoteUrl ?? this.remoteUrl,
+          certSha256: certSha256 ?? this.certSha256,
+          tlsPort: tlsPort ?? this.tlsPort);
+
   /// Old saved entries may carry extra keys (e.g. `lanUrl`) or lack newer
   /// ones (e.g. `token`); they are simply ignored/defaulted so they still
   /// load.
@@ -29,10 +62,20 @@ class SavedDevice {
         code: json['code'] as String? ?? '',
         name: json['name'] as String? ?? '',
         token: json['token'] as String? ?? '',
+        remoteUrl: json['remoteUrl'] as String? ?? '',
+        certSha256: json['certSha256'] as String? ?? '',
+        tlsPort: (json['tlsPort'] as num?)?.toInt() ?? 0,
       );
 
-  Map<String, dynamic> toJson() =>
-      {'relayUrl': relayUrl, 'code': code, 'name': name, 'token': token};
+  Map<String, dynamic> toJson() => {
+        'relayUrl': relayUrl,
+        'code': code,
+        'name': name,
+        'token': token,
+        'remoteUrl': remoteUrl,
+        'certSha256': certSha256,
+        'tlsPort': tlsPort,
+      };
 }
 
 /// Persists the list of saved PCs in shared_preferences as a JSON list.

@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 /// An event pushed by the agent/relay without a request id
@@ -16,7 +19,8 @@ class RelayEvent {
 /// One decoded binary screen frame (`PJF1` packet: magic + little-endian
 /// header length + UTF-8 JSON header + JPEG payload).
 class ScreenFrame {
-  ScreenFrame(this.jpegBytes, this.w, this.h, {this.src = 'screen'});
+  ScreenFrame(this.jpegBytes, this.w, this.h,
+      {this.src = 'screen', this.header = const {}});
 
   final Uint8List jpegBytes;
   final int w;
@@ -26,17 +30,29 @@ class ScreenFrame {
   /// capture, `"camera"` for the webcam. Older agents send no `src`, and
   /// their frames default to `'screen'`.
   final String src;
+
+  /// The whole `PJF1` JSON header. Newer agents add the effective stream
+  /// settings (`q` = JPEG quality, `preset`); older ones send only
+  /// `w`/`h`/`src`.
+  final Map<String, dynamic> header;
 }
 
 /// One `H264` binary packet: the JSON header (carries `w`, `h`, `codec`,
-/// `encoder`, `fps`) plus the raw H.264 Annex-B bytestream chunk that
-/// followed it. Chunks are arbitrary splits of one continuous bytestream
-/// (SPS/PPS lead it); they must be fed, in order, to the platform decoder.
+/// `encoder`, `capture`, `fps`, `key`, `ts`) plus exactly ONE H.264 access
+/// unit in Annex-B form (AUD first; SPS/PPS ahead of every IDR). Feed them
+/// to the platform decoder in order, one AU per input buffer.
 class VideoChunk {
   VideoChunk(this.header, this.data);
 
   final Map<String, dynamic> header;
   final Uint8List data;
+
+  /// True for a keyframe (IDR) access unit — the only place a decoder can
+  /// (re)start.
+  bool get key => header['key'] == true;
+
+  /// Capture timestamp in milliseconds since the stream started.
+  int get ts => (header['ts'] as num?)?.toInt() ?? 0;
 }
 
 /// Outcome of [connectAndPair]: the `paired` handshake reply plus the
@@ -84,9 +100,10 @@ Future<PairResult> connectAndPair(
   String? token,
   String? name,
   Duration? timeout,
+  String? pinSha256,
   void Function()? onApprovalPending,
 }) async {
-  await client.connect(relayUrl, timeout: timeout);
+  await client.connect(relayUrl, timeout: timeout, pinSha256: pinSha256);
   final paired = await client.pair(
       code: code,
       token: token,
@@ -122,6 +139,8 @@ class RelayClient {
       StreamController<ScreenFrame>.broadcast();
   final StreamController<VideoChunk> _videoChunksCtrl =
       StreamController<VideoChunk>.broadcast();
+  final StreamController<Uint8List> _audioChunksCtrl =
+      StreamController<Uint8List>.broadcast();
   final StreamController<bool> _connCtrl = StreamController<bool>.broadcast();
   final StreamController<Map<String, dynamic>> _commandsCtrl =
       StreamController<Map<String, dynamic>>.broadcast();
@@ -143,9 +162,13 @@ class RelayClient {
   /// source is idle — consumers should keep showing the last one.
   Stream<ScreenFrame> get screenFrames => _framesCtrl.stream;
 
-  /// Binary `H264` packets from `screen.start` with `codec: 'h264'`: raw
-  /// Annex-B bytestream chunks for the hardware decoder, in wire order.
+  /// Binary `H264` packets from `screen.start` with `codec: 'h264'`: one
+  /// Annex-B access unit each, for the hardware decoder, in wire order.
   Stream<VideoChunk> get videoChunks => _videoChunksCtrl.stream;
+
+  /// `PCM1` packets after `phone.audio {enabled: true}`: 40 ms of the PC's
+  /// phone-screen sound as 16-bit little-endian stereo PCM at 48 kHz.
+  Stream<Uint8List> get audioChunks => _audioChunksCtrl.stream;
 
   /// Emits `true` when the socket comes up, `false` when it drops.
   Stream<bool> get connectionState => _connCtrl.stream;
@@ -155,9 +178,29 @@ class RelayClient {
   /// Opens the WebSocket to [relayUrl] (e.g. `ws://192.168.1.10:8080`).
   /// When [timeout] is given, a socket that isn't ready in time is closed
   /// and the call fails with [RelayException].
-  Future<void> connect(String relayUrl, {Duration? timeout}) async {
+  ///
+  /// [pinSha256] (for `wss://`, the agent's remote-access port): the
+  /// SHA-256 hex of the only certificate accepted. The PC's certificate is
+  /// self-signed, so no CA vouches for it; the phone learned this hash on
+  /// the LAN. No CA roots are trusted at all here, so the pin is checked
+  /// for every certificate — a CA-signed one for the same address would
+  /// not get past it either.
+  Future<void> connect(String relayUrl,
+      {Duration? timeout, String? pinSha256}) async {
     await disconnect();
-    final channel = WebSocketChannel.connect(Uri.parse(relayUrl));
+    HttpClient? tlsClient;
+    if (pinSha256 != null && pinSha256.isNotEmpty) {
+      final pin = pinSha256.toLowerCase();
+      tlsClient = HttpClient(context: SecurityContext(withTrustedRoots: false))
+        ..badCertificateCallback = (cert, host, port) =>
+            sha256.convert(cert.der).toString() == pin;
+    }
+    // Compression off: the stream is JPEG/H.264, which doesn't compress, and
+    // an agent that accepted the default offer deflated every frame on its
+    // event loop (stalling cursor input) while this phone inflated them.
+    final channel = IOWebSocketChannel(WebSocket.connect(relayUrl,
+        compression: CompressionOptions.compressionOff,
+        customClient: tlsClient));
     _channel = channel;
     try {
       await (timeout == null ? channel.ready : channel.ready.timeout(timeout));
@@ -378,8 +421,8 @@ class RelayClient {
   /// or `"camera"`; a missing `src` means `"screen"` (older agents).
   ///
   /// `H264` layout: `[4B "H264"][4B LE uint32 headerLen][headerLen bytes
-  /// UTF-8 JSON header {"w","h","codec","encoder","fps"}][raw Annex-B
-  /// bytestream chunk]`.
+  /// UTF-8 JSON header {"w","h","codec","encoder","capture","fps","key",
+  /// "ts"}][one Annex-B access unit]`.
   void _onBinaryMessage(dynamic raw) {
     // web_socket_channel normally delivers Uint8List, but accept any
     // List<int> so a different implementation can't silently break us.
@@ -392,6 +435,18 @@ class RelayClient {
         bytes[2] == 0x36 &&
         bytes[3] == 0x34) {
       _onH264Packet(bytes);
+      return;
+    }
+    // 0x50 'P', 0x43 'C', 0x4D 'M', 0x31 '1': phone-screen sound.
+    if (bytes[0] == 0x50 &&
+        bytes[1] == 0x43 &&
+        bytes[2] == 0x4D &&
+        bytes[3] == 0x31) {
+      final headerLen =
+          ByteData.sublistView(bytes).getUint32(4, Endian.little);
+      if (bytes.length > 8 + headerLen) {
+        _audioChunksCtrl.add(Uint8List.sublistView(bytes, 8 + headerLen));
+      }
       return;
     }
     // 0x50 'P', 0x4A 'J', 0x46 'F', 0x31 '1'.
@@ -410,7 +465,7 @@ class RelayClient {
       final h = (header['h'] as num?)?.toInt() ?? 0;
       final src = header['src'] as String? ?? 'screen';
       final jpeg = Uint8List.sublistView(bytes, 8 + headerLen);
-      _framesCtrl.add(ScreenFrame(jpeg, w, h, src: src));
+      _framesCtrl.add(ScreenFrame(jpeg, w, h, src: src, header: header));
     } catch (_) {
       // Malformed packet; drop it and wait for the next one.
     }

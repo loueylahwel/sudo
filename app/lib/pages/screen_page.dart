@@ -1,17 +1,47 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 import '../client_registry.dart';
+import '../frame_view.dart';
+import '../orientation.dart';
+import '../live_typing.dart';
 import '../relay_client.dart';
 import '../util.dart';
+import 'window_switcher.dart';
 
 enum _GestureState { idle, pressing, dragging, longPressPending, dragSelect }
 
 enum _TwoFingerMode { pinch, scroll }
+
+/// The one stream mode: JPEG, the agent's adaptive `auto` preset (width and
+/// quality step down when Wi-Fi backs up) at up to 60 fps. Agents that cap
+/// fps lower simply send fewer frames.
+///
+/// `ack`: this app acks every frame it receives (`screen.ack`), and the
+/// agent keeps at most two frames unacked — so frames can never queue up on
+/// a slow or bursty Wi-Fi link (the picture lagging behind the cursor).
+const Map<String, dynamic> _streamParams = {
+  'codec': 'jpeg',
+  'preset': 'auto',
+  'fps': 60,
+  'binary': true,
+  'ack': true,
+};
+
+/// What this app sent before presets existed, for agents that ignore
+/// `preset` (they answer without one).
+const Map<String, dynamic> _legacyStreamParams = {
+  'codec': 'jpeg',
+  'fps': 15,
+  'quality': 65,
+  'max_width': 1152,
+  'binary': true,
+};
 
 class ScreenPage extends StatefulWidget {
   const ScreenPage({super.key, required this.client});
@@ -32,14 +62,21 @@ class _ScreenPageState extends State<ScreenPage>
   StreamSubscription<RelayEvent>? _eventSub;
   StreamSubscription<ScreenFrame>? _frameSub;
   StreamSubscription<bool>? _connSub;
-  // The last frame received (binary or legacy base64). Never cleared while
-  // the page is open: the agent skips unchanged frames, so an idle PC sends
-  // nothing and the UI must keep showing the last frame indefinitely.
-  Uint8List? _frame;
+  // The last decoded frame. Never cleared while the page is open: the agent
+  // skips unchanged frames, so an idle PC sends nothing and the UI must keep
+  // showing the last frame indefinitely.
+  late final FrameDecoder _decoder = FrameDecoder(onDecoded: _onDecoded);
+  // The last frame and its size when a Screen page closed, shown the
+  // moment the next one opens — the PC screen appears at once instead of a
+  // blank page, and live frames replace it within a fraction of a second.
+  static ui.Image? _cachedImage;
+  static int _cachedW = 16;
+  static int _cachedH = 9;
+  // The agent agreed to flow control (screen.start answered `ack: true`).
+  bool _acks = false;
   int _frameW = 16;
   int _frameH = 9;
   Rect _imageRect = Rect.zero;
-  bool _streaming = false;
   // True from socket loss until the stream is back (first frame after
   // reconnection, or `agent.online`). Drives the reconnecting overlay.
   bool _connectionLost = false;
@@ -50,15 +87,13 @@ class _ScreenPageState extends State<ScreenPage>
   // `screen.frame` events (older agents).
   bool _binaryMode = false;
 
-  // H.264 hardware-decoded path (agents that answer `codec: 'h264'`): the
-  // chunks go to the platform MediaCodec decoder over this channel, which
-  // renders into the texture below. Anything else keeps the JPEG flow.
-  static const MethodChannel _videoChannel = MethodChannel('pcocket/video');
-  StreamSubscription<VideoChunk>? _videoSub;
-  bool _h264Mode = false;
-  bool _videoStartRequested = false;
-  bool _restartingOnCodecError = false;
-  int? _textureId;
+  // Set when screen.start answered without `preset`: the agent predates
+  // presets and fell back to its own low defaults, so requests carry the
+  // explicit settings this app always sent instead.
+  bool _legacyAgent = false;
+  // A restart requested while a screen.start was in flight;
+  // _startStream runs again once the current one finishes.
+  bool _restartPending = false;
 
   double _scrollAccum = 0;
   double _scrollAccumX = 0;
@@ -108,8 +143,6 @@ class _ScreenPageState extends State<ScreenPage>
   static const Duration _tapMaxDuration = Duration(milliseconds: 300);
   static const Duration _doubleTapWindow = Duration(milliseconds: 300);
 
-  final _keyboardCtrl = TextEditingController();
-
   // Voice dictation: hold the app-bar mic to talk. speech_to_text requests
   // the RECORD_AUDIO runtime permission itself inside initialize(). Only
   // FINAL results are typed at the PC cursor; partials just render in the
@@ -119,14 +152,38 @@ class _ScreenPageState extends State<ScreenPage>
   bool _listening = false;
   String _dictationText = '';
   late final AnimationController _pulseCtrl = AnimationController(
-      vsync: this, duration: const Duration(milliseconds: 900));
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  );
+
+  // App dock along the bottom edge (running PC apps, tap to switch). The
+  // key lets the page re-list right after the switcher sheet closes.
+  final _dockKey = GlobalKey<AppDockState>();
+  // The gesture cheat-sheet only shows for the first seconds, then fades
+  // out — permanently, it just covered the PC screen.
+  bool _showGestureHint = true;
+  Timer? _gestureHintTimer;
+
+  // Full screen: the PC screen alone — no app bar, no dock, no system bars.
+  // Automatic whenever the phone is landscape; the app-bar button forces
+  // it (and landscape) from portrait, and Back leaves it.
+  bool _fullscreenForced = false;
+  bool? _immersive; // the system-bar mode last applied
 
   @override
   void initState() {
     super.initState();
+    final cached = _cachedImage;
+    if (cached != null) {
+      _decoder.image.value = cached.clone();
+      _frameW = _cachedW;
+      _frameH = _cachedH;
+    }
+    _gestureHintTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() => _showGestureHint = false);
+    });
     _bindClient(_client);
     _registrySub = ClientRegistry.instance.onChange.listen(_onRegistryClient);
-    _videoChannel.setMethodCallHandler(_onVideoChannelCall);
     // If a reconnect already replaced the client before this page opened,
     // the passed-in one is stale: switch to the registry's live one.
     final current = ClientRegistry.instance.client;
@@ -134,41 +191,27 @@ class _ScreenPageState extends State<ScreenPage>
     _startStream();
   }
 
-  /// The native decoder wedged (usually a corrupt frame after a hiccup):
-  /// restart the stream from the agent — fresh SPS/PPS + IDR resyncs the
-  /// picture cleanly instead of the green corruption of a mid-GOP decode.
-  Future<void> _onVideoChannelCall(MethodCall call) async {
-    if (call.method != 'onCodecError' || _restartingOnCodecError) return;
-    _restartingOnCodecError = true;
-    try {
-      try {
-        await _client.request('screen.stop');
-      } catch (_) {
-        // Agent unreachable; _startStream's own error path handles it.
-      }
-      await _startStream();
-    } finally {
-      _restartingOnCodecError = false;
-    }
-  }
-
   @override
   void dispose() {
     _lpTimer?.cancel();
     _moveFlushTimer?.cancel();
+    _gestureHintTimer?.cancel();
+    if (_fullscreenForced) unawaited(unlockOrientation());
+    if (_immersive == true) {
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+    }
     _registrySub?.cancel();
     _eventSub?.cancel();
     _frameSub?.cancel();
     _connSub?.cancel();
-    _videoSub?.cancel();
-    _videoChannel.setMethodCallHandler(null);
-    if (_videoStartRequested) {
-      _videoStartRequested = false;
-      // Fire-and-forget: dispose cannot await, and the native side tears
-      // the codec down off the UI thread anyway.
-      unawaited(_videoChannel.invokeMethod<bool>('stop'));
+    // Keep the last frame for the next Screen page (see _cachedImage).
+    final last = _decoder.dispose();
+    if (last != null) {
+      _cachedImage?.dispose();
+      _cachedImage = last;
+      _cachedW = _frameW;
+      _cachedH = _frameH;
     }
-    _keyboardCtrl.dispose();
     _pulseCtrl.dispose();
     unawaited(_speech.stop());
     _client.send('screen.stop');
@@ -180,8 +223,6 @@ class _ScreenPageState extends State<ScreenPage>
     _eventSub?.cancel();
     _frameSub?.cancel();
     _connSub?.cancel();
-    _videoSub?.cancel();
-    _videoSub = null;
     _client = client;
     _eventSub = client.events.listen(_onEvent);
     _frameSub = client.screenFrames.listen(_onFrame);
@@ -199,90 +240,36 @@ class _ScreenPageState extends State<ScreenPage>
   }
 
   Future<void> _startStream() async {
-    if (_starting) return; // a screen.start is already in flight
+    if (_starting) {
+      // A screen.start is already in flight; run once more after it.
+      _restartPending = true;
+      return;
+    }
     _starting = true;
     try {
-      final resp = await _client.request('screen.start',
-          {'codec': 'jpeg', 'fps': 15, 'quality': 65, 'max_width': 1152,
-           'binary': true});
+      final resp = await _client.request(
+        'screen.start',
+        _legacyAgent ? _legacyStreamParams : _streamParams,
+      );
       if (!mounted) return;
-      if (resp['codec'] == 'h264') {
-        // New agent: hardware-decoded H.264. A restart after a reconnect
-        // starts a fresh bytestream, so tear any old decoder down first.
-        await _stopVideoDecoder();
-        if (!mounted) return;
-        _h264Mode = true;
-        _videoSub ??= _client.videoChunks.listen(_onVideoChunk);
-        setState(() {
-          _streaming = true;
-          // Suppresses the legacy base64 event path; frames now arrive as
-          // H264 packets, never as screen.frame events.
-          _binaryMode = true;
-        });
-      } else {
-        // Old agent: keep the JPEG/PJF1 flow exactly as before.
-        _h264Mode = false;
-        setState(() {
-          _streaming = true;
-          _binaryMode = resp['binary'] == true;
-        });
+      if (resp['preset'] == null && !_legacyAgent) {
+        // The agent predates presets: it ignored `preset` and fell back to
+        // its own low defaults. Ask again with the explicit settings.
+        _legacyAgent = true;
+        _restartPending = true;
       }
+      setState(() {
+        _binaryMode = resp['binary'] == true;
+        _acks = resp['ack'] == true;
+      });
     } catch (e) {
       if (mounted) showError(context, e);
     } finally {
       _starting = false;
-    }
-  }
-
-  /// Feeds one H.264 chunk to the platform decoder. The first chunk of a
-  /// stream also creates the decoder with the header's geometry; SPS/PPS
-  /// lead the bytestream, so MediaCodec syncs on that first feed.
-  void _onVideoChunk(VideoChunk chunk) {
-    if (!mounted || !_h264Mode) return;
-    if (!_videoStartRequested) {
-      final w = (chunk.header['w'] as num?)?.toInt() ?? 0;
-      final h = (chunk.header['h'] as num?)?.toInt() ?? 0;
-      if (w <= 0 || h <= 0) return;
-      _videoStartRequested = true;
-      _initVideoDecoder(w, h);
-    }
-    // Fire-and-forget: platform channel calls are dispatched in order, so
-    // this feed always reaches the decoder after the `start` above.
-    unawaited(_videoChannel.invokeMethod<void>('feed', {'bytes': chunk.data}));
-  }
-
-  Future<void> _initVideoDecoder(int w, int h) async {
-    try {
-      final id =
-          await _videoChannel.invokeMethod<int>('start', {'w': w, 'h': h});
-      if (!mounted || id == null) return;
-      setState(() {
-        _textureId = id;
-        // The texture drives the layout aspect ratio now — the same fields
-        // the JPEG path uses, so the zoom/pinch math is unchanged.
-        _frameW = w;
-        _frameH = h;
-        // First chunk after a reconnect: the stream is back.
-        _connectionLost = false;
-      });
-    } on PlatformException catch (e) {
-      // Decoder failed to come up; allow a retry on the next chunk.
-      _videoStartRequested = false;
-      if (mounted) showError(context, e.message ?? 'Video decoder failed');
-    }
-  }
-
-  /// Tears down the platform decoder (stream restart or page dispose).
-  Future<void> _stopVideoDecoder() async {
-    if (!_videoStartRequested) return;
-    _videoStartRequested = false;
-    try {
-      await _videoChannel.invokeMethod<bool>('stop');
-    } on PlatformException {
-      // Decoder already gone; nothing to clean up.
-    }
-    if (mounted && _textureId != null) {
-      setState(() => _textureId = null);
+      if (_restartPending && mounted) {
+        _restartPending = false;
+        unawaited(_startStream());
+      }
     }
   }
 
@@ -294,10 +281,7 @@ class _ScreenPageState extends State<ScreenPage>
       // the agent replaces any old streamer server-side).
       _startStream();
     } else {
-      setState(() {
-        _connectionLost = true;
-        _streaming = false;
-      });
+      setState(() => _connectionLost = true);
     }
   }
 
@@ -306,13 +290,25 @@ class _ScreenPageState extends State<ScreenPage>
     // Camera frames share the same socket stream; they belong to CameraPage
     // and must never hijack the PC screen view.
     if (frame.src != 'screen') return;
-    setState(() {
-      _frame = frame.jpegBytes;
-      if (frame.w > 0) _frameW = frame.w;
-      if (frame.h > 0) _frameH = frame.h;
-      // First frame after a reconnect: the stream is back, hide the overlay.
-      _connectionLost = false;
-    });
+    // Ack on arrival: the agent sends the next frame once this one is
+    // here, so at most two are ever on the way. Decoding is newest-wins
+    // (FrameDecoder), so a slow decode can't build a queue either.
+    if (_acks) _client.send('screen.ack');
+    _decoder.add(frame.jpegBytes, frame.w, frame.h);
+  }
+
+  /// A frame was decoded: relayout only when its size changed (the auto
+  /// ladder stepped) or it is the first after a reconnect — every other
+  /// frame just repaints the picture.
+  void _onDecoded(int w, int h) {
+    if (!mounted) return;
+    if (w != _frameW || h != _frameH || _connectionLost) {
+      setState(() {
+        _frameW = w;
+        _frameH = h;
+        _connectionLost = false;
+      });
+    }
   }
 
   void _onEvent(RelayEvent event) {
@@ -329,14 +325,11 @@ class _ScreenPageState extends State<ScreenPage>
     final jpeg = event.data['jpeg'];
     if (jpeg is! String) return;
     try {
-      final bytes = base64Decode(jpeg);
-      setState(() {
-        _frame = bytes;
-        _frameW = (event.data['w'] as num?)?.toInt() ?? _frameW;
-        _frameH = (event.data['h'] as num?)?.toInt() ?? _frameH;
-        // First frame after a reconnect: the stream is back.
-        _connectionLost = false;
-      });
+      _decoder.add(
+        base64Decode(jpeg),
+        (event.data['w'] as num?)?.toInt() ?? 0,
+        (event.data['h'] as num?)?.toInt() ?? 0,
+      );
     } catch (_) {
       // Corrupt frame; wait for the next one.
     }
@@ -353,8 +346,7 @@ class _ScreenPageState extends State<ScreenPage>
     // the UI renders a new frame — and on an idle PC screen no new video
     // frames arrive, nothing renders, and the deltas would sit here unsent
     // (the "cursor only moves when the background moves" bug).
-    _moveFlushTimer ??=
-        Timer(const Duration(milliseconds: 16), _flushMoveRel);
+    _moveFlushTimer ??= Timer(const Duration(milliseconds: 16), _flushMoveRel);
   }
 
   void _flushMoveRel() {
@@ -370,8 +362,11 @@ class _ScreenPageState extends State<ScreenPage>
 
   /// Click at the PC cursor's current position (no x/y coordinates).
   void _click(String button, int count) {
-    _client.send(
-        'input', {'action': 'click', 'button': button, 'count': count});
+    _client.send('input', {
+      'action': 'click',
+      'button': button,
+      'count': count,
+    });
   }
 
   void _button(String action) {
@@ -412,9 +407,12 @@ class _ScreenPageState extends State<ScreenPage>
     final scale = (_pinchStartScale * dist / _pinchStartDist).clamp(1.0, 5.0);
     setState(() {
       _zoomScale = scale.toDouble();
-      _zoomOrigin = mid -
-          Offset(_pinchImageFrac.dx * _imageRect.width * _zoomScale,
-              _pinchImageFrac.dy * _imageRect.height * _zoomScale);
+      _zoomOrigin =
+          mid -
+          Offset(
+            _pinchImageFrac.dx * _imageRect.width * _zoomScale,
+            _pinchImageFrac.dy * _imageRect.height * _zoomScale,
+          );
     });
   }
 
@@ -439,10 +437,14 @@ class _ScreenPageState extends State<ScreenPage>
       if (!_imageRect.isEmpty) {
         final base = _zoomScale > 1.0 ? _zoomOrigin : _imageRect.topLeft;
         _pinchImageFrac = Offset(
-          ((mid.dx - base.dx) / (_imageRect.width * _zoomScale))
-              .clamp(0.0, 1.0),
-          ((mid.dy - base.dy) / (_imageRect.height * _zoomScale))
-              .clamp(0.0, 1.0),
+          ((mid.dx - base.dx) / (_imageRect.width * _zoomScale)).clamp(
+            0.0,
+            1.0,
+          ),
+          ((mid.dy - base.dy) / (_imageRect.height * _zoomScale)).clamp(
+            0.0,
+            1.0,
+          ),
         );
       }
     } else {
@@ -482,10 +484,14 @@ class _ScreenPageState extends State<ScreenPage>
         _pinchStartScale = _zoomScale;
         final base = _zoomScale > 1.0 ? _zoomOrigin : _imageRect.topLeft;
         _pinchImageFrac = Offset(
-          ((mid.dx - base.dx) / (_imageRect.width * _zoomScale))
-              .clamp(0.0, 1.0),
-          ((mid.dy - base.dy) / (_imageRect.height * _zoomScale))
-              .clamp(0.0, 1.0),
+          ((mid.dx - base.dx) / (_imageRect.width * _zoomScale)).clamp(
+            0.0,
+            1.0,
+          ),
+          ((mid.dy - base.dy) / (_imageRect.height * _zoomScale)).clamp(
+            0.0,
+            1.0,
+          ),
         );
       }
       // A not-yet-committed primary can't turn into tap/long-press anymore.
@@ -566,7 +572,7 @@ class _ScreenPageState extends State<ScreenPage>
         if (DateTime.now().difference(_downTime) <= _tapMaxDuration) {
           _onTap();
         }
-        // Longer holds that never reached the long-press timer do nothing.
+      // Longer holds that never reached the long-press timer do nothing.
       case _GestureState.longPressPending:
         _click('right', 1);
       case _GestureState.dragSelect:
@@ -642,15 +648,33 @@ class _ScreenPageState extends State<ScreenPage>
     _pointerId = null;
   }
 
-  void _showWindowSwitcher() {
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) => DraggableScrollableSheet(
-        expand: false,
-        initialChildSize: 0.6,
-        builder: (ctx, scrollCtrl) =>
-            WindowSwitcherSheet(client: _client, scrollController: scrollCtrl),
+  Future<void> _showWindowSwitcher() async {
+    await showWindowSwitcher(context, _client);
+    // A switch or launch just changed the PC's windows: update the dock
+    // now instead of on its next periodic refresh.
+    unawaited(_dockKey.currentState?.refresh());
+  }
+
+  void _enterFullscreen() {
+    setState(() => _fullscreenForced = true);
+    // Either way round, following the phone (even with rotation locked).
+    unawaited(lockSensorLandscape());
+  }
+
+  void _exitFullscreen() {
+    setState(() => _fullscreenForced = false);
+    // Back to the system's rotation: held sideways, it stays full screen.
+    unawaited(unlockOrientation());
+  }
+
+  /// Hides the status and navigation bars in full screen (a swipe from the
+  /// edge brings them back for a moment), restores them otherwise.
+  void _syncSystemBars(bool fullscreen) {
+    if (_immersive == fullscreen) return;
+    _immersive = fullscreen;
+    unawaited(
+      SystemChrome.setEnabledSystemUIMode(
+        fullscreen ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
       ),
     );
   }
@@ -669,49 +693,19 @@ class _ScreenPageState extends State<ScreenPage>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(
-              controller: _keyboardCtrl,
-              autofocus: true,
-              decoration: const InputDecoration(
-                labelText: 'Type on the PC',
-                border: OutlineInputBorder(),
-              ),
-              onSubmitted: (_) => _sendKeyboardText(),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                TextButton.icon(
-                  onPressed: () =>
-                      _client.send('input', {'action': 'key', 'key': 'backspace'}),
-                  icon: const Icon(Icons.backspace_outlined),
-                  label: const Text('Backspace'),
-                ),
-                TextButton.icon(
-                  onPressed: () =>
-                      _client.send('input', {'action': 'key', 'key': 'enter'}),
-                  icon: const Icon(Icons.keyboard_return),
-                  label: const Text('Enter'),
-                ),
-                FilledButton(
-                  onPressed: _sendKeyboardText,
-                  child: const Text('Send'),
-                ),
-              ],
+            // Live: every keystroke, delete and Enter on the phone
+            // keyboard goes straight to the PC (see LiveTypingField).
+            LiveTypingField(
+              label: 'Type on the PC',
+              onText: (text) =>
+                  _client.send('input', {'action': 'text', 'text': text}),
+              onKey: (key) =>
+                  _client.send('input', {'action': 'key', 'key': key}),
             ),
           ],
         ),
       ),
     );
-  }
-
-  void _sendKeyboardText() {
-    final text = _keyboardCtrl.text;
-    if (text.isNotEmpty) {
-      _client.send('input', {'action': 'text', 'text': text});
-      _keyboardCtrl.clear();
-    }
   }
 
   /// Hold-to-talk start. The first call initializes speech_to_text, which
@@ -739,20 +733,24 @@ class _ScreenPageState extends State<ScreenPage>
       _dictationText = '';
     });
     _pulseCtrl.repeat(reverse: true);
-    unawaited(_speech.listen(
-      onResult: (result) {
-        if (!mounted) return;
-        setState(() => _dictationText = result.recognizedWords);
-        // Partials only update the overlay; the FINAL result is typed at
-        // the PC cursor (trailing space separates consecutive utterances).
-        if (result.finalResult && result.recognizedWords.isNotEmpty) {
-          _client.send('input',
-              {'action': 'text', 'text': '${result.recognizedWords} '});
-        }
-      },
-      // Device default locale (localeId omitted), partial results on.
-      listenOptions: stt.SpeechListenOptions(partialResults: true),
-    ));
+    unawaited(
+      _speech.listen(
+        onResult: (result) {
+          if (!mounted) return;
+          setState(() => _dictationText = result.recognizedWords);
+          // Partials only update the overlay; the FINAL result is typed at
+          // the PC cursor (trailing space separates consecutive utterances).
+          if (result.finalResult && result.recognizedWords.isNotEmpty) {
+            _client.send('input', {
+              'action': 'text',
+              'text': '${result.recognizedWords} ',
+            });
+          }
+        },
+        // Device default locale (localeId omitted), partial results on.
+        listenOptions: stt.SpeechListenOptions(partialResults: true),
+      ),
+    );
   }
 
   /// Hold-to-talk release. stop() still lets the in-flight utterance deliver
@@ -780,322 +778,249 @@ class _ScreenPageState extends State<ScreenPage>
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Screen'),
-        actions: [
-          // Hold-to-talk dictation. A GestureDetector (not IconButton) so
-          // long-press start/end drive listen/stop.
-          Tooltip(
-            message: 'Hold to dictate',
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onLongPressStart: (_) => unawaited(_startDictation()),
-              onLongPressEnd: (_) => unawaited(_stopDictation()),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Icon(
-                  _listening ? Icons.mic : Icons.mic_none,
-                  color: _listening ? Colors.redAccent : null,
-                ),
-              ),
-            ),
-          ),
-          IconButton(
-            tooltip: 'Switch app',
-            icon: const Icon(Icons.apps),
-            onPressed: _showWindowSwitcher,
-          ),
-          IconButton(
-            tooltip: 'Keyboard',
-            icon: const Icon(Icons.keyboard),
-            onPressed: _openKeyboard,
-          ),
-        ],
-      ),
-      body: Container(
-        color: Colors.black,
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final aspect = _frameW / _frameH;
-            var w = constraints.maxWidth;
-            var h = w / aspect;
-            if (h > constraints.maxHeight) {
-              h = constraints.maxHeight;
-              w = h * aspect;
-            }
-            _imageRect = Rect.fromLTWH(
-              (constraints.maxWidth - w) / 2,
-              (constraints.maxHeight - h) / 2,
-              w,
-              h,
-            );
-            return Stack(
-              children: [
-                Positioned(
-                  left: _zoomScale > 1.0 ? _zoomOrigin.dx : _imageRect.left,
-                  top: _zoomScale > 1.0 ? _zoomOrigin.dy : _imageRect.top,
-                  width: _imageRect.width * _zoomScale,
-                  height: _imageRect.height * _zoomScale,
-                  child: _textureId != null
-                      ? Texture(textureId: _textureId!)
-                      : _frame != null
-                          ? Image.memory(
-                              _frame!,
-                              gaplessPlayback: true,
-                              fit: BoxFit.fill,
-                            )
-                          : Center(
-                              child: Text(
-                                _streaming
-                                    ? 'Waiting for frames…'
-                                    : 'Starting stream…',
-                                style: const TextStyle(color: Colors.white54),
-                              ),
-                            ),
-                ),
-                Positioned.fill(
-                  child: Listener(
-                    behavior: HitTestBehavior.opaque,
-                    onPointerDown: _onPointerDown,
-                    onPointerMove: _onPointerMove,
-                    onPointerUp: _onPointerUp,
-                    onPointerCancel: _onPointerCancel,
-                  ),
-                ),
-                if (_connectionLost)
-                  Positioned.fill(
-                    child: AbsorbPointer(
-                      child: Container(
-                        color: Colors.black54,
-                        child: const Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              CircularProgressIndicator(),
-                              SizedBox(height: 12),
-                              Text(
-                                'Connection lost — reconnecting…',
-                                style: TextStyle(color: Colors.white70),
-                              ),
-                            ],
-                          ),
+    final fullscreen =
+        _fullscreenForced ||
+        MediaQuery.orientationOf(context) == Orientation.landscape;
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _syncSystemBars(fullscreen),
+    );
+    // In forced full screen, Back leaves full screen instead of the page.
+    return PopScope(
+      canPop: !_fullscreenForced,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _exitFullscreen();
+      },
+      child: Scaffold(
+        appBar: fullscreen
+            ? null
+            : AppBar(
+                title: const Text('Screen'),
+                actions: [
+                  // Hold-to-talk dictation. A GestureDetector (not IconButton) so
+                  // long-press start/end drive listen/stop.
+                  Tooltip(
+                    message: 'Hold to dictate',
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onLongPressStart: (_) => unawaited(_startDictation()),
+                      onLongPressEnd: (_) => unawaited(_stopDictation()),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                        child: Icon(
+                          _listening ? Icons.mic : Icons.mic_none,
+                          color: _listening ? Colors.redAccent : null,
                         ),
                       ),
                     ),
                   ),
-                if (_zoomScale > 1.01)
+                  IconButton(
+                    tooltip: 'Full screen',
+                    icon: const Icon(Icons.fullscreen),
+                    onPressed: _enterFullscreen,
+                  ),
+                  IconButton(
+                    tooltip: 'Switch app',
+                    icon: const Icon(Icons.apps),
+                    onPressed: _showWindowSwitcher,
+                  ),
+                  IconButton(
+                    tooltip: 'Keyboard',
+                    icon: const Icon(Icons.keyboard),
+                    onPressed: _openKeyboard,
+                  ),
+                ],
+              ),
+        body: Container(
+          color: Colors.black,
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final aspect = _frameW / _frameH;
+              var w = constraints.maxWidth;
+              var h = w / aspect;
+              if (h > constraints.maxHeight) {
+                h = constraints.maxHeight;
+                w = h * aspect;
+              }
+              _imageRect = Rect.fromLTWH(
+                (constraints.maxWidth - w) / 2,
+                (constraints.maxHeight - h) / 2,
+                w,
+                h,
+              );
+              return Stack(
+                children: [
                   Positioned(
-                    right: 12,
-                    bottom: 44,
-                    child: ActionChip(
-                      label: Text('${(_zoomScale * 100).round()}% — reset'),
-                      onPressed: () => setState(() => _zoomScale = 1.0),
+                    left: _zoomScale > 1.0 ? _zoomOrigin.dx : _imageRect.left,
+                    top: _zoomScale > 1.0 ? _zoomOrigin.dy : _imageRect.top,
+                    width: _imageRect.width * _zoomScale,
+                    height: _imageRect.height * _zoomScale,
+                    child: FrameImage(_decoder),
+                  ),
+                  Positioned.fill(
+                    child: Listener(
+                      behavior: HitTestBehavior.opaque,
+                      onPointerDown: _onPointerDown,
+                      onPointerMove: _onPointerMove,
+                      onPointerUp: _onPointerUp,
+                      onPointerCancel: _onPointerCancel,
                     ),
                   ),
-                // Dictation overlay: red pulsing mic + live partial text.
-                // IgnorePointer keeps every gesture flowing to the Listener.
-                if (_listening)
-                  Positioned(
-                    left: 24,
-                    right: 24,
-                    top: 16,
-                    child: IgnorePointer(
-                      child: Center(
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            color: Colors.black87,
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 16, vertical: 10),
+                  if (_connectionLost)
+                    Positioned.fill(
+                      child: AbsorbPointer(
+                        child: Container(
+                          color: Colors.black54,
+                          child: const Center(
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    ScaleTransition(
-                                      scale: Tween(begin: 1.0, end: 1.3)
-                                          .animate(CurvedAnimation(
-                                              parent: _pulseCtrl,
-                                              curve: Curves.easeInOut)),
-                                      child: const Icon(Icons.mic,
-                                          color: Colors.redAccent, size: 18),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    const Text(
-                                      'Listening…',
-                                      style: TextStyle(color: Colors.white70),
-                                    ),
-                                  ],
+                                CircularProgressIndicator(),
+                                SizedBox(height: 12),
+                                Text(
+                                  'Connection lost — reconnecting…',
+                                  style: TextStyle(color: Colors.white70),
                                 ),
-                                if (_dictationText.isNotEmpty) ...[
-                                  const SizedBox(height: 6),
-                                  Text(
-                                    _dictationText,
-                                    textAlign: TextAlign.center,
-                                    maxLines: 3,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                        color: Colors.white, fontSize: 13),
-                                  ),
-                                ],
                               ],
                             ),
                           ),
                         ),
                       ),
                     ),
-                  ),
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  bottom: 12,
-                  child: IgnorePointer(
-                    child: Center(
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: Colors.black54,
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 14, vertical: 6),
-                          child: Text(
-                            'Drag: cursor • Two fingers: scroll • Pinch: zoom • Tap: click',
-                            style: const TextStyle(
-                                color: Colors.white70, fontSize: 12),
+                  if (_zoomScale > 1.01)
+                    Positioned(
+                      right: 12,
+                      // Clear of the app dock (none in full screen).
+                      bottom: fullscreen
+                          ? 12
+                          : 72 + MediaQuery.paddingOf(context).bottom,
+                      child: ActionChip(
+                        label: Text('${(_zoomScale * 100).round()}% — reset'),
+                        onPressed: () => setState(() => _zoomScale = 1.0),
+                      ),
+                    ),
+                  // Dictation overlay: red pulsing mic + live partial text.
+                  // IgnorePointer keeps every gesture flowing to the Listener.
+                  if (_listening)
+                    Positioned(
+                      left: 24,
+                      right: 24,
+                      top: 16,
+                      child: IgnorePointer(
+                        child: Center(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: Colors.black87,
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 10,
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      ScaleTransition(
+                                        scale: Tween(begin: 1.0, end: 1.3)
+                                            .animate(
+                                              CurvedAnimation(
+                                                parent: _pulseCtrl,
+                                                curve: Curves.easeInOut,
+                                              ),
+                                            ),
+                                        child: const Icon(
+                                          Icons.mic,
+                                          color: Colors.redAccent,
+                                          size: 18,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      const Text(
+                                        'Listening…',
+                                        style: TextStyle(color: Colors.white70),
+                                      ),
+                                    ],
+                                  ),
+                                  if (_dictationText.isNotEmpty) ...[
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      _dictationText,
+                                      textAlign: TextAlign.center,
+                                      maxLines: 3,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
                           ),
                         ),
                       ),
                     ),
-                  ),
-                ),
-              ],
-            );
-          },
-        ),
-      ),
-    );
-  }
-}
-
-/// Lists the PC's top-level windows (what Alt-Tab would show) and switches
-/// to one with a tap.
-class WindowSwitcherSheet extends StatefulWidget {
-  const WindowSwitcherSheet({
-    super.key,
-    required this.client,
-    required this.scrollController,
-  });
-
-  final RelayClient client;
-  final ScrollController scrollController;
-
-  @override
-  State<WindowSwitcherSheet> createState() => _WindowSwitcherSheetState();
-}
-
-class _WindowSwitcherSheetState extends State<WindowSwitcherSheet> {
-  List<Map<String, dynamic>>? _windows;
-  String? _error;
-  // The id of the window currently being switched to, so the tile shows a
-  // spinner and every other tile is disabled until the switch resolves.
-  Object? _switchingId;
-
-  @override
-  void initState() {
-    super.initState();
-    unawaited(_load());
-  }
-
-  Future<void> _load() async {
-    try {
-      final data = await widget.client.request('wm.list');
-      final list = (data['windows'] as List? ?? [])
-          .map((e) => (e as Map).cast<String, dynamic>())
-          .toList();
-      if (!mounted) return;
-      setState(() {
-        _windows = list;
-        _error = null;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = '$e');
-    }
-  }
-
-  Future<void> _activate(Map<String, dynamic> win) async {
-    final id = win['id'];
-    if (id == null || _switchingId != null) return;
-    setState(() => _switchingId = id);
-    try {
-      await widget.client.request('wm.activate', {'id': id});
-      if (mounted) Navigator.pop(context);
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _switchingId = null);
-      showError(context, e);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final wins = _windows;
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            children: [
-              Text('Switch app', style: Theme.of(context).textTheme.titleMedium),
-              const Spacer(),
-              IconButton(
-                tooltip: 'Refresh',
-                icon: const Icon(Icons.refresh),
-                onPressed: () => unawaited(_load()),
-              ),
-            ],
+                  // Gesture cheat-sheet: first seconds only, then fades out.
+                  if (!fullscreen)
+                    Positioned(
+                      left: 16,
+                      right: 16,
+                      bottom: 72 + MediaQuery.paddingOf(context).bottom,
+                      child: IgnorePointer(
+                        child: AnimatedOpacity(
+                          opacity: _showGestureHint ? 1 : 0,
+                          duration: const Duration(milliseconds: 600),
+                          child: Center(
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: Colors.black54,
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: const Padding(
+                                padding: EdgeInsets.symmetric(
+                                  horizontal: 14,
+                                  vertical: 6,
+                                ),
+                                child: Text(
+                                  'Drag: cursor • Two fingers: scroll • Pinch: zoom • Tap: click',
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  // App dock. Above the touchpad Listener in the stack, but
+                  // only its own surface takes touches: everything around it
+                  // still drives the PC cursor. Lifted by the bottom system
+                  // inset: with Android 15 edge-to-edge the body runs under
+                  // the navigation bar, where taps belong to the system.
+                  if (!_connectionLost && !fullscreen)
+                    Positioned(
+                      left: 8,
+                      right: 8,
+                      bottom: 8 + MediaQuery.paddingOf(context).bottom,
+                      child: AppDock(
+                        key: _dockKey,
+                        client: _client,
+                        onOpenSwitcher: _showWindowSwitcher,
+                      ),
+                    ),
+                ],
+              );
+            },
           ),
         ),
-        const Divider(height: 1),
-        Expanded(
-          child: _error != null
-              ? Center(child: Text(_error!))
-              : wins == null
-                  ? const Center(child: CircularProgressIndicator())
-                  : wins.isEmpty
-                      ? const Center(child: Text('No open windows'))
-                      : ListView.builder(
-                          controller: widget.scrollController,
-                          itemCount: wins.length,
-                          itemBuilder: (context, i) {
-                            final w = wins[i];
-                            final id = w['id'];
-                            final busy = _switchingId != null && _switchingId == id;
-                            return ListTile(
-                              enabled: _switchingId == null,
-                              leading: const Icon(Icons.window_outlined),
-                              title: Text('${w['title'] ?? '?'}',
-                                  overflow: TextOverflow.ellipsis),
-                              subtitle: Text('${w['process'] ?? '?'}'),
-                              trailing: busy
-                                  ? const SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child:
-                                          CircularProgressIndicator(strokeWidth: 2),
-                                    )
-                                  : null,
-                              onTap: () => unawaited(_activate(w)),
-                            );
-                          },
-                        ),
-        ),
-      ],
+      ),
     );
   }
 }

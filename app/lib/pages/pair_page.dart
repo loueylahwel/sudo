@@ -92,9 +92,12 @@ class _PairPageState extends State<PairPage> {
     try {
       // If this PC was paired before, send its saved trust token so the
       // agent skips the on-PC approval prompt.
+      // A PC whose certificate is pinned only ever gets the token over its
+      // TLS port: here (plain WebSocket) it isn't sent, so re-pairing it is
+      // a fresh pairing (code or approval) and resets the pin.
       var token = '';
       for (final d in await DeviceStore().load()) {
-        if (d.relayUrl == relayUrl && d.token.isNotEmpty) {
+        if (d.relayUrl == relayUrl && d.token.isNotEmpty && !d.hasPin) {
           token = d.token;
           break;
         }

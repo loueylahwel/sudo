@@ -6,3 +6,6 @@ pyperclip>=1.8.2
 psutil>=5.9.0
 qrcode>=7.4
 opencv-python>=4.8
+comtypes>=1.4
+pycaw>=20240316
+cryptography>=42

@@ -12,12 +12,22 @@ your local network. No accounts, no cloud, no QR codes, no pairing codes,
 nothing to configure.
 
 - **Screen streaming** with a live touchpad cursor — drag to move, two
-  fingers to scroll (laptop-style), tap to click
+  fingers to scroll (laptop-style), tap to click. Quality presets (Auto
+  adapts to your Wi-Fi, up to full-res Max with sharp text, plus a beta
+  H.264 "Smooth video" mode)
+- **Phone screen** — use your phone as a second monitor: put one PC app
+  (Discord, YouTube in a browser, …) on a virtual screen only the phone
+  sees, while the PC keeps showing what you're doing. Taps don't move your
+  PC cursor or steal its focus. Needs a one-time driver install (Parsec
+  Virtual Display, approved on the PC)
+- **App switcher** — Alt-Tab-style grid with live previews and icons,
+  search, a one-tap dock of running apps, and launching Start-menu apps
 - **PC webcam view** on your phone
 - **Files** — browse, download to your phone, upload to your PC
-- **Media & volume** control, **clipboard** sync
-- **Power**: lock, **unlock** (types your PIN at the lock screen), sleep,
-  restart, shutdown
+- **Media & volume** control, **clipboard** sync, **brightness** slider
+- **Power**: lock, sleep, hibernate, restart, shutdown — now or on a
+  **timer** (shut down in 30 min, at 1:00 AM, …) with a countdown you can
+  cancel from the phone
 - **Shell** commands and process list/kill
 
 ## Setup (2 minutes)

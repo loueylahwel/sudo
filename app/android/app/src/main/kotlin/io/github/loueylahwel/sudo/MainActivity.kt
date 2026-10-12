@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -24,8 +25,14 @@ class MainActivity : FlutterActivity() {
     private var videoDecoder: VideoDecoder? = null
 
     // Hardware volume keys, forwarded to Dart ("volumeKey", "up"/"down") so
-    // they adjust the PC's volume instead of the phone's.
+    // they adjust the PC's volume instead of the phone's. Dart switches the
+    // forwarding off ("setForwarding", false) while the phone itself plays
+    // the PC's sound (phone screen), so the keys control what you hear.
     private var volumeKeysChannel: MethodChannel? = null
+    @Volatile private var forwardVolumeKeys = true
+
+    // Sound of the PC's phone-screen apps (PCM1 packets), see PcmPlayer.
+    private var pcmPlayer: PcmPlayer? = null
 
     companion object {
         // Lock taps from the home screen widget reach Dart through this
@@ -37,6 +44,58 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         volumeKeysChannel =
             MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "pcocket/volume_keys")
+                .also { channel ->
+                    channel.setMethodCallHandler { call, result ->
+                        if (call.method == "setForwarding") {
+                            forwardVolumeKeys = call.arguments as? Boolean ?: true
+                            result.success(null)
+                        } else {
+                            result.notImplemented()
+                        }
+                    }
+                }
+        // Landscape that follows the motion sensor even with auto-rotate off.
+        // Flutter's landscapeLeft+landscapeRight maps to USER_LANDSCAPE, which
+        // obeys the rotation lock: flipping the phone over left the PC screen
+        // upside down. "unlock" hands orientation back to the system.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "pcocket/orientation")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "sensorLandscape" -> {
+                        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        result.success(null)
+                    }
+                    "unlock" -> {
+                        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        val player = PcmPlayer()
+        pcmPlayer = player
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "pcocket/audio")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "start" -> {
+                        player.start(
+                            call.argument<Int>("rate") ?: 48000,
+                            call.argument<Int>("channels") ?: 2,
+                        )
+                        result.success(true)
+                    }
+                    "write" -> {
+                        val bytes = call.arguments as? ByteArray
+                        if (bytes != null) player.write(bytes)
+                        result.success(null)
+                    }
+                    "stop" -> {
+                        player.stop()
+                        result.success(true)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
         widgetActionsChannel =
             MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "pcocket/widget_actions")
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, downloadsChannel)
@@ -65,6 +124,9 @@ class MainActivity : FlutterActivity() {
         decoder.onCodecError = {
             runOnUiThread { videoMethodChannel.invokeMethod("onCodecError", null) }
         }
+        decoder.onFirstFrame = {
+            runOnUiThread { videoMethodChannel.invokeMethod("onFrameRendered", null) }
+        }
         videoMethodChannel.setMethodCallHandler { call, result ->
                 try {
                     when (call.method) {
@@ -78,11 +140,16 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                         "feed" -> {
+                            // One access unit per call: its bytes, whether
+                            // it is a keyframe, and its capture time (ms).
                             val bytes = call.argument<ByteArray>("bytes")
+                            val key = call.argument<Boolean>("key") ?: false
+                            // Dart ints arrive as Integer or Long by size.
+                            val ts = call.argument<Number>("ts")?.toLong() ?: 0L
                             if (bytes == null) {
                                 result.error("bad_args", "bytes are required", null)
                             } else {
-                                decoder.feed(bytes)
+                                decoder.feed(bytes, key, ts)
                                 result.success(true)
                             }
                         }
@@ -112,7 +179,7 @@ class MainActivity : FlutterActivity() {
             KeyEvent.KEYCODE_VOLUME_DOWN -> "down"
             else -> null
         }
-        if (direction != null) {
+        if (direction != null && forwardVolumeKeys) {
             if (event.action == KeyEvent.ACTION_DOWN) {
                 volumeKeysChannel?.invokeMethod("volumeKey", direction)
             }
@@ -124,6 +191,8 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         videoDecoder?.release()
         videoDecoder = null
+        pcmPlayer?.release()
+        pcmPlayer = null
         super.onDestroy()
     }
 

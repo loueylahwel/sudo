@@ -14,8 +14,11 @@ answers neither (DDC/CI switched off in the monitor's OSD, a TV, a
 DisplayLink dock) is simply absent, and "supported" is false when nothing
 answers at all.
 
-Display ids are opaque strings for the phone: "wmi:<InstanceName>" or
-"ddc:<\\\\.\\DISPLAYn>#<index>". Levels are always 0-100.
+On Linux, KDE Plasma's PowerDevil (org.kde.ScreenBrightness on the session
+bus) covers the panel and DDC/CI monitors in one backend.
+
+Display ids are opaque strings for the phone: "wmi:<InstanceName>",
+"ddc:<\\\\.\\DISPLAYn>#<index>" or "kde:<name>". Levels are always 0-100.
 """
 
 import asyncio
@@ -274,6 +277,72 @@ def _ddc_set(level=None, delta=None, target=None):
     return _ddc_session(apply)
 
 
+# ---------------------------------------------------------------- KDE (Linux)
+
+# On KDE Plasma 6, PowerDevil owns every backlight it can drive (the laptop
+# panel's sysfs backlight and DDC/CI monitors alike) and publishes them on
+# the session bus as org.kde.ScreenBrightness, so one backend covers both.
+# busctl ships with systemd. Ids are "kde:<D-Bus name>" (e.g. kde:display0);
+# a phone-sent id is only ever compared against the listed ones, never put
+# into an object path itself.
+_KDE_SERVICE = "org.kde.ScreenBrightness"
+_KDE_PATH = "/org/kde/ScreenBrightness"
+_KDE_DISPLAY = "org.kde.ScreenBrightness.Display"
+_KDE_SUPPRESS_OSD = 0x1  # no on-screen popup for every step of a phone slider
+
+
+def _busctl(*args):
+    out = subprocess.run(["busctl", "--user", "--json=short", *args],
+                         capture_output=True, text=True, timeout=5)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip() or "busctl failed")
+    return json.loads(out.stdout) if out.stdout.strip() else None
+
+
+def _kde_list():
+    """[{id, name, level, method, _path, _max}] for every KDE display."""
+    names = _busctl("get-property", _KDE_SERVICE, _KDE_PATH,
+                    "org.kde.ScreenBrightness", "DisplaysDBusNames")["data"]
+    out = []
+    for n in names:
+        path = f"{_KDE_PATH}/{n}"
+        prop = lambda p: _busctl("get-property", _KDE_SERVICE, path,
+                                 _KDE_DISPLAY, p)["data"]
+        top = int(prop("MaxBrightness"))
+        if top <= 0:
+            continue
+        out.append({"id": f"kde:{n}", "name": prop("Label"),
+                    "level": round(int(prop("Brightness")) * 100 / top),
+                    "method": "kde", "_path": path, "_max": top})
+    return out
+
+
+def _kde_public(displays):
+    return [{k: v for k, v in d.items() if not k.startswith("_")}
+            for d in displays]
+
+
+def _kde_apply(level=None, delta=None, display_id=None):
+    displays = _kde_list()
+    if not displays:
+        raise ValueError("no display with adjustable brightness")
+    if display_id is not None and not any(d["id"] == display_id
+                                          for d in displays):
+        raise ValueError(f"unknown display: {display_id}")
+    for d in displays:
+        if display_id is not None and d["id"] != display_id:
+            continue
+        new = level if level is not None else d["level"] + (delta or 0)
+        new = max(0, min(100, int(new)))
+        # Never 0 raw: on many panels that switches the backlight off, and
+        # a black screen can't be fixed from the phone's screen view.
+        raw = max(1, round(new * d["_max"] / 100))
+        _busctl("call", _KDE_SERVICE, d["_path"], _KDE_DISPLAY,
+                "SetBrightness", "iu", str(raw), str(_KDE_SUPPRESS_OSD))
+        d["level"] = new  # report what was set, as the WMI side does
+    return _state(_kde_public(displays))
+
+
 # ---------------------------------------------------------------- backend
 
 def _state(displays):
@@ -324,6 +393,8 @@ def _side_by_side(wmi_args, ddc_fn, wmi_strict=False, ddc_strict=False):
 
 def get_state():
     """Blocking. {supported, level (first controllable display), displays}."""
+    if platform.system() == "Linux":
+        return _state(_kde_public(_safe("KDE", _kde_list)))
     if platform.system() != "Windows":
         return _state([])
     panels, monitors = _side_by_side(("",), _ddc_list)
@@ -334,8 +405,10 @@ def apply(level=None, delta=None, display_id=None):
     """Blocking. Sets one display (display_id) or every controllable one
     (None) to level, or moves it by delta; both clamp to 0-100. Returns
     the new state. Errors from the targeted backend propagate."""
+    if platform.system() == "Linux":
+        return _kde_apply(level, delta, display_id)
     if platform.system() != "Windows":
-        raise ValueError("brightness control is only supported on Windows")
+        raise ValueError("brightness control is only supported on Windows and KDE")
     if level is not None:
         mode, value = "level", max(0, min(100, int(level)))
     else:

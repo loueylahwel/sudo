@@ -1620,6 +1620,18 @@ def read_chunk(path, offset=0, length=CHUNK):
     }
 
 
+def pc_path(path):
+    """A path the phone built, in this PC's own form. Apps built before the
+    Linux support join Files-page paths with '\\' ("/home/bl9\\photo.jpg"),
+    which on Linux names one odd file (and an upload into the home folder
+    then fails on /home's permissions). On a POSIX PC a '\\' in a phone-built
+    absolute path can only be that, so it becomes '/'."""
+    path = str(path)
+    if platform.system() != "Windows" and path.startswith("/") and "\\" in path:
+        path = path.replace("\\", "/")
+    return path
+
+
 def write_chunk(path, data, offset=0, append=False):
     raw = base64.b64decode(data)
     p = Path(path)
@@ -2358,7 +2370,7 @@ class Agent:
 
     async def h_fs_upload(self, msg):
         return await asyncio.to_thread(
-            write_chunk, msg["path"], msg["data"],
+            write_chunk, pc_path(msg["path"]), msg["data"],
             msg.get("offset", 0), msg.get("append", False),
         )
 
@@ -2366,8 +2378,9 @@ class Agent:
         return await asyncio.to_thread(delete_path, msg["path"])
 
     async def h_fs_mkdir(self, msg):
-        Path(msg["path"]).mkdir(parents=True, exist_ok=True)
-        return {"path": msg["path"]}
+        path = pc_path(msg["path"])
+        Path(path).mkdir(parents=True, exist_ok=True)
+        return {"path": path}
 
     async def h_input(self, msg):
         action = msg.get("action")

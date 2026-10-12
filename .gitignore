@@ -16,3 +16,6 @@ scripts/frame*.jpg
 scripts/viewer*.jpg
 scripts/desktop*.jpg
 app/android/build/
+
+# TLS key/cert for remote access (generated per PC; never commit)
+*.pem

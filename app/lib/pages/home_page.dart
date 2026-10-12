@@ -12,7 +12,9 @@ import '../relay_client.dart';
 import '../util.dart';
 import 'camera_page.dart';
 import 'files_page.dart';
+import 'phone_monitor_page.dart';
 import 'screen_page.dart';
+import 'window_switcher.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -21,7 +23,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   final _store = DeviceStore();
   List<SavedDevice> _devices = [];
   bool _loadingDevices = true;
@@ -48,14 +50,16 @@ class _HomePageState extends State<HomePage> {
 
   // Auto-reconnect after an unexpected socket drop (Wi-Fi blip etc.): on a
   // connection loss that we did not initiate, _connect is retried with a
-  // backoff of 3s, 6s, 12s, 24s, 30s (capped) until _maxReconnectAttempts is
-  // reached; then the UI falls back to the manual Reconnect button.
+  // backoff of 3s, 6s, 12s, 24s, then every 30s for as long as the PC stays
+  // selected — never giving up: the PC service restarts (updates, reboots)
+  // can take minutes, and an open Screen/Phone screen page must recover by
+  // itself instead of freezing on its last frame.
   // RelayClient.disconnect() never emits connectionState=false, so any drop
   // reported by the live client is genuine and safe to retry on.
   Timer? _reconnectTimer;
   int _reconnectAttempts = 0;
   bool _reconnecting = false;
-  static const int _maxReconnectAttempts = 5;
+  static const int _maxBackoffSteps = 4;
   static const int _maxReconnectDelaySecs = 30;
 
   // Instant reconnect after a network switch: instead of waiting for the OS
@@ -97,15 +101,41 @@ class _HomePageState extends State<HomePage> {
   bool _seekDragging = false;
   double? _dragValue;
 
+  // Display brightness. The PC is the source of truth: the level is read
+  // with display.brightness.get on every (re)connect. While the slider is
+  // dragged the UI is optimistic — the thumb follows the finger, sets go
+  // out at most every 150ms plus a final one on release — and only the
+  // reply to the newest send may move the slider afterwards, so a late
+  // echo of an older value never yanks the thumb back.
+  bool? _brightnessSupported; // null until the PC has answered
+  double _brightness = 0;
+  bool _brightnessDragging = false;
+  Timer? _brightnessThrottle;
+  int? _brightnessQueued; // latest drag value not sent yet
+  int? _brightnessLastSent;
+  int _brightnessSeq = 0;
+  static const _brightnessThrottleInterval = Duration(milliseconds: 150);
+
+  // Scheduled power action (power.schedule). The PC owns it and runs the
+  // countdown: the status is synced from power.status on every
+  // (re)connect and from the power.schedule events the agent broadcasts,
+  // so two phones always show the same timer. _powerTick only re-renders
+  // the remaining time; nothing here fires anything.
+  String? _powerAction;
+  DateTime? _powerEnd;
+  Timer? _powerTick;
+
   // Temporary diagnostics for the network-switch bug (visible in logcat).
   void _dbg(String msg) => debugPrint('[Sudo] $msg');
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadDevices();
-    _connectivitySub =
-        Connectivity().onConnectivityChanged.listen(_onConnectivityChanged);
+    _connectivitySub = Connectivity().onConnectivityChanged.listen(
+      _onConnectivityChanged,
+    );
     _volumeKeysChannel.setMethodCallHandler((call) async {
       if (call.method == 'volumeKey' && call.arguments is String) {
         _onVolumeKey(call.arguments as String);
@@ -116,14 +146,37 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  /// Back from the background: Android freezes a backgrounded app, so a
+  /// reconnect timer may not have run for minutes. Reconnect right away
+  /// instead of waiting out the backoff, so an open Screen / Phone screen
+  /// page comes back to life the moment the user returns to it.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !mounted) return;
+    final device = _selected;
+    if (device == null || _socketUp || _connecting || _instantReconnecting) {
+      return;
+    }
+    _cancelReconnect();
+    _instantReconnecting = true;
+    unawaited(
+      _connect(
+        device,
+        auto: true,
+      ).whenComplete(() => _instantReconnecting = false),
+    );
+  }
+
   @override
   void dispose() {
     _connectivitySub?.cancel();
     _volumeKeysChannel.setMethodCallHandler(null);
     _widgetActionsChannel.setMethodCallHandler(null);
     _cancelSleepTimer(update: false);
+    _powerTick?.cancel();
     _cancelReconnect();
     _tearDownClient();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
@@ -131,11 +184,13 @@ class _HomePageState extends State<HomePage> {
   /// connectivity types; anything usable (wifi/mobile/ethernet/vpn) counts
   /// as online.
   void _onConnectivityChanged(List<ConnectivityResult> results) {
-    final online = results.any((r) =>
-        r == ConnectivityResult.wifi ||
-        r == ConnectivityResult.mobile ||
-        r == ConnectivityResult.ethernet ||
-        r == ConnectivityResult.vpn);
+    final online = results.any(
+      (r) =>
+          r == ConnectivityResult.wifi ||
+          r == ConnectivityResult.mobile ||
+          r == ConnectivityResult.ethernet ||
+          r == ConnectivityResult.vpn,
+    );
     if (!mounted) return;
     if (!online) {
       // Connectivity lost: force the same state a socket close would have
@@ -156,8 +211,12 @@ class _HomePageState extends State<HomePage> {
       _dbg('connectivity back — reconnecting immediately');
       _cancelReconnect();
       _instantReconnecting = true;
-      unawaited(_connect(_selected!, auto: true)
-          .whenComplete(() => _instantReconnecting = false));
+      unawaited(
+        _connect(
+          _selected!,
+          auto: true,
+        ).whenComplete(() => _instantReconnecting = false),
+      );
     }
   }
 
@@ -167,12 +226,15 @@ class _HomePageState extends State<HomePage> {
   void _onVolumeKey(String direction) {
     final client = _client;
     if (client == null || !_socketUp) return;
-    unawaited(client
-        .request('media', {
-          'action':
-              direction == 'up' ? 'media_volume_up' : 'media_volume_down',
-        })
-        .then((_) => true, onError: (_) => false));
+    unawaited(
+      client
+          .request('media', {
+            'action': direction == 'up'
+                ? 'media_volume_up'
+                : 'media_volume_down',
+          })
+          .then((_) => true, onError: (_) => false),
+    );
   }
 
   /// Lock tap on the home screen widget. The native receiver only forwards
@@ -180,9 +242,11 @@ class _HomePageState extends State<HomePage> {
   void _lockFromWidget() {
     final client = _client;
     if (client == null || !_socketUp) return;
-    unawaited(client
-        .request('power', {'action': 'lock'})
-        .then((_) => true, onError: (_) => false));
+    unawaited(
+      client
+          .request('power', {'action': 'lock'})
+          .then((_) => true, onError: (_) => false),
+    );
   }
 
   /// Pushes the current PC name + connection state to the home screen widget.
@@ -213,6 +277,9 @@ class _HomePageState extends State<HomePage> {
 
   void _tearDownClient() {
     _stopMediaPoll();
+    _brightnessThrottle?.cancel();
+    _brightnessThrottle = null;
+    _brightnessQueued = null;
     _eventSub?.cancel();
     _connSub?.cancel();
     _eventSub = null;
@@ -241,15 +308,15 @@ class _HomePageState extends State<HomePage> {
     if (!mounted || _reconnectTimer != null) return;
     final device = _selected;
     if (device == null) return;
-    if (_reconnectAttempts >= _maxReconnectAttempts) {
-      if (_reconnecting) setState(() => _reconnecting = false);
-      return;
-    }
-    var secs = 3 << _reconnectAttempts; // 3, 6, 12, 24, 48…
+    // 3, 6, 12, 24, then the 30s cap forever (the shift stops growing so
+    // it can't overflow on a PC that stays away for hours).
+    var secs = 3 << _reconnectAttempts.clamp(0, _maxBackoffSteps);
     if (secs > _maxReconnectDelaySecs) secs = _maxReconnectDelaySecs;
     _reconnectAttempts++;
-    _dbg('reconnect attempt $_reconnectAttempts in ${secs}s '
-        '(device=${device.relayUrl})');
+    _dbg(
+      'reconnect attempt $_reconnectAttempts in ${secs}s '
+      '(device=${device.relayUrl})',
+    );
     setState(() => _reconnecting = true);
     _reconnectTimer = Timer(Duration(seconds: secs), () {
       _reconnectTimer = null;
@@ -274,6 +341,10 @@ class _HomePageState extends State<HomePage> {
       _approvalPending = false;
       _sysInfo = null;
       _viaText = null;
+      // Both are re-read from the PC once connected.
+      _brightnessSupported = null;
+      _brightnessDragging = false;
+      _clearPowerSchedule();
     });
     RelayClient? winner;
     var current = device;
@@ -292,9 +363,19 @@ class _HomePageState extends State<HomePage> {
 
     // The agent's denial arrives as {type:"error", error:"denied on this PC"}.
     bool isDenial(Object? e) =>
-        e is RelayException && e.message.contains('denied');
+        e is RelayException &&
+        (e.message.contains('denied') || e.message.contains("isn't paired"));
 
-    Future<PairResult?> attempt(RelayClient c, SavedDevice d) async {
+    // Set when the winning connection is the internet route (remote).
+    var viaRemote = false;
+
+    /// One connect+pair try. [remote]: through the PC's internet address
+    /// (TLS, certificate pinned) instead of its LAN address.
+    Future<PairResult?> attempt(
+      RelayClient c,
+      SavedDevice d, {
+      bool remote = false,
+    }) async {
       // Hard OUTER timeout: on a blackholed address (phone switched
       // networks) inner socket timeouts have proven unreliable — a
       // connect attempt hung forever and froze the whole retry loop.
@@ -312,24 +393,29 @@ class _HomePageState extends State<HomePage> {
       armOuter(const Duration(seconds: 6));
       try {
         return await Future.any<PairResult?>([
-          connectAndPair(c,
-              relayUrl: d.relayUrl,
-              code: d.code,
-              token: d.token,
-              name: await DeviceStore.phoneName(),
-              timeout: const Duration(seconds: 4),
-              onApprovalPending: () {
-                armOuter(const Duration(seconds: 60));
-                noteApprovalPending();
-              }),
+          connectAndPair(
+            c,
+            relayUrl: remote ? d.remoteUrl : _lanUrl(d),
+            pinSha256: d.hasPin ? d.certSha256 : null,
+            code: remote ? null : d.code,
+            token: d.token,
+            name: await DeviceStore.phoneName(),
+            timeout: const Duration(seconds: 4),
+            onApprovalPending: () {
+              armOuter(const Duration(seconds: 60));
+              noteApprovalPending();
+            },
+          ),
           outer.future.then<PairResult?>(
-              (_) => throw TimeoutException('connect attempt timed out')),
+            (_) => throw TimeoutException('connect attempt timed out'),
+          ),
         ]);
       } catch (e) {
-        _dbg('connect to ${d.relayUrl} failed: $e');
+        _dbg('connect to ${remote ? d.remoteUrl : _lanUrl(d)} failed: $e');
         failure = e;
         unawaited(
-            c.disconnect().timeout(const Duration(seconds: 2), onTimeout: () {}));
+          c.disconnect().timeout(const Duration(seconds: 2), onTimeout: () {}),
+        );
         return null;
       } finally {
         outerTimer?.cancel();
@@ -344,27 +430,60 @@ class _HomePageState extends State<HomePage> {
       var failures = 0;
       final c1 = RelayClient();
       final c2 = RelayClient();
-      void win(RelayClient c, PairResult r) {
-        if (race.isCompleted) return;
+      final c3 = RelayClient();
+      final routes = current.hasRemote ? 3 : 2;
+      void win(RelayClient c, PairResult r, {bool remote = false}) {
+        if (race.isCompleted) {
+          // Another route won meanwhile: don't leave this session open.
+          unawaited(
+            c.disconnect().timeout(
+              const Duration(seconds: 2),
+              onTimeout: () {},
+            ),
+          );
+          return;
+        }
         winner = c;
         result = r;
+        viaRemote = remote;
         race.complete();
       }
 
       void lose() {
-        if (++failures == 2 && !race.isCompleted) race.complete();
+        if (++failures == routes && !race.isCompleted) race.complete();
       }
 
-      unawaited(attempt(c1, current).then((r) {
-        if (r != null) {
-          win(c1, r);
-        } else {
-          lose();
-        }
-      }));
+      if (current.hasRemote) {
+        // Away from home the LAN tries fail fast or hang; the internet
+        // route starts a moment later so that at home the LAN still wins.
+        final remoteDevice = current;
+        unawaited(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 1500));
+          if (race.isCompleted) {
+            lose();
+            return;
+          }
+          final r = await attempt(c3, remoteDevice, remote: true);
+          if (r != null) {
+            win(c3, r, remote: true);
+          } else {
+            lose();
+          }
+        }());
+      }
+
+      unawaited(
+        attempt(c1, current).then((r) {
+          if (r != null) {
+            win(c1, r);
+          } else {
+            lose();
+          }
+        }),
+      );
       unawaited(() async {
         final rd = await _rediscover(current);
-        if (rd == null) {
+        if (rd == null || race.isCompleted) {
           lose();
           return;
         }
@@ -385,11 +504,14 @@ class _HomePageState extends State<HomePage> {
         if (DateTime.now().difference(waitStart) >= budget) break;
         await Future<void>.delayed(const Duration(milliseconds: 200));
       }
-      for (final c in [c1, c2]) {
+      for (final c in [c1, c2, c3]) {
         if (!identical(c, winner)) {
-          unawaited(c
-              .disconnect()
-              .timeout(const Duration(seconds: 2), onTimeout: () {}));
+          unawaited(
+            c.disconnect().timeout(
+              const Duration(seconds: 2),
+              onTimeout: () {},
+            ),
+          );
         }
       }
     } else {
@@ -407,12 +529,20 @@ class _HomePageState extends State<HomePage> {
           result = await attempt(client, current);
         }
       }
+      if (result == null && !isDenial(failure) && current.hasRemote) {
+        // Not on the home network: go through the PC's internet address.
+        result = await attempt(client, current, remote: true);
+        viaRemote = result != null;
+      }
       if (result != null) {
         winner = client;
       } else {
-        unawaited(client
-            .disconnect()
-            .timeout(const Duration(seconds: 2), onTimeout: () {}));
+        unawaited(
+          client.disconnect().timeout(
+            const Duration(seconds: 2),
+            onTimeout: () {},
+          ),
+        );
       }
     }
 
@@ -434,11 +564,14 @@ class _HomePageState extends State<HomePage> {
         _scheduleReconnect();
       } else {
         showError(
-            context,
-            denied
-                ? failure!
-                : RelayException('Could not connect to '
-                    '${current.name.isEmpty ? current.relayUrl : current.name}'));
+          context,
+          denied
+              ? failure!
+              : RelayException(
+                  'Could not connect to '
+                  '${current.name.isEmpty ? current.relayUrl : current.name}',
+                ),
+        );
       }
       return;
     }
@@ -467,11 +600,7 @@ class _HomePageState extends State<HomePage> {
     // already had).
     final newToken = result!.paired['token'] as String? ?? '';
     if (newToken.isNotEmpty && newToken != current.token) {
-      current = SavedDevice(
-          relayUrl: current.relayUrl,
-          code: current.code,
-          name: current.name,
-          token: newToken);
+      current = current.copyWith(token: newToken);
       // save() dedupes by code+relayUrl — same key here, so the existing
       // entry is replaced in place.
       await _store.save(current);
@@ -485,15 +614,77 @@ class _HomePageState extends State<HomePage> {
       _reconnecting = false;
       _reconnectAttempts = 0;
       _socketUp = true;
-      _viaText = 'via $usedHost';
+      _viaText = viaRemote ? 'via internet' : 'via $usedHost';
     });
     _syncWidget(connected: true);
     // Best effort: mirror PC clipboard changes onto the phone.
-    unawaited(client
-        .request('clipboard.watch', {'enabled': true})
-        .then((_) => true, onError: (_) => false));
+    unawaited(
+      client
+          .request('clipboard.watch', {'enabled': true})
+          .then((_) => true, onError: (_) => false),
+    );
     unawaited(_refreshSysInfo());
+    unawaited(_refreshBrightness());
+    unawaited(_refreshPowerStatus());
+    unawaited(_refreshRemoteInfo());
     _startMediaPoll();
+  }
+
+  /// The LAN address to try. Once the PC's certificate is known, the LAN
+  /// goes through its TLS port too, pinned: on another network a device
+  /// sitting at the home PC's LAN address must never receive the token.
+  String _lanUrl(SavedDevice d) {
+    if (!d.hasPin) return d.relayUrl;
+    final lan = Uri.tryParse(d.relayUrl);
+    if (lan == null || lan.host.isEmpty) return d.relayUrl;
+    return 'wss://${lan.host}:${d.tlsPort}';
+  }
+
+  /// Asks the PC how to reach it from outside the home network and keeps
+  /// that with the saved PC — so after one connection at home the phone
+  /// can connect from anywhere, and a new public address is picked up on
+  /// every connection. Older agents (no `remote.info`) leave it as is.
+  Future<void> _refreshRemoteInfo() async {
+    final client = _client;
+    if (client == null) return;
+    try {
+      _applyRemoteInfo(await client.request('remote.info'));
+    } catch (_) {
+      // Older agent, or remote access off: nothing to store.
+    }
+  }
+
+  void _applyRemoteInfo(Map<String, dynamic> info) {
+    final device = _selected;
+    if (device == null) return;
+    final host = '${info['host'] ?? ''}';
+    final port = (info['port'] as num?)?.toInt() ?? 0;
+    final fingerprint = '${info['fingerprint'] ?? ''}'.toLowerCase();
+    if (port <= 0 || fingerprint.length != 64) return;
+    // Trust on first use: a pinned PC keeps its certificate. A different
+    // one is never taken from a connection (it would let whoever answered
+    // redirect this phone's internet route); re-pairing resets it.
+    if (device.certSha256.isNotEmpty && device.certSha256 != fingerprint) {
+      return;
+    }
+    // The internet address only while the router forward works; the pin
+    // and TLS port always, so the LAN stops using clear text at once.
+    final url = info['available'] == true && host.isNotEmpty
+        ? 'wss://$host:$port'
+        : device.remoteUrl;
+    if (url == device.remoteUrl &&
+        fingerprint == device.certSha256 &&
+        port == device.tlsPort) {
+      return;
+    }
+    final updated = device.copyWith(
+      remoteUrl: url,
+      certSha256: fingerprint,
+      tlsPort: port,
+    );
+    // save() dedupes by code+relayUrl: same key, replaced in place.
+    unawaited(_store.save(updated));
+    if (mounted) setState(() => _selected = updated);
   }
 
   /// Runs LAN discovery once and, when a PC with the same name as [device]
@@ -510,21 +701,18 @@ class _HomePageState extends State<HomePage> {
       return null;
     }
     if (!mounted) return null;
-    _dbg('discovery found: ${found.map((p) => '${p.name}@${p.relayUrl}').toList()}');
+    _dbg(
+      'discovery found: ${found.map((p) => '${p.name}@${p.relayUrl}').toList()}',
+    );
     final name = device.name.toLowerCase();
-    final matches =
-        found.where((pc) => pc.name.toLowerCase() == name).toList();
+    final matches = found.where((pc) => pc.name.toLowerCase() == name).toList();
     if (matches.isEmpty) {
       _dbg('rediscover: no PC named "$name" among ${found.length} found');
       return null;
     }
     final pc = matches.first;
     if (pc.relayUrl == device.relayUrl) return device;
-    final updated = SavedDevice(
-        relayUrl: pc.relayUrl,
-        code: device.code,
-        name: device.name,
-        token: device.token);
+    final updated = device.copyWith(relayUrl: pc.relayUrl);
     // save() dedupes by code+relayUrl, so remove the stale entry first or
     // the updated address would be stored alongside it.
     await _store.delete(device);
@@ -535,14 +723,24 @@ class _HomePageState extends State<HomePage> {
   void _onEvent(RelayEvent event) {
     if (!mounted) return;
     switch (event.name) {
+      case 'remote.changed':
+        _applyRemoteInfo(event.data);
       case 'agent.online':
         setState(() => _agentOnline = true);
         unawaited(_refreshSysInfo());
+        unawaited(_refreshBrightness());
+        unawaited(_refreshPowerStatus());
       case 'agent.offline':
         setState(() => _agentOnline = false);
       case 'clipboard.changed':
         // Never surface PC clipboard popups — clipboard sync stays manual.
         return;
+      case 'power.schedule':
+        // Any phone (or the PC's own Cancel) changed the schedule.
+        final before = _powerAction;
+        _applyPowerStatus(event.data);
+        final note = _powerEventNote(event.data, before);
+        if (note != null) showMessage(context, note);
     }
   }
 
@@ -567,6 +765,7 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       _selected = null;
       _sysInfo = null;
+      _clearPowerSchedule();
     });
     _syncWidget(connected: false);
     _loadDevices();
@@ -587,7 +786,10 @@ class _HomePageState extends State<HomePage> {
     if (mounted) _loadDevices();
   }
 
-  Future<void> _runCommand(String cmd, [Map<String, dynamic> params = const {}]) async {
+  Future<void> _runCommand(
+    String cmd, [
+    Map<String, dynamic> params = const {},
+  ]) async {
     final client = _client;
     if (client == null) return;
     try {
@@ -648,7 +850,11 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _power(String action, String label, {bool dangerous = false}) async {
+  Future<void> _power(
+    String action,
+    String label, {
+    bool dangerous = false,
+  }) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -706,8 +912,7 @@ class _HomePageState extends State<HomePage> {
 
   void _startSleepTimer(int minutes) {
     _cancelSleepTimer(update: false);
-    setState(
-        () => _sleepEnd = DateTime.now().add(Duration(minutes: minutes)));
+    setState(() => _sleepEnd = DateTime.now().add(Duration(minutes: minutes)));
     _sleepTimer = Timer(Duration(minutes: minutes), _onSleepTimerExpired);
     // Refreshes the countdown chip; stops itself once the end is reached.
     _sleepTick = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -732,9 +937,11 @@ class _HomePageState extends State<HomePage> {
     _cancelSleepTimer();
     final client = _client;
     if (client != null && _socketUp) {
-      unawaited(client
-          .request('media', {'action': 'media_play_pause'})
-          .then((_) => true, onError: (_) => false));
+      unawaited(
+        client
+            .request('media', {'action': 'media_play_pause'})
+            .then((_) => true, onError: (_) => false),
+      );
     }
   }
 
@@ -743,7 +950,9 @@ class _HomePageState extends State<HomePage> {
   void _startMediaPoll() {
     _stopMediaPoll();
     _mediaPollTimer = Timer.periodic(
-        const Duration(seconds: 3), (_) => unawaited(_pollMediaInfo()));
+      const Duration(seconds: 3),
+      (_) => unawaited(_pollMediaInfo()),
+    );
     _mediaTick = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted || !_mediaPlaying || _seekDragging) return;
       setState(() {}); // advance the interpolated position
@@ -767,7 +976,11 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _pollMediaInfo() async {
     final client = _client;
-    if (client == null || !_socketUp) return;
+    if (client == null || !_socketUp || !mounted) return;
+    // Each poll costs the PC a 1-3 s PowerShell run. Nobody sees the card
+    // while another page (Screen, Files...) covers the dashboard, so skip
+    // it then and leave that CPU to the screen stream.
+    if (!(ModalRoute.isCurrentOf(context) ?? true)) return;
     try {
       final info = await client.request('media.info');
       if (!mounted) return;
@@ -812,9 +1025,11 @@ class _HomePageState extends State<HomePage> {
     });
     final client = _client;
     if (client == null || !_socketUp) return;
-    unawaited(client
-        .request('media.seek', {'seconds': seconds.round()})
-        .then((_) => true, onError: (_) => false));
+    unawaited(
+      client
+          .request('media.seek', {'seconds': seconds.round()})
+          .then((_) => true, onError: (_) => false),
+    );
   }
 
   /// Remaining time as `m:ss` for the countdown chip.
@@ -824,6 +1039,270 @@ class _HomePageState extends State<HomePage> {
     var secs = end.difference(DateTime.now()).inSeconds;
     if (secs < 0) secs = 0;
     return '${secs ~/ 60}:${(secs % 60).toString().padLeft(2, '0')}';
+  }
+
+  Future<void> _refreshBrightness() async {
+    final client = _client;
+    if (client == null) return;
+    try {
+      final state = await client.request('display.brightness.get');
+      if (!mounted || !identical(client, _client)) return;
+      _applyBrightnessState(state);
+    } catch (_) {
+      // Agents that predate brightness control answer "unknown cmd": show
+      // the card disabled instead of an error popup.
+      if (mounted && identical(client, _client)) {
+        setState(() => _brightnessSupported = false);
+      }
+    }
+  }
+
+  void _applyBrightnessState(Map<String, dynamic> state) {
+    final level = state['level'];
+    setState(() {
+      _brightnessSupported = state['supported'] == true && level is num;
+      if (level is num && !_brightnessDragging) {
+        _brightness = level.toDouble().clamp(0.0, 100.0);
+      }
+    });
+  }
+
+  /// Slider drag: move the thumb now, send right away (leading edge), then
+  /// at most one set per throttle tick with whatever value is newest.
+  void _onBrightnessChanged(double value) {
+    setState(() => _brightness = value);
+    _brightnessQueued = value.round();
+    if (_brightnessThrottle != null) return;
+    _flushBrightness();
+    _brightnessThrottle = Timer.periodic(_brightnessThrottleInterval, (t) {
+      if (_brightnessQueued == null) {
+        t.cancel();
+        _brightnessThrottle = null;
+      } else {
+        _flushBrightness();
+      }
+    });
+  }
+
+  void _flushBrightness() {
+    final level = _brightnessQueued;
+    _brightnessQueued = null;
+    if (level != null) unawaited(_sendBrightness({'level': level}));
+  }
+
+  /// Release: the final value always reaches the PC (unless the throttle
+  /// already sent exactly that one).
+  void _onBrightnessChangeEnd(double value) {
+    _brightnessThrottle?.cancel();
+    _brightnessThrottle = null;
+    _brightnessQueued = null;
+    setState(() {
+      _brightnessDragging = false;
+      _brightness = value;
+    });
+    if (value.round() != _brightnessLastSent) {
+      unawaited(_sendBrightness({'level': value.round()}));
+    }
+  }
+
+  /// -/+ buttons: a relative step, so it builds on the PC's real level
+  /// even if this phone's copy is stale (the agent adds up quick taps).
+  void _nudgeBrightness(int delta) {
+    setState(() => _brightness = (_brightness + delta).clamp(0.0, 100.0));
+    unawaited(_sendBrightness({'delta': delta}));
+  }
+
+  Future<void> _sendBrightness(Map<String, dynamic> params) async {
+    final client = _client;
+    if (client == null || !_socketUp) return;
+    final seq = ++_brightnessSeq;
+    final level = params['level'];
+    _brightnessLastSent = level is int ? level : null;
+    try {
+      final state = await client.request('display.brightness.set', params);
+      // The agent merges a burst of sets, so replies can carry a newer
+      // value than their request — or an older one than the thumb shows.
+      // Only the newest send's reply counts, and never mid-drag.
+      if (!mounted ||
+          !identical(client, _client) ||
+          seq != _brightnessSeq ||
+          _brightnessDragging) {
+        return;
+      }
+      _applyBrightnessState(state);
+    } catch (e) {
+      // A reconnect tears the old client down and fails its pending
+      // requests; that is not an error worth a popup (the new connection
+      // re-reads the level anyway).
+      if (!mounted || !identical(client, _client) || seq != _brightnessSeq) {
+        return;
+      }
+      showError(context, e);
+      // Put the slider back where the PC really is.
+      unawaited(_refreshBrightness());
+    }
+  }
+
+  Future<void> _refreshPowerStatus() async {
+    final client = _client;
+    if (client == null) return;
+    try {
+      final status = await client.request('power.status');
+      if (!mounted || !identical(client, _client)) return;
+      _applyPowerStatus(status);
+    } catch (_) {
+      // Older agents have no scheduler: no chip, nothing to sync.
+    }
+  }
+
+  /// Mirrors the PC's power status (a power.status reply or a
+  /// power.schedule event) into the countdown chip.
+  void _applyPowerStatus(Map<String, dynamic> status) {
+    final remaining = status['remaining_s'];
+    final at = status['at'];
+    DateTime? end;
+    if (status['scheduled'] == true) {
+      // remaining_s anchors the deadline to this phone's own clock, so a
+      // phone whose clock is off still counts down right; the absolute
+      // `at` is only the fallback.
+      if (remaining is num) {
+        end = DateTime.now().add(
+          Duration(milliseconds: (remaining * 1000).round()),
+        );
+      } else if (at is num) {
+        end = DateTime.fromMillisecondsSinceEpoch((at * 1000).round());
+      }
+    }
+    setState(() {
+      _clearPowerSchedule();
+      if (end != null) {
+        _powerAction = '${status['action']}';
+        _powerEnd = end;
+      }
+    });
+    if (end == null) return;
+    // Re-renders the chip once a second. At 0:00 it just waits for the
+    // PC's power.schedule event (fired) — the PC decides, not this tick.
+    _powerTick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final e = _powerEnd;
+      if (e == null || !e.isAfter(DateTime.now())) return;
+      setState(() {});
+    });
+  }
+
+  /// Drops the local copy of the schedule (callers wrap it in setState).
+  void _clearPowerSchedule() {
+    _powerTick?.cancel();
+    _powerTick = null;
+    _powerAction = null;
+    _powerEnd = null;
+  }
+
+  /// Snackbar text for a power.schedule event that ended a schedule on
+  /// its own; null for plain schedule/cancel changes.
+  String? _powerEventNote(Map<String, dynamic> data, String? before) {
+    String label(Object? action) =>
+        (_powerActionLabels[action] ?? 'power action').toLowerCase();
+    if (data['fired'] != null) {
+      return 'Scheduled ${label(data['fired'])} is happening now';
+    }
+    if (data['missed'] != null) {
+      return 'Scheduled ${label(data['missed'])} skipped: '
+          'the PC slept through it';
+    }
+    if (data['cancelled_by'] == 'pc' && before != null) {
+      return 'Scheduled ${label(before)} was cancelled on the PC';
+    }
+    return null;
+  }
+
+  /// Timer quick action: pick what the PC should do and when, then hand it
+  /// to the PC, which runs the countdown even while this phone is off.
+  Future<void> _showPowerTimerDialog() async {
+    if (_client == null || !_socketUp) {
+      showMessage(context, 'Not connected');
+      return;
+    }
+    final choice = await showDialog<_PowerTimerChoice>(
+      context: context,
+      builder: (ctx) => const _PowerTimerDialog(),
+    );
+    if (choice == null || !mounted) return;
+    final client = _client;
+    if (client == null) return;
+    try {
+      final status = await client.request('power.schedule', {
+        'action': choice.action,
+        'seconds': choice.seconds,
+      });
+      if (!mounted) return;
+      _applyPowerStatus(status);
+      final end = _powerEnd;
+      if (end != null) {
+        showMessage(
+          context,
+          '${_powerActionLabels[choice.action]} at '
+          '${TimeOfDay.fromDateTime(end).format(context)}',
+        );
+      }
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  /// Countdown chip tap: confirm, then cancel on the PC.
+  Future<void> _confirmCancelPowerSchedule() async {
+    final end = _powerEnd;
+    if (end == null) return;
+    final label = (_powerActionLabels[_powerAction] ?? 'power action')
+        .toLowerCase();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Cancel timer?'),
+        content: Text(
+          'The $label scheduled for '
+          '${TimeOfDay.fromDateTime(end).format(ctx)} will not happen.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Keep'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Cancel timer'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final client = _client;
+    if (client == null) return;
+    try {
+      final status = await client.request('power.cancel');
+      if (!mounted) return;
+      _applyPowerStatus(status);
+      showMessage(context, 'Timer cancelled');
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  /// Remaining time for the power countdown chip: m:ss, h:mm:ss, or
+  /// days + hours for the long ones (a timer can be up to 7 days out).
+  String get _powerTimerLabel {
+    final end = _powerEnd;
+    if (end == null) return '';
+    var secs = end.difference(DateTime.now()).inSeconds;
+    if (secs < 0) secs = 0;
+    String two(int n) => n.toString().padLeft(2, '0');
+    if (secs >= 86400) return '${secs ~/ 86400}d ${secs % 86400 ~/ 3600}h';
+    if (secs >= 3600) {
+      return '${secs ~/ 3600}:${two(secs % 3600 ~/ 60)}:${two(secs % 60)}';
+    }
+    return '${secs ~/ 60}:${two(secs % 60)}';
   }
 
   @override
@@ -843,31 +1322,33 @@ class _HomePageState extends State<HomePage> {
       body: _loadingDevices
           ? const Center(child: CircularProgressIndicator())
           : _devices.isEmpty
-              ? const Center(child: Text('No saved PCs yet'))
-              : RefreshIndicator(
-                  onRefresh: _loadDevices,
-                  child: ListView.builder(
-                    itemCount: _devices.length,
-                    itemBuilder: (context, i) {
-                      final d = _devices[i];
-                      return Card(
-                        margin: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 6),
-                        child: ListTile(
-                          leading: const Icon(Icons.computer, size: 36),
-                          title: Text(d.name.isEmpty ? d.code : d.name),
-                          subtitle: Text(d.relayUrl),
-                          trailing: IconButton(
-                            icon: const Icon(Icons.delete_outline),
-                            tooltip: 'Remove',
-                            onPressed: () => _deleteDevice(d),
-                          ),
-                          onTap: () => _connect(d),
-                        ),
-                      );
-                    },
-                  ),
-                ),
+          ? const Center(child: Text('No saved PCs yet'))
+          : RefreshIndicator(
+              onRefresh: _loadDevices,
+              child: ListView.builder(
+                itemCount: _devices.length,
+                itemBuilder: (context, i) {
+                  final d = _devices[i];
+                  return Card(
+                    margin: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 6,
+                    ),
+                    child: ListTile(
+                      leading: const Icon(Icons.computer, size: 36),
+                      title: Text(d.name.isEmpty ? d.code : d.name),
+                      subtitle: Text(d.relayUrl),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.delete_outline),
+                        tooltip: 'Remove',
+                        onPressed: () => _deleteDevice(d),
+                      ),
+                      onTap: () => _connect(d),
+                    ),
+                  );
+                },
+              ),
+            ),
     );
   }
 
@@ -878,12 +1359,12 @@ class _HomePageState extends State<HomePage> {
     final statusText = _approvalPending
         ? 'Waiting for approval on the PC…'
         : _reconnecting
-            ? 'Reconnecting…'
-            : !_socketUp
-                ? 'Disconnected'
-                : _agentOnline
-                    ? 'Connected'
-                    : 'PC is offline';
+        ? 'Reconnecting…'
+        : !_socketUp
+        ? 'Disconnected'
+        : _agentOnline
+        ? 'Connected'
+        : 'PC is offline';
     final deviceName = device.name.isEmpty ? device.code : device.name;
     return Scaffold(
       appBar: AppBar(
@@ -900,9 +1381,11 @@ class _HomePageState extends State<HomePage> {
                 children: [
                   const CircularProgressIndicator(),
                   const SizedBox(height: 16),
-                  Text(_approvalPending
-                      ? 'Waiting for approval on the PC…'
-                      : 'Connecting to $deviceName…'),
+                  Text(
+                    _approvalPending
+                        ? 'Waiting for approval on the PC…'
+                        : 'Connecting to $deviceName…',
+                  ),
                   if (_approvalPending) ...[
                     const SizedBox(height: 8),
                     Text(
@@ -949,10 +1432,32 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ],
                 ),
+                const SizedBox(height: 8),
+                // Phone as a second monitor: one PC app (Discord, say) lives
+                // on a virtual screen only this phone sees, while the PC's
+                // own screen keeps showing whatever the PC user is doing.
+                Card(
+                  child: ListTile(
+                    leading: const Icon(Icons.phonelink, size: 32),
+                    title: const Text('Phone screen'),
+                    subtitle: const Text(
+                      'Open a PC app here while the PC shows something else',
+                    ),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => _open(
+                      PhoneMonitorPage(
+                        client: _client!,
+                        onAddApp: _pickAppForPhone,
+                      ),
+                    ),
+                  ),
+                ),
                 const SizedBox(height: 24),
                 Text('Quick actions', style: theme.textTheme.titleMedium),
                 const SizedBox(height: 8),
                 _buildMediaCard(theme),
+                const SizedBox(height: 8),
+                _buildDisplayCard(theme),
                 const SizedBox(height: 8),
                 _buildClipboardCard(theme),
                 const SizedBox(height: 8),
@@ -1040,15 +1545,13 @@ class _HomePageState extends State<HomePage> {
                 color: online
                     ? Colors.greenAccent
                     : _reconnecting
-                        ? Colors.amberAccent
-                        : Colors.white38,
+                    ? Colors.amberAccent
+                    : Colors.white38,
               ),
               const SizedBox(width: 8),
-              Text(statusText,
-                  style: const TextStyle(color: Colors.white70)),
+              Text(statusText, style: const TextStyle(color: Colors.white70)),
               if (platform.isNotEmpty) ...[
-                const Text('  ·  ',
-                    style: TextStyle(color: Colors.white38)),
+                const Text('  ·  ', style: TextStyle(color: Colors.white38)),
                 Flexible(
                   child: Text(
                     platform,
@@ -1077,7 +1580,7 @@ class _HomePageState extends State<HomePage> {
   Widget _quickAction({
     required IconData icon,
     required String tooltip,
-    required VoidCallback onPressed,
+    required VoidCallback? onPressed, // null = disabled
     Color? color,
   }) {
     return IconButton(
@@ -1098,7 +1601,9 @@ class _HomePageState extends State<HomePage> {
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
         for (final button in buttons)
-          Flexible(child: FittedBox(fit: BoxFit.scaleDown, child: button)),
+          Flexible(
+            child: FittedBox(fit: BoxFit.scaleDown, child: button),
+          ),
       ],
     );
   }
@@ -1148,8 +1653,9 @@ class _HomePageState extends State<HomePage> {
                   _mediaArtist,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodySmall
-                      ?.copyWith(color: theme.hintColor),
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.hintColor,
+                  ),
                 ),
               // Seek bar: shows the polled position interpolated forward
               // between polls; dragging freezes interpolation and the
@@ -1207,8 +1713,9 @@ class _HomePageState extends State<HomePage> {
               const SizedBox(height: 8),
               Text(
                 'Nothing playing',
-                style: theme.textTheme.bodyMedium
-                    ?.copyWith(color: theme.hintColor),
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.hintColor,
+                ),
               ),
               _oneLineRow([
                 _quickAction(
@@ -1231,6 +1738,72 @@ class _HomePageState extends State<HomePage> {
                 ),
               ]),
             ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDisplayCard(ThemeData theme) {
+    final supported = _brightnessSupported == true;
+    final enabled = supported && _socketUp;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Text('Display', style: theme.textTheme.titleSmall),
+                const Spacer(),
+                if (supported)
+                  Text(
+                    '${_brightness.round()}%',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.hintColor,
+                    ),
+                  ),
+              ],
+            ),
+            Row(
+              children: [
+                _quickAction(
+                  tooltip: 'Dimmer',
+                  icon: Icons.brightness_low,
+                  onPressed: enabled ? () => _nudgeBrightness(-10) : null,
+                ),
+                // Brightness: optimistic while dragging, throttled sends
+                // (see _onBrightnessChanged) and a final one on release.
+                Expanded(
+                  child: Slider(
+                    value: _brightness,
+                    max: 100,
+                    onChangeStart: enabled
+                        ? (_) => setState(() => _brightnessDragging = true)
+                        : null,
+                    onChanged: enabled ? _onBrightnessChanged : null,
+                    onChangeEnd: enabled ? _onBrightnessChangeEnd : null,
+                  ),
+                ),
+                _quickAction(
+                  tooltip: 'Brighter',
+                  icon: Icons.brightness_high,
+                  onPressed: enabled ? () => _nudgeBrightness(10) : null,
+                ),
+              ],
+            ),
+            if (_brightnessSupported == false)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  "This PC's display doesn't support brightness control "
+                  '(external monitors need DDC/CI turned on in their menu).',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.hintColor,
+                  ),
+                ),
+              ),
           ],
         ),
       ),
@@ -1271,7 +1844,31 @@ class _HomePageState extends State<HomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Power', style: theme.textTheme.titleSmall),
+            Row(
+              children: [
+                Text('Power', style: theme.textTheme.titleSmall),
+                const Spacer(),
+                // The PC's scheduled action, counting down; tap to cancel.
+                // Flexible: "Hibernate 6d 23h" under a large system font
+                // would otherwise push the row past a 360dp-wide screen.
+                if (_powerEnd != null)
+                  Flexible(
+                    child: ActionChip(
+                      avatar: Icon(
+                        _powerActionIcons[_powerAction] ?? Icons.schedule,
+                        size: 16,
+                      ),
+                      label: Text(
+                        '${_powerActionLabels[_powerAction] ?? ''} '
+                        '$_powerTimerLabel',
+                      ),
+                      tooltip: 'Cancel timer',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: _confirmCancelPowerSchedule,
+                    ),
+                  ),
+              ],
+            ),
             const SizedBox(height: 8),
             _oneLineRow([
               _quickAction(
@@ -1287,14 +1884,18 @@ class _HomePageState extends State<HomePage> {
               _quickAction(
                 tooltip: 'Restart',
                 icon: Icons.restart_alt,
-                onPressed: () =>
-                    _power('restart', 'Restart', dangerous: true),
+                onPressed: () => _power('restart', 'Restart', dangerous: true),
               ),
               _quickAction(
                 tooltip: 'Shut down',
                 icon: Icons.power_settings_new,
                 onPressed: () =>
                     _power('shutdown', 'Shut down', dangerous: true),
+              ),
+              _quickAction(
+                tooltip: 'Timer',
+                icon: Icons.schedule,
+                onPressed: _showPowerTimerDialog,
               ),
             ]),
           ],
@@ -1349,8 +1950,7 @@ class _HomePageState extends State<HomePage> {
                       '${formatBytes((info['mem_total'] as num?) ?? 0)}',
                   strong: true,
                 ),
-                _InfoRow('Uptime',
-                    formatUptime((info['uptime'] as num?) ?? 0)),
+                _InfoRow('Uptime', formatUptime((info['uptime'] as num?) ?? 0)),
               ],
             ],
           ),
@@ -1359,12 +1959,29 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  void _open(Widget page) {
+  /// "Add app" on the phone screen: the shared window switcher, picking a
+  /// window moves it onto the phone screen instead of focusing it on the PC.
+  Future<void> _pickAppForPhone(BuildContext context) {
+    final client = ClientRegistry.instance.client ?? _client;
+    if (client == null) return Future.value();
+    return showWindowSwitcher(
+      context,
+      client,
+      title: 'Show on phone',
+      allowLaunch: false,
+      onPick: (w) => client.request('phone.move', {'window': w['id']}),
+    );
+  }
+
+  Future<void> _open(Widget page) async {
     if (_client == null || !_socketUp) {
       showMessage(context, 'Not connected');
       return;
     }
-    Navigator.push(context, MaterialPageRoute(builder: (_) => page));
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => page));
+    // Back on the dashboard: Now Playing was paused meanwhile, refresh it
+    // now rather than on the next tick.
+    if (mounted) unawaited(_pollMediaInfo());
   }
 }
 
@@ -1419,8 +2036,10 @@ class _InfoRow extends StatelessWidget {
         children: [
           SizedBox(
             width: 80,
-            child: Text(label,
-                style: TextStyle(color: Theme.of(context).hintColor)),
+            child: Text(
+              label,
+              style: TextStyle(color: Theme.of(context).hintColor),
+            ),
           ),
           Expanded(
             child: Text(
@@ -1432,6 +2051,281 @@ class _InfoRow extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// The actions power.schedule accepts, in the order the timer dialog
+/// offers them (Shut down first: the default).
+const _powerActionLabels = {
+  'shutdown': 'Shut down',
+  'restart': 'Restart',
+  'sleep': 'Sleep',
+  'hibernate': 'Hibernate',
+  'lock': 'Lock',
+};
+
+const _powerActionIcons = {
+  'shutdown': Icons.power_settings_new,
+  'restart': Icons.restart_alt,
+  'sleep': Icons.bedtime_outlined,
+  'hibernate': Icons.ac_unit,
+  'lock': Icons.lock_outline,
+};
+
+/// What the timer dialog hands back. seconds is measured when Start is
+/// tapped, so time spent in the dialog doesn't shift an "at a time" pick.
+typedef _PowerTimerChoice = ({String action, int seconds});
+
+enum _TimerWhen { preset, custom, at }
+
+/// Power timer picker: what (Shut down / Restart / Sleep / Hibernate /
+/// Lock) and when (a preset, a custom hours+minutes, or a clock time).
+class _PowerTimerDialog extends StatefulWidget {
+  const _PowerTimerDialog();
+
+  @override
+  State<_PowerTimerDialog> createState() => _PowerTimerDialogState();
+}
+
+class _PowerTimerDialogState extends State<_PowerTimerDialog> {
+  static const _presetMinutes = [15, 30, 60, 120, 180];
+  // The agent's power.schedule bounds.
+  static const _minSeconds = 60;
+  static const _maxSeconds = 7 * 24 * 3600;
+
+  String _action = 'shutdown';
+  _TimerWhen _when = _TimerWhen.preset;
+  int _preset = 30;
+  TimeOfDay? _atTime;
+  final _hoursCtrl = TextEditingController(text: '1');
+  final _minutesCtrl = TextEditingController(text: '0');
+
+  @override
+  void dispose() {
+    _hoursCtrl.dispose();
+    _minutesCtrl.dispose();
+    super.dispose();
+  }
+
+  /// Seconds from [now] the current choice means, or null while it is
+  /// incomplete or outside 1 minute .. 7 days.
+  int? _seconds(DateTime now) {
+    int secs;
+    switch (_when) {
+      case _TimerWhen.preset:
+        secs = _preset * 60;
+      case _TimerWhen.custom:
+        final h = int.tryParse(_hoursCtrl.text) ?? 0;
+        final m = int.tryParse(_minutesCtrl.text) ?? 0;
+        secs = h * 3600 + m * 60;
+      case _TimerWhen.at:
+        final t = _atTime;
+        if (t == null) return null;
+        var at = DateTime(now.year, now.month, now.day, t.hour, t.minute);
+        // Next occurrence. Tomorrow is built from the date, not +24h, so a
+        // DST switch overnight keeps the wall-clock time the user picked.
+        if (!at.isAfter(now)) {
+          at = DateTime(now.year, now.month, now.day + 1, t.hour, t.minute);
+        }
+        // "At 10:16" picked at 10:15:30 is only 30s away: round up to the
+        // PC's 1-minute minimum rather than refuse it.
+        secs = at.difference(now).inSeconds;
+        if (secs < _minSeconds) secs = _minSeconds;
+    }
+    return secs >= _minSeconds && secs <= _maxSeconds ? secs : null;
+  }
+
+  /// "Shut down at 23:45 · in 1h 30m" under the choices.
+  String _summary(DateTime now, int? secs) {
+    if (secs == null) {
+      return _when == _TimerWhen.at
+          ? 'Pick a time'
+          : 'Choose between 1 minute and 7 days';
+    }
+    final target = now.add(Duration(seconds: secs));
+    final time = TimeOfDay.fromDateTime(target).format(context);
+    final String day;
+    if (DateUtils.isSameDay(target, now)) {
+      day = '';
+    } else if (DateUtils.isSameDay(
+      target,
+      DateTime(now.year, now.month, now.day + 1),
+    )) {
+      day = 'tomorrow ';
+    } else {
+      day = '${MaterialLocalizations.of(context).formatMediumDate(target)} ';
+    }
+    final d = Duration(seconds: secs);
+    final inText = d.inDays > 0
+        ? '${d.inDays}d ${d.inHours % 24}h'
+        : d.inHours > 0
+        ? '${d.inHours}h ${d.inMinutes % 60}m'
+        : '${d.inMinutes}m';
+    return '${_powerActionLabels[_action]} ${day}at $time · in $inText';
+  }
+
+  Future<void> _pickTime() async {
+    final picked = await showTimePicker(
+      context: context,
+      initialTime:
+          _atTime ??
+          TimeOfDay.fromDateTime(DateTime.now().add(const Duration(hours: 1))),
+      // The app theme styles AlertDialogs only; give the picker the same
+      // near-black AMOLED surface instead of Material's grey default.
+      builder: (context, child) {
+        final theme = Theme.of(context);
+        return Theme(
+          data: theme.copyWith(
+            timePickerTheme: theme.timePickerTheme.copyWith(
+              backgroundColor: theme.dialogTheme.backgroundColor,
+              shape: theme.dialogTheme.shape,
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+    if (!mounted) return;
+    setState(() {
+      if (picked != null) _atTime = picked;
+      // Cancelling the picker keeps the previous choice, unless a time
+      // was already picked earlier.
+      if (_atTime != null) _when = _TimerWhen.at;
+    });
+  }
+
+  String _presetLabel(int minutes) =>
+      minutes < 60 ? '${minutes}m' : '${minutes ~/ 60}h';
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final now = DateTime.now();
+    final secs = _seconds(now);
+    final at = _atTime;
+    return AlertDialog(
+      title: const Text('Power timer'),
+      scrollable: true,
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('The PC will', style: theme.textTheme.labelLarge),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              for (final entry in _powerActionLabels.entries)
+                ChoiceChip(
+                  avatar: Icon(_powerActionIcons[entry.key], size: 18),
+                  showCheckmark: false,
+                  label: Text(entry.value),
+                  selected: _action == entry.key,
+                  onSelected: (_) => setState(() => _action = entry.key),
+                ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Text('When', style: theme.textTheme.labelLarge),
+          const SizedBox(height: 8),
+          // No checkmarks: they widen the selected chip, and the Wrap
+          // would reflow under the user's finger on every pick.
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              for (final m in _presetMinutes)
+                ChoiceChip(
+                  label: Text(_presetLabel(m)),
+                  showCheckmark: false,
+                  selected: _when == _TimerWhen.preset && _preset == m,
+                  onSelected: (_) => setState(() {
+                    _when = _TimerWhen.preset;
+                    _preset = m;
+                  }),
+                ),
+              ChoiceChip(
+                label: const Text('Custom'),
+                showCheckmark: false,
+                selected: _when == _TimerWhen.custom,
+                onSelected: (_) => setState(() => _when = _TimerWhen.custom),
+              ),
+              ChoiceChip(
+                label: Text(
+                  at == null ? 'At a time…' : 'At ${at.format(context)}',
+                ),
+                showCheckmark: false,
+                selected: _when == _TimerWhen.at,
+                onSelected: (_) => _pickTime(),
+              ),
+            ],
+          ),
+          if (_when == _TimerWhen.custom) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _hoursCtrl,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                      LengthLimitingTextInputFormatter(3),
+                    ],
+                    decoration: const InputDecoration(
+                      labelText: 'Hours',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onChanged: (_) => setState(() {}),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: TextField(
+                    controller: _minutesCtrl,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                      LengthLimitingTextInputFormatter(4),
+                    ],
+                    decoration: const InputDecoration(
+                      labelText: 'Minutes',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onChanged: (_) => setState(() {}),
+                  ),
+                ),
+              ],
+            ),
+          ],
+          const SizedBox(height: 16),
+          Text(
+            _summary(now, secs),
+            style: theme.textTheme.bodyMedium?.copyWith(color: theme.hintColor),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: secs == null
+              ? null
+              : () {
+                  final s = _seconds(DateTime.now());
+                  if (s != null) {
+                    Navigator.pop(context, (action: _action, seconds: s));
+                  }
+                },
+          child: const Text('Start timer'),
+        ),
+      ],
     );
   }
 }

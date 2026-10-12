@@ -1,0 +1,17 @@
+[Unit]
+Description=Sudo PC agent (phone remote control)
+# Runs inside the desktop session: mouse/keyboard control and screen capture
+# need the session's display, and the approval prompt shows on it.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/share/sudo-agent/venv/bin/python %h/.local/share/sudo-agent/agent.py
+Environment=PYTHONUNBUFFERED=1
+# Until the desktop is fully up the agent exits ("can't reach the desktop");
+# systemd simply tries again.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

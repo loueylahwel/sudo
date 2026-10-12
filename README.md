@@ -58,6 +58,42 @@ app listens for. If the PC's IP changes, the app re-finds it by name.
 > agent also exposes full file and shell access by design — run it only on
 > machines you own.
 
+## Linux (Ubuntu / Kubuntu 26.04)
+
+```bash
+git clone https://github.com/loueylahwel/sudo.git && cd sudo
+bash agent/linux/install.sh
+```
+
+The installer adds a few system packages, puts the agent in
+`~/.local/share/sudo-agent` and starts it with your desktop session
+(a systemd user service). Re-run it after `git pull` to update. Logs:
+`journalctl --user -u sudo-agent -f`.
+
+What works on Linux today:
+- files, terminal (bash), processes, clipboard, power and the timer;
+- media keys, Now Playing and seek (through MPRIS, so any player);
+- camera, and remote access.
+
+The **Screen view and mouse/keyboard control need an X11 session for now**.
+On Kubuntu 26.04 (Wayland by default):
+
+```bash
+sudo apt install plasma-session-x11
+```
+
+Then log out and pick **Plasma (X11)** on the login screen. In a Wayland
+session the phone says so instead of showing a frozen screen.
+
+These are still Windows-only:
+- the app switcher and dock;
+- the phone as a second monitor;
+- phone audio;
+- brightness.
+
+See [docs/linux-port-plan.md](docs/linux-port-plan.md) for the plan to port
+them, and for native Wayland (KDE portal) capture.
+
 ## Optional: Sudo-Agent.exe (GUI)
 
 Also in the release: `Sudo-Agent.exe` shows a little window with live

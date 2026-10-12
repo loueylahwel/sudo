@@ -125,10 +125,14 @@ class _FilesPageState extends State<FilesPage> {
     }
   }
 
+  // Linux/macOS PCs have absolute paths starting with '/', Windows ones a
+  // drive ('C:\'): join and split with the PC's own separator.
+  bool get _posix => _path.startsWith('/');
+
   String _join(String base, String name) {
     if (base.isEmpty) return name;
     if (base.endsWith('\\') || base.endsWith('/')) return '$base$name';
-    return '$base\\$name';
+    return base.startsWith('/') ? '$base/$name' : '$base\\$name';
   }
 
   List<String> get _segments => _path
@@ -138,6 +142,7 @@ class _FilesPageState extends State<FilesPage> {
 
   String _pathForSegment(int index) {
     final segs = _segments.sublist(0, index + 1);
+    if (_posix) return '/${segs.join('/')}';
     var p = segs.join('\\');
     if (index == 0 && segs[0].endsWith(':')) p = '$p\\';
     return p;

@@ -57,6 +57,7 @@ except Exception as _input_error:  # Linux with no X display reachable
 
 from brightness import BrightnessControl
 import kdeapps
+import wayland_portal
 from remote_access import is_lan_address
 
 if getattr(sys, "frozen", False) and sys.stdout is None:
@@ -125,6 +126,9 @@ DISCOVERY_PORT = 47809  # UDP beacon the phone app listens on
 
 mouse = MouseController()
 kb = KbController()
+# Wayland: input goes through the agent's portal session instead of
+# pynput, which only reaches Xwayland windows there (set by Agent).
+PORTAL = None
 
 # ---------------------------------------------------------------- config
 
@@ -269,7 +273,9 @@ def _cv():
 def cursor_polygon(mon, pos, width, height):
     """Arrow-pointer outline for a cursor at screen position pos, scaled
     into a width x height frame of monitor mon; None when the cursor
-    is not on that monitor."""
+    is not on that monitor (or pos is None: no cursor to draw)."""
+    if pos is None:
+        return None
     cx, cy = pos
     x = (cx - mon["left"]) * width / mon["width"]
     y = (cy - mon["top"]) * height / mon["height"]
@@ -314,8 +320,9 @@ def frame_thumb(shot, pos):
     else:
         grid = Image.frombuffer("RGB", (w, h), shot.raw, "raw", "BGRX", 0,
                                 1).resize((32, 18), Image.NEAREST).tobytes()
-    # signed: monitors left of / above the primary have negative coords
-    qx, qy = int(pos[0]) // 2, int(pos[1]) // 2
+    # signed: monitors left of / above the primary have negative coords.
+    # pos None: portal frames, whose pixels already include the pointer.
+    qx, qy = (int(pos[0]) // 2, int(pos[1]) // 2) if pos is not None else (0, 0)
     return (grid + qx.to_bytes(4, "little", signed=True)
             + qy.to_bytes(4, "little", signed=True))
 
@@ -490,8 +497,14 @@ class ScreenStreamer:
         self._dxgi = None            # capture thread's DXGICapture
         self._dxgi_errors = 0        # consecutive Desktop Duplication errors
         self._dxgi_retry_at = 0.0    # mss until then, after repeated errors
-        self._base = None            # newest full image (DXGI or GDI)
+        self._base = None            # newest full image (DXGI, GDI, portal)
         self._base_rect = None       # the rect _base was captured for
+        # Wayland: frames come from the agent's portal session instead.
+        portal = getattr(agent, "portal", None)
+        self._portal = portal if portal is not None and wayland_session() \
+            else None
+        self._pframes = None         # capture thread's PortalFrames
+        self._pgen = None            # portal session generation it reads
         # Flow control (screen.start {ack: true}): the phone acks every frame
         # it receives, and at most MAX_UNACKED frames are ever out (grabbed
         # but not yet acked). Nothing can queue anywhere between the PC
@@ -569,6 +582,9 @@ class ScreenStreamer:
         self._enc_pool.shutdown(wait=False)
 
     def _close_capture(self):
+        if self._pframes is not None:
+            self._pframes.close()
+            self._pframes = None
         if self._sct is not None:
             self._sct.close()
             self._sct = None
@@ -587,6 +603,10 @@ class ScreenStreamer:
     def _refresh_rect(self, now):
         # Follow resolution changes / monitors being re-arranged; the
         # monitor list itself is cached, so this is cheap.
+        if self._portal is not None:
+            if self._portal.rect:
+                self.rect = dict(self._portal.rect)
+            return
         if now - self._rect_at < MONITORS_TTL:
             return
         self._rect_at = now
@@ -698,6 +718,44 @@ class ScreenStreamer:
         self._last_thumb = thumb
         return shot, pos, rect
 
+    # Longest wait for the portal's next frame once streaming: PipeWire only
+    # delivers when the compositor repaints, so this is the idle poll.
+    PORTAL_WAIT_S = 0.016
+
+    def _grab_portal(self, rect, force, not_before):
+        """Capture-thread stage via the Wayland portal (wayland_portal.py):
+        PipeWire hands over a frame whenever the compositor repaints the
+        monitor, pointer included. Paces itself like _grab_dxgi. Same return
+        as _grab, with pos None: the pointer is already in the image."""
+        delay = not_before - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        portal = self._portal
+        if not portal.active:
+            # Sharing was stopped from the desktop, or closed while no phone
+            # watched: start it again (no dialog thanks to the restore token).
+            asyncio.run_coroutine_threadsafe(portal.ensure(), self.agent.loop) \
+                .result(wayland_portal.START_TIMEOUT + 5)
+        if self._pframes is None or self._pgen != portal.generation:
+            if self._pframes is not None:
+                self._pframes.close()
+            self._pframes, self._base = None, None
+            _cv()  # warm the lazy OpenCV import here, off the event loop
+            self._pgen = portal.generation
+            self._pframes = portal.open_frames()
+        img = self._pframes.grab(1.0 if self._base is None
+                                 else self.PORTAL_WAIT_S)
+        if img is not None:
+            self._base = DuplicatedShot(img)
+            self._base_rect = rect
+        if self._base is None:
+            return None
+        thumb = frame_thumb(self._base, None)
+        if thumb == self._last_thumb and not force:
+            return None
+        self._last_thumb = thumb
+        return self._base, None, rect
+
     def _use_dxgi(self, now):
         return platform.system() == "Windows" and now >= self._dxgi_retry_at
 
@@ -737,9 +795,14 @@ class ScreenStreamer:
                 grab_at = time.monotonic()
                 self._refresh_rect(grab_at)
                 force, self._force = self._force, False
-                dxgi = self._use_dxgi(grab_at)
+                portal = self._portal is not None
+                dxgi = not portal and self._use_dxgi(grab_at)
                 try:
-                    if dxgi:
+                    if portal:
+                        grabbed = await loop.run_in_executor(
+                            self._grab_pool, self._grab_portal, self.rect,
+                            force, deadline)
+                    elif dxgi:
                         grabbed = await loop.run_in_executor(
                             self._grab_pool, self._grab_dxgi, self.rect,
                             force, deadline)
@@ -778,7 +841,7 @@ class ScreenStreamer:
                         self._outstanding += 1
                     inflight.append(asyncio.create_task(
                         self._encode_and_send(grabbed, prev)))
-                if dxgi:
+                if dxgi or portal:
                     # _grab_dxgi paces itself: it sleeps until `deadline`,
                     # then blocks until the screen (or pointer) changes.
                     # Next deadline: one interval after this one, never
@@ -1514,6 +1577,9 @@ def do_move(x, y, rect=None):
     streamed monitor), the primary monitor when None. Clamped to the last
     pixel: x=1.0 must not land on the first pixel of a monitor to the
     right."""
+    if PORTAL is not None:
+        PORTAL.move_abs(x, y)
+        return
     if rect is None:
         rect = primary_monitor(list_monitors())
     w, h = rect["width"], rect["height"]
@@ -1532,6 +1598,9 @@ def do_move_rel(dx, dy, rect=None):
     """Relative move — dx/dy are normalized deltas (-1..1 of the streamed
     monitor's size, the primary monitor's when `rect` is None), so a drag
     across the phone image crosses the same share of the monitor shown."""
+    if PORTAL is not None:
+        PORTAL.move_rel(dx, dy)  # the portal takes fractional pixels
+        return
     w, h = (rect["width"], rect["height"]) if rect else screen_size()
     _move_carry[0] += dx * w
     _move_carry[1] += dy * h
@@ -1546,6 +1615,12 @@ def do_click(button="left", action="click", x=None, y=None, count=1,
              rect=None):
     if x is not None and y is not None:
         do_move(x, y, rect)
+    if PORTAL is not None:
+        if action in ("down", "up"):
+            PORTAL.button(button, action == "down")
+        else:
+            PORTAL.click(button, count)
+        return
     btn = BUTTONS.get(button, Button.left)
     if action == "down":
         mouse.press(btn)
@@ -1556,10 +1631,16 @@ def do_click(button="left", action="click", x=None, y=None, count=1,
 
 
 def do_scroll(dx=0, dy=0):
+    if PORTAL is not None:
+        PORTAL.scroll(dx, dy)
+        return
     mouse.scroll(int(dx), int(dy))
 
 
 def do_key(name):
+    if PORTAL is not None:
+        PORTAL.key(name)
+        return
     key = SPECIAL_KEYS.get(name.lower())
     if key is None:
         if len(name) == 1:
@@ -1572,6 +1653,9 @@ def do_key(name):
 
 
 def do_text(text):
+    if PORTAL is not None:
+        PORTAL.text(text)
+        return
     kb.type(text)
 
 
@@ -2202,6 +2286,15 @@ class Agent:
         # scripts (kdeapps.py); on Windows through winapps.py.
         self.kde_apps = kdeapps.KdeApps(list_monitors) \
             if platform.system() == "Linux" and kdeapps.available() else None
+        # Wayland: the screen and input through the desktop portal
+        # (wayland_portal.py). Started by the first screen.start or input;
+        # stopped a minute after the last phone left.
+        global PORTAL
+        self.portal = wayland_portal.Portal(
+            _default_config_path().parent / "portal_token") \
+            if wayland_session() and wayland_portal.available() else None
+        PORTAL = self.portal
+        self._portal_idle_task = None
         # Scheduled power action: {"action", "at" (unix s)} or None. Kept
         # in cfg["power_schedule"] too, so power.status survives a restart.
         self.power_sched = None
@@ -2536,11 +2629,19 @@ class Agent:
         # request must fail without freezing the phone's current picture.
         # max_age=0: monitors may have changed since the last query.
         if wayland_session():
-            raise ValueError(
-                "This PC is in a Wayland session, which Sudo can't capture "
-                "yet. On Kubuntu: install plasma-session-x11, log out and "
-                "pick 'Plasma (X11)' on the login screen.")
-        rect = await asyncio.to_thread(self.resolve_monitor, spec, 0)
+            if self.portal is None:
+                raise ValueError(
+                    "This PC is in a Wayland session and the screen-sharing "
+                    "pieces are missing: re-run agent/linux/install.sh (it "
+                    "installs python3-gi, GStreamer and dbus-fast).")
+            if spec not in (None, "primary"):
+                raise ValueError("On Wayland only the main screen can be "
+                                 "shown for now.")
+            # The first time, the PC shows "Allow remote control".
+            await self.portal.ensure()
+            rect = dict(self.portal.rect)
+        else:
+            rect = await asyncio.to_thread(self.resolve_monitor, spec, 0)
         settings = None
         if codec != "h264":
             settings = screen_settings(msg, rect["width"])
@@ -3296,6 +3397,11 @@ class Agent:
                 await cam.stop()
             if client_id == self._phone_audio_client:
                 await self._phone_audio_stop()
+            if self.portal is not None and not self.known_clients and (
+                    self._portal_idle_task is None
+                    or self._portal_idle_task.done()):
+                self._portal_idle_task = asyncio.create_task(
+                    self._portal_idle_off())
             if self.phone is not None and self.phone.enabled:
                 # A finger that was down can't be lifted over a dead socket.
                 self.phone.release_touches()
@@ -3304,6 +3410,16 @@ class Agent:
                         or self._phone_idle_task.done()):
                     self._phone_idle_task = asyncio.create_task(
                         self._phone_idle_off())
+
+    PORTAL_IDLE_OFF_S = 60
+
+    async def _portal_idle_off(self):
+        """No phone left: stop the portal session after a grace minute, so
+        the desktop's "screen is being shared" indicator goes away. The next
+        screen.start or input starts it again (no dialog: restore token)."""
+        await asyncio.sleep(self.PORTAL_IDLE_OFF_S)
+        if not self.known_clients and self.portal is not None:
+            await self.portal.close()
 
     # ---- main loop ----
 

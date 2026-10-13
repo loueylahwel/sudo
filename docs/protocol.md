@@ -111,7 +111,7 @@ Events are pushed without an `id`:
 | `clipboard.get` | – | `{ text }` |
 | `clipboard.set` | `text` | `{ text }` |
 | `clipboard.watch` | `enabled: bool` | `{ watching }` – when on, agent broadcasts `clipboard.changed` events |
-| `screen.start` | see [`screen.start`](#screenstart) below | `{ streaming, codec, binary, preset, fps, quality, max_width, subsampling, adaptive, w, h, monitor }` (H.264: `bitrate` instead of `quality`/`subsampling`/`adaptive`) – then frames stream to this client |
+| `screen.start` | see [`screen.start`](#screenstart) below | `{ streaming, codec, binary, preset, fps, quality, max_width, subsampling, adaptive, w, h, monitor, ack, cursor, pointer }` (H.264: `bitrate` instead of `quality`/`subsampling`/`adaptive`/`ack`/`cursor`/`pointer`, pointer in the frames) – then frames stream to this client |
 | `screen.stop` | – | `{ streaming: false }` |
 | `screen.ack` | – (send without `id`) | – one received frame, for a stream started with `ack: true` |
 | `camera.start` | `fps?` (dflt 10), `max_width?` (dflt 640) | `{ streaming: true }` – webcam frames stream as PJF1 packets |
@@ -141,7 +141,8 @@ Events are pushed without an `id`:
 | `bitrate` | H.264 bits/s, 0.5-20 M | 6 000 000 |
 | `monitor` | `"primary"` or an index into the agent's monitor list (`0` = all monitors, `1..n` = each one) | `"primary"` |
 | `binary` | PJF1 binary frames instead of base64 events | `false` |
-| `ack` | flow control (JPEG): the client sends `{"cmd": "screen.ack"}` (no `id`) for every frame it receives, and the agent never has more than 2 frames out unacked — frames can't queue up on a slow link. Answered as `ack: true` by agents that support it; older agents ignore it (then send no acks) | `false` |
+| `ack` | flow control (JPEG): the client sends `{"cmd": "screen.ack"}` (no `id`) for every frame it receives, in order. The agent keeps 2-8 frames out unacked: enough to cover the link's round trip at the target fps (the ack round trips' 10 s minimum), one fewer per round trip while acks come back clearly late (frames queueing). Frames can't queue up on a slow link, and a long route (the internet tunnel) still gets full fps. Answered as `ack: true` by agents that support it; older agents ignore it (then send no acks) | `false` |
+| `cursor` | `"client"`: the client draws the pointer itself. Frames carry no pointer, pointer-only movement sends no frame, and the agent sends `cursor` events (below). Answered as `cursor: "client"` (plus `pointer`, the first position) when supported, else `"frame"` (pointer painted into frames: Wayland portal, older agents answer nothing) | pointer in frames |
 
 Explicit `fps` / `quality` / `max_width` / `subsampling` override the
 preset's values. With **no preset and no params** the agent uses the
@@ -157,8 +158,8 @@ exactly what they always got.
 | `auto` | starts at 1280 | starts at 70 | 20 | 4:2:0 |
 
 `auto` adapts per client: when that phone's link backs up (the stream
-spent over 60% of the last 2 s blocked sending to it, or its socket is
-congested) it steps down a rung of 1280/q70 → 1120/q62 → 960/q55 →
+spent over 60% of the last 2 s blocked sending to it, or waiting for acks
+while they come back late, or its socket is congested) it steps down a rung of 1280/q70 → 1120/q62 → 960/q55 →
 800/q50 → 640/q45, at most one rung per second, and back up one rung
 after ~6 s (and 20+ frames) under 25%. Pinning `quality` or `max_width`
 alongside `auto` turns the adaptation off (reported as preset `custom`).
@@ -170,6 +171,18 @@ without touching a running stream. The response's `monitor` is the
 captured rect `{left, top, width, height}` in desktop pixels, and `w`/`h`
 the size of the frames being sent.
 
+### Client-drawn pointer (`cursor: "client"`)
+
+`{ "event": "cursor", "data": { "x": 0.42, "y": 0.61, "seq": 118 } }` comes
+after every pointer input from this client and whenever the pointer moves
+otherwise (the PC's own mouse, ~16x/s). `x`/`y` are the pointer as a fraction
+of the streamed monitor (outside 0..1 when it is on another monitor); `seq`
+is the last `seq` this client sent with a pointer `input` (0 if none). The
+client draws the pointer at that position plus the `move_rel` deltas it sent
+with a higher `seq`, so the drawn pointer follows the finger at once,
+whatever the link's latency. Events are coalesced (the newest position
+wins).
+
 ### `input` actions
 
 All pointer coordinates are **normalized 0..1** relative to the monitor
@@ -178,7 +191,7 @@ when it isn't streaming); the agent maps them to pixels.
 
 ```json
 { "cmd": "input", "action": "move",   "x": 0.5, "y": 0.5 }
-{ "cmd": "input", "action": "move_rel", "dx": 0.02, "dy": -0.01 }
+{ "cmd": "input", "action": "move_rel", "dx": 0.02, "dy": -0.01, "seq": 118 }  // seq optional, see cursor events
 { "cmd": "input", "action": "click",  "button": "left|right|middle", "x": 0.5, "y": 0.5, "count": 1 }
 { "cmd": "input", "action": "down",   "button": "left", "x": 0.5, "y": 0.5 }
 { "cmd": "input", "action": "up",     "button": "left", "x": 0.5, "y": 0.5 }
@@ -192,8 +205,10 @@ size) for touchpad-style control. `click`/`down`/`up` may omit `x`/`y` to
 act at the PC cursor's current position — this is how "tap to click where
 the cursor already is" is implemented.
 
-The agent draws the PC cursor onto every `screen.frame` image itself, so the
-phone always sees the real cursor position without any extra message.
+Unless the stream was started with `cursor: "client"` (see
+[Client-drawn pointer](#client-drawn-pointer-cursor-client)), the agent
+draws the PC cursor onto every `screen.frame` image itself, so the phone
+sees the real cursor position without any extra message.
 
 Named keys: `enter backspace tab esc space up down left right delete home end
 pageup pagedown shift ctrl alt cmd f1..f12` plus the `media_*` keys.

@@ -94,6 +94,30 @@ These are still Windows-only:
 See [docs/linux-port-plan.md](docs/linux-port-plan.md) for the plan to port
 them, and for native Wayland (KDE portal) capture.
 
+## Away from home
+
+Pair once on your home Wi-Fi; after that the app reaches your PC from any
+network (mobile data, another Wi-Fi), with nobody at the PC. It tries, in
+order of speed:
+
+1. the home network;
+2. your router's forward of the PC's secure port (set up by UPnP, when
+   your provider allows incoming connections);
+3. a Cloudflare tunnel the PC opens outward (works even when the provider
+   blocks incoming connections). The PC downloads `cloudflared` once if
+   it isn't installed. No account needed. Traffic stays end-to-end
+   encrypted with the PC's own certificate, so Cloudflare only carries
+   scrambled bytes.
+
+The tunnel's address changes when the PC restarts. The PC posts the new one
+to a secret [ntfy.sh](https://ntfy.sh) topic that only your paired phones
+know, and the app looks there when the old address stops answering.
+
+For it to work whenever you want, the PC must be on, logged in (turn on
+automatic login) and not asleep. Set `"tunnel": false` in the agent's
+`config.json` to turn the tunnel off, or `"remote_access": false` to turn
+off all access from outside.
+
 ## Optional: Sudo-Agent.exe (GUI)
 
 Also in the release: `Sudo-Agent.exe` shows a little window with live
@@ -111,8 +135,9 @@ above.
  └─────────────────────┘              └────────────────┘
 ```
 
-The phone and PC talk directly over WebSocket on port 8080 — nothing leaves
-your network. PC discovery uses a UDP beacon on port 47809.
+At home the phone and PC talk directly over WebSocket on port 8080 (and
+8443, TLS, once paired) — nothing leaves your network. PC discovery uses a
+UDP beacon on port 47809. Away from home, see [Away from home](#away-from-home).
 
 ## Building from source
 
@@ -129,4 +154,3 @@ app), `relay/` (optional standalone Node relay for remote access),
 ## Roadmap
 
 - PC notification mirroring
-- Remote (internet) access mode via the standalone relay

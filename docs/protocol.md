@@ -126,6 +126,7 @@ Events are pushed without an `id`:
 | `apps.launch` | `app` (an `apps.list` id) | `{ launched: true, id, name }` – starts the app (`shell:AppsFolder\<id>`) and brings its first new window to the front; ids not in the list are rejected |
 | `input` | see below | `{}` |
 | `notify.subscribe` | – | currently returns `ok:false` (not implemented yet) |
+| `remote.info` | – | `{ available, host, port, fingerprint, error, tunnel, tunnelError, rendezvous }` – how to reach the PC from other networks, see [Remote access](#remote-access); changes are pushed as `remote.changed` events with the same data |
 
 ### `screen.start`
 
@@ -271,6 +272,30 @@ On Windows, `shutdown`/`restart` are also handed to Windows' own timer
 shows its own notice; `power.cancel` always aborts that timer
 (`shutdown /a`). In standalone mode the PC also shows a small always-on-top
 "Shutting down in 60s — Cancel" notice a minute before any action.
+
+### Remote access
+
+A phone that paired on the LAN can reach the PC from any network. Every
+route ends at the agent's TLS port (`port`, default 8443), whose self-signed
+certificate the phone pins (`fingerprint`, SHA-256 of the DER), and only a
+`pair` carrying a trust token from a LAN pairing is accepted there.
+
+- **Direct** (`available`, `host`): the router forwards `port` to the PC
+  (UPnP). Fails when the provider blocks incoming connections.
+- **Tunnel** (`tunnel`): `https://<name>.trycloudflare.com`, a Cloudflare
+  quick tunnel that cloudflared on the PC dials out to (no account). Open a
+  WebSocket to it: its binary messages carry one raw TCP stream into the
+  TLS port, so the phone runs its pinned TLS through it, Cloudflare only
+  sees encrypted bytes. The app pipes a loopback socket into it
+  (`app/lib/tunnel.dart`) and connects to `wss://127.0.0.1:<port>`.
+  `GET <tunnel>/sudo-health` answers `sudo tunnel ok` while the path works.
+- **Rendezvous** (`rendezvous`): the tunnel address changes when
+  cloudflared restarts. The PC posts `{"url": "<tunnel>", "t": <unix s>}`
+  to this secret ntfy topic on every change and every 6 h; read the latest
+  with `GET <rendezvous>/json?poll=1&since=all` (last `message` event).
+
+Config (`config.json`): `remote_access: false` turns off every route;
+`tunnel: false` only the tunnel; `ntfy_server` replaces `https://ntfy.sh`.
 
 ## 5. Typical flows
 

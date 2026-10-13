@@ -15,6 +15,7 @@ Usage:
 import asyncio
 import base64
 import io
+import math
 import json
 import os
 import platform
@@ -27,6 +28,7 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -480,7 +482,7 @@ class ScreenStreamer:
     """
 
     def __init__(self, agent, client_id, settings, rect, monitor="primary",
-                 binary=False, acks=False):
+                 binary=False, acks=False, client_cursor=False):
         self.agent = agent
         self.client_id = client_id
         self.preset = settings["preset"]
@@ -505,6 +507,12 @@ class ScreenStreamer:
             else None
         self._pframes = None         # capture thread's PortalFrames
         self._pgen = None            # portal session generation it reads
+        # screen.start {cursor: "client"}: the phone draws the pointer
+        # itself from `cursor` events (Agent.send_cursor), so it moves the
+        # moment the finger does, whatever the link's latency. Frames then
+        # carry no pointer, and pointer-only movement sends no frame. Not
+        # on the portal, whose frames already contain the pointer.
+        self.client_cursor = bool(client_cursor) and self._portal is None
         # Flow control (screen.start {ack: true}): the phone acks every frame
         # it receives, and at most MAX_UNACKED frames are ever out (grabbed
         # but not yet acked). Nothing can queue anywhere between the PC
@@ -512,11 +520,35 @@ class ScreenStreamer:
         self.acks = acks
         self._outstanding = 0
         self._ack_event = asyncio.Event()
+        # How many frames may be out: grows with the link's round trip so
+        # a slow route (the internet tunnel, 100-300 ms) still gets full
+        # fps, and shrinks when acks come back later than the route's
+        # base round trip (frames queueing). See _rtt_sample.
+        self._window = self.MIN_UNACKED
+        self._window_at = 0.0
+        self._sent_at = deque()      # send times of frames not acked yet
+        # The oldest _sent_at entries written off after ACK_TIMEOUT: their
+        # acks still come (a stalled mobile link delivers them late) and
+        # are absorbed, never paired with newer frames.
+        self._written_off = 0
+        # Acks still owed to the stream this one replaced on the same
+        # socket (Agent.h_screen_start), absorbed until _stale_until.
+        self._stale_acks = 0
+        self._stale_until = 0.0
+        self._rtts = deque()         # (time, seconds) ack round trips
+        self._min_rtt = None         # base round trip, last RTT_WINDOW s
+        self._srtt = None            # smoothed round trip
+        self._stats_at = time.monotonic()
+        self._stats_frames = 0
         self._last_thumb = None      # capture thread only
         # Set when a frame was dropped after its thumb was taken: the next
         # grab goes through even if unchanged, so the drop is never final.
         self._force = False
         self._wake = asyncio.Event()  # any cursor movement nudges a frame
+        # Client cursor: a frame is owed this soon after input or pointer
+        # movement (see wake).
+        self._refresh_at = 0.0
+        self._refresh_crc = None      # checksum of the last refresh passed on
         self._hot_until = 0.0         # stay at full rate briefly after change
         self._grab_pool = ThreadPoolExecutor(1, "sudo-screen-grab")
         self._enc_pool = ThreadPoolExecutor(1, "sudo-screen-encode")
@@ -536,20 +568,113 @@ class ScreenStreamer:
         return width, max(1, round(self.rect["height"] * width
                                    / self.rect["width"]))
 
+    # Client cursor: pointer moves no longer change the frame thumb, and
+    # its sparse grid can miss small changes (a hover highlight, a text
+    # selection, a checkbox). So input or pointer movement owes one forced
+    # frame this long after: ~12/s at most while moving, always after the
+    # last move.
+    REFRESH_AFTER = 0.08
+
     def wake(self):
+        if self.client_cursor and not self._refresh_at:
+            self._refresh_at = time.monotonic() + self.REFRESH_AFTER
         self._wake.set()
 
-    # Frames that may be out at once with acks on: one being shown on the
-    # phone while the next travels. ACK_TIMEOUT: acks that stop coming (an
-    # app bug) resync the count instead of freezing the stream.
-    MAX_UNACKED = 2
+    def unacked_sent(self):
+        """Frames this stream sent whose acks haven't come yet (written off
+        or not): a replacement stream on the same socket gets them first."""
+        return len(self._sent_at) + self._stale_acks
+
+    # Frames that may be out at once with acks on: at least one being shown
+    # on the phone while the next travels, and up to MAX_UNACKED when the
+    # round trip is long (see _rtt_sample). ACK_TIMEOUT: acks that stop
+    # coming (an app bug) resync the count instead of freezing the stream.
+    MIN_UNACKED = 2
+    MAX_UNACKED = 8
     ACK_TIMEOUT = 1.0
+    RTT_WINDOW = 10.0   # the base round trip is the minimum over this long
+    STATS_EVERY = 15.0  # log line while frames flow (journalctl diagnostics)
 
     def ack(self):
-        """The phone received a frame (screen.ack)."""
+        """The phone received a frame (screen.ack). Acks come in frame
+        order, so the oldest unacked send time is this frame's."""
+        now = time.monotonic()
+        if self._stale_acks > 0:
+            if now < self._stale_until:
+                self._stale_acks -= 1  # the replaced stream's frame
+                return
+            self._stale_acks = 0
+        if self._written_off > 0:
+            # A frame written off after ACK_TIMEOUT: already out of
+            # _outstanding, and its round trip includes the stall.
+            self._written_off -= 1
+            if self._sent_at:
+                self._sent_at.popleft()
+            return
+        if self._sent_at:
+            self._rtt_sample(now - self._sent_at.popleft(), now)
         if self._outstanding > 0:
             self._outstanding -= 1
         self._ack_event.set()
+
+    def _acks_late(self):
+        """ACK_TIMEOUT with frames out: write off the ones already sent so
+        the stream moves on. Their acks are late, not lost, so they are
+        absorbed when they come (ack) instead of being paired with the
+        frames sent next, which would fake tiny round trips. Frames still
+        being encoded stay counted."""
+        fresh = len(self._sent_at) - self._written_off
+        self._written_off = len(self._sent_at)
+        self._outstanding = max(0, self._outstanding - fresh)
+        if self._written_off > 4 * self.MAX_UNACKED:
+            # Acks really stopped coming (an app bug): forget them.
+            self._sent_at.clear()
+            self._written_off = 0
+
+    def _queued(self):
+        """True when acks come back clearly later than the route's base
+        round trip: frames are queueing on the link (too much data), as
+        opposed to a route that is merely long."""
+        if self._srtt is None or self._min_rtt is None:
+            return False
+        return self._srtt - self._min_rtt > max(0.02, 0.3 * self._min_rtt)
+
+    def _rtt_sample(self, rtt, now):
+        """One frame's ack round trip. Once per round trip the window moves
+        one step: down while frames queue, else up towards what covers the
+        base round trip at the target fps (delay-based, like TCP Vegas, so
+        it never fills the link's buffers)."""
+        self._rtts.append((now, rtt))
+        while now - self._rtts[0][0] > self.RTT_WINDOW:
+            self._rtts.popleft()
+        self._min_rtt = min(r for _, r in self._rtts)
+        self._srtt = rtt if self._srtt is None \
+            else 0.75 * self._srtt + 0.25 * rtt
+        if now - self._window_at < max(self._srtt, 0.05):
+            return
+        self._window_at = now
+        need = min(self.MAX_UNACKED,
+                   max(self.MIN_UNACKED,
+                       math.ceil(self._min_rtt * self.fps) + 1))
+        if self._queued():
+            self._window = max(self.MIN_UNACKED, self._window - 1)
+        elif self._window < need:
+            self._window += 1
+        elif self._window > need:
+            self._window = need
+
+    def _stats(self, now):
+        """Every STATS_EVERY s while frames flow: what the phone gets."""
+        self._stats_frames += 1
+        if now - self._stats_at < self.STATS_EVERY:
+            return
+        fps = self._stats_frames / (now - self._stats_at)
+        self._stats_at, self._stats_frames = now, 0
+        width, quality = self._current()
+        rtt = "" if self._srtt is None else \
+            f", rtt {self._srtt * 1000:.0f} ms (base " \
+            f"{self._min_rtt * 1000:.0f}), window {self._window}"
+        print(f"[agent] stream: {fps:.0f} fps, {width}w q{quality}{rtt}")
 
     def _frame_gone(self):
         """A grabbed frame was dropped or failed before reaching the phone:
@@ -615,7 +740,7 @@ class ScreenStreamer:
         except Exception:
             pass  # monitor gone: keep the last rect; capture errors recover
 
-    def _grab(self, rect, force):
+    def _grab(self, rect, force, refresh=False):
         """Capture-thread stage: grab `rect`. Returns (shot, cursor pos,
         rect), or None when nothing changed since the last frame passed on
         (and no resend is forced)."""
@@ -623,12 +748,32 @@ class ScreenStreamer:
             _cv()  # warm the lazy OpenCV import here, off the event loop
             self._sct = new_mss()
         shot = self._sct.grab(rect)
-        pos = mouse.position
-        thumb = frame_thumb(shot, pos)
-        if thumb == self._last_thumb and not force:
+        pos = None if self.client_cursor else mouse.position
+        if not self._changed(shot, pos, force, refresh):
             return None
-        self._last_thumb = thumb
         return shot, pos, rect
+
+    def _changed(self, shot, pos, force, refresh):
+        """Whether a grab goes on to the phone: its thumb changed, a resend
+        is owed (force), or an owed refresh (see wake) finds the picture
+        different from the last refresh passed on. The refresh compares a
+        checksum of every pixel (~5 ms for 1080p, at most ~12/s), so a
+        still screen under a moving pointer costs one frame, not 12/s."""
+        thumb = frame_thumb(shot, pos)
+        if thumb != self._last_thumb or force:
+            self._last_thumb = thumb
+            self._refresh_crc = None
+            return True
+        if not refresh:
+            return False
+        try:
+            crc = zlib.crc32(shot.raw)
+        except (TypeError, ValueError, BufferError):
+            crc = None  # not one flat buffer: just send it
+        if crc is not None and crc == self._refresh_crc:
+            return False
+        self._refresh_crc = crc
+        return True
 
     # Ring of capture buffers: an image stays valid until this many newer
     # ones were grabbed — more than can be past the grab stage at once
@@ -639,7 +784,7 @@ class ScreenStreamer:
     # waits at most this long, so keep it at about one frame.
     DXGI_WAIT_MS = 16
 
-    def _grab_dxgi(self, rect, force, not_before):
+    def _grab_dxgi(self, rect, force, not_before, refresh=False):
         """Capture-thread stage via Desktop Duplication (dxgi_capture.py):
         a GPU copy, ~3 ms for 1080p where mss's GDI grab takes 30-40 ms
         here, so 60 fps fits. Paces itself: sleeps until `not_before`
@@ -665,7 +810,7 @@ class ScreenStreamer:
         try:
             if self._dxgi is None:
                 if self._base is None:
-                    return self._grab_base(rect, force)
+                    return self._grab_base(rect, force, refresh)
                 import dxgi_capture
                 dx = dxgi_capture.DXGICapture(rect, ring=self.DXGI_RING)
                 dx.FIRST_IMAGE_MS = 0  # never block waiting for a present
@@ -673,14 +818,14 @@ class ScreenStreamer:
                 self._dxgi = dx
                 # Duplicating now: re-grab the base so whatever changed while
                 # it opened is in; every later change comes from DXGI.
-                return self._grab_base(rect, force)
+                return self._grab_base(rect, force, refresh)
             reopens = self._dxgi.reopens
             img = self._dxgi.grab(rect, timeout_ms=self.DXGI_WAIT_MS)
             if self._dxgi.reopens != reopens:
                 # Access lost (UAC, mode change): re-open and re-base, the
                 # screen may have changed while duplication was down.
                 self._dxgi.open()
-                return self._grab_base(rect, force)
+                return self._grab_base(rect, force, refresh)
         except Exception:
             # Release it here, on the thread that made it (D3D11 contexts
             # are single-threaded); the next grab re-opens.
@@ -691,9 +836,9 @@ class ScreenStreamer:
         if img is not None:
             self._base = DuplicatedShot(img)
             self._base_rect = rect
-        return self._pass_frame(self._base, rect, force)
+        return self._pass_frame(self._base, rect, force, refresh)
 
-    def _grab_base(self, rect, force):
+    def _grab_base(self, rect, force, refresh=False):
         """One GDI grab as the base image (stream start, DXGI re-opened)."""
         if self._sct is None:
             _cv()  # warm the lazy OpenCV import here, off the event loop
@@ -704,18 +849,17 @@ class ScreenStreamer:
         self._base = DuplicatedShot(
             np.frombuffer(shot.raw, np.uint8).reshape(h, w, 4))
         self._base_rect = rect
-        return self._pass_frame(self._base, rect, force)
+        return self._pass_frame(self._base, rect, force, refresh)
 
-    def _pass_frame(self, shot, rect, force):
+    def _pass_frame(self, shot, rect, force, refresh=False):
         """(shot, cursor pos, rect) unless neither the image nor the cursor
         changed since the last frame passed on (and no resend is owed). The
         pointer isn't in captured images (we paint our own), so the thumb,
-        which includes its position, tells changed from not."""
-        pos = mouse.position
-        thumb = frame_thumb(shot, pos)
-        if thumb == self._last_thumb and not force:
+        which includes its position, tells changed from not. With a client
+        cursor the pointer is neither painted nor part of the thumb."""
+        pos = None if self.client_cursor else mouse.position
+        if not self._changed(shot, pos, force, refresh):
             return None
-        self._last_thumb = thumb
         return shot, pos, rect
 
     # Longest wait for the portal's next frame once streaming: PipeWire only
@@ -777,7 +921,7 @@ class ScreenStreamer:
         deadline = time.monotonic()  # when the current grab was due
         try:
             while True:
-                if self.acks and self._outstanding >= self.MAX_UNACKED:
+                if self.acks and self._outstanding >= self._window:
                     # The phone hasn't got the last frames yet: grab nothing
                     # until it acks, then grab the freshest screen. Time
                     # spent waiting is what a too-slow link costs, so the
@@ -788,13 +932,19 @@ class ScreenStreamer:
                         await asyncio.wait_for(self._ack_event.wait(),
                                                self.ACK_TIMEOUT)
                     except asyncio.TimeoutError:
-                        self._outstanding = sum(not f.done()
-                                                for f in inflight)
-                    self._link_sample(time.monotonic() - t)
+                        self._acks_late()
+                    # Waiting out a long but uncongested route is not a
+                    # slow link: only waits while frames queue count, or
+                    # the auto ladder would shrink the picture for nothing.
+                    waited = time.monotonic() - t
+                    self._link_sample(waited if self._queued() else 0.0)
                     continue
                 grab_at = time.monotonic()
                 self._refresh_rect(grab_at)
                 force, self._force = self._force, False
+                refresh = False
+                if self._refresh_at and grab_at >= self._refresh_at:
+                    refresh, self._refresh_at = True, 0.0
                 portal = self._portal is not None
                 dxgi = not portal and self._use_dxgi(grab_at)
                 try:
@@ -805,11 +955,12 @@ class ScreenStreamer:
                     elif dxgi:
                         grabbed = await loop.run_in_executor(
                             self._grab_pool, self._grab_dxgi, self.rect,
-                            force, deadline)
+                            force, deadline, refresh)
                         self._dxgi_errors = 0
                     else:
                         grabbed = await loop.run_in_executor(
-                            self._grab_pool, self._grab, self.rect, force)
+                            self._grab_pool, self._grab, self.rect, force,
+                            refresh)
                     errors = 0
                 except Exception as e:
                     # Transient capture hiccup (display sleep, UAC secure
@@ -817,6 +968,8 @@ class ScreenStreamer:
                     # the frame and keep streaming. NEVER return here — a
                     # dead stream is a frozen phone screen.
                     self._force = self._force or force
+                    if refresh and not self._refresh_at:
+                        self._refresh_at = time.monotonic()  # still owed
                     if dxgi:
                         self._dxgi_failed(e, time.monotonic())
                     errors += 1
@@ -868,6 +1021,9 @@ class ScreenStreamer:
                 # the oversleeps average out. Never bank more than one
                 # interval of lag, so a stall can't cause a burst.
                 deadline = max(deadline + interval, now - interval)
+                if self._refresh_at:
+                    # Don't idle past an owed refresh (see wake).
+                    deadline = min(deadline, max(now, self._refresh_at))
                 if deadline > now:
                     try:
                         await asyncio.wait_for(self._wake.wait(),
@@ -892,6 +1048,7 @@ class ScreenStreamer:
         then send it once `prev` — the frame before it — is out."""
         shot, pos, rect = grabbed
         width, quality = self._current()
+        t = None
         try:
             jpeg, w, h = await asyncio.get_running_loop().run_in_executor(
                 self._enc_pool, encode_frame, shot, rect, pos, width,
@@ -907,6 +1064,10 @@ class ScreenStreamer:
                 self._link_sample(None)
                 return
             t = time.monotonic()
+            if self.acks:
+                # Before the send: its ack may be handled before this
+                # coroutine resumes from the send.
+                self._sent_at.append(t)
             if self.binary:
                 header = json.dumps({
                     "w": w, "h": h, "src": "screen",
@@ -924,13 +1085,25 @@ class ScreenStreamer:
                     "data": {"jpeg": base64.b64encode(jpeg).decode(),
                              "w": w, "h": h},
                 })
-            self._link_sample(time.monotonic() - t)
+            now = time.monotonic()
+            self._link_sample(now - t)
+            self._stats(now)
             self._errors = 0
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            gone = True
+            if t is not None and t in self._sent_at:
+                # Never sent: no ack will come for it.
+                index = self._sent_at.index(t)
+                del self._sent_at[index]
+                if index < self._written_off:
+                    # Written off already (and out of _outstanding).
+                    self._written_off -= 1
+                    gone = False
             self._force = True
-            self._frame_gone()
+            if gone:
+                self._frame_gone()
             self._errors += 1
             if self._errors == 25:
                 print(f"[agent] screen encode/send failing repeatedly: {e}")
@@ -2325,6 +2498,12 @@ class Agent:
         # for networks whose provider blocks incoming connections.
         self.tunnel = None
         self._bridge = None
+        # Client-drawn cursor (ScreenStreamer.client_cursor): the last
+        # pointer input `seq` handled per phone, echoed in `cursor` events
+        # so the phone can drop the moves the PC has already applied, and
+        # the per-phone sender state of those events (push_cursor).
+        self._input_seq = {}
+        self._cursor_push = {}
 
     def _status(self, text):
         cb = self.on_status
@@ -2486,6 +2665,61 @@ class Agent:
         Path(path).mkdir(parents=True, exist_ok=True)
         return {"path": path}
 
+    def _cursor_data(self, client_id):
+        """The `cursor` event for a phone drawing the pointer itself: the
+        position as a fraction of its streamed monitor (outside 0..1 when
+        the pointer is on another monitor) and the last input seq applied.
+        None when that phone's stream doesn't use a client cursor."""
+        streamer = self.streamers.get(client_id)
+        if streamer is None or not streamer.client_cursor:
+            return None
+        try:
+            pos = mouse.position
+        except Exception:
+            pos = None
+        if pos is None:
+            # Windows: GetCursorPos fails while another desktop has the
+            # input (lock screen, UAC, Ctrl+Alt+Del). cursor_watcher pushes
+            # the position once it can be read again.
+            return None
+        x, y = pos
+        rect = streamer.rect
+        return {"x": (x - rect["left"]) / rect["width"],
+                "y": (y - rect["top"]) / rect["height"],
+                "seq": self._input_seq.get(client_id, 0)}
+
+    def push_cursor(self, client_id):
+        """Send that phone a `cursor` event, never waiting for it: input is
+        handled inline in the socket's receive loop, which a send behind a
+        backed-up stream must not hold. At most one send per phone is out;
+        positions that change meanwhile are folded into one more send of
+        the newest."""
+        state = self._cursor_push.get(client_id)
+        if state is not None:
+            state["dirty"] = True
+            return
+        streamer = self.streamers.get(client_id)
+        if streamer is None or not streamer.client_cursor:
+            return
+        state = self._cursor_push[client_id] = {"dirty": True}
+
+        async def run():
+            try:
+                while state["dirty"]:
+                    state["dirty"] = False
+                    data = self._cursor_data(client_id)
+                    if data is None:
+                        break
+                    await self.send_to(client_id,
+                                       {"event": "cursor", "data": data})
+            except Exception:
+                pass  # socket gone: drop_client cleans up
+            finally:
+                if self._cursor_push.get(client_id) is state:
+                    del self._cursor_push[client_id]
+
+        asyncio.ensure_future(run())
+
     async def h_input(self, msg):
         action = msg.get("action")
         # Pointer coordinates are relative to the monitor this client is
@@ -2513,9 +2747,15 @@ class Agent:
             do_text(msg.get("text", ""))
         else:
             raise ValueError(f"unknown input action: {action}")
+        client = msg.get("from")
+        if action in ("move", "move_rel", "click", "down", "up"):
+            seq = msg.get("seq")
+            if isinstance(seq, int):
+                self._input_seq[client] = seq
+            self.push_cursor(client)
         # Any input changes the screen: wake the streamer NOW so the frame
         # capturing this change isn't delayed by the idle tick.
-        s = self.streamers.get(msg.get("from"))
+        s = self.streamers.get(client)
         if s:
             s.wake()
         return {}
@@ -2657,8 +2897,11 @@ class Agent:
         if codec != "h264":
             settings = screen_settings(msg, rect["width"])
         old = self.streamers.pop(client, None)
+        stale = 0
         if old:
             await old.stop()
+            # Its frames already on the way are acked after this request.
+            stale = old.unacked_sent() if old.acks else 0
         old_v = self.video_streamers.pop(client, None)
         if old_v:
             await old_v.stop()
@@ -2677,9 +2920,16 @@ class Agent:
                     "bitrate": streamer.bitrate, "w": streamer.width,
                     "h": streamer.height, "max_width": streamer.width,
                     "monitor": rect}
-        streamer = ScreenStreamer(self, client, settings, rect, spec,
-                                  binary=bool(msg.get("binary", False)),
-                                  acks=bool(msg.get("ack", False)))
+        streamer = ScreenStreamer(
+            self, client, settings, rect, spec,
+            binary=bool(msg.get("binary", False)),
+            acks=bool(msg.get("ack", False)),
+            client_cursor=msg.get("cursor") == "client")
+        if streamer.acks and stale:
+            # Same socket, and acks carry no stream id: absorb the old
+            # stream's (bounded in time, in case they never come).
+            streamer._stale_acks = stale
+            streamer._stale_until = time.monotonic() + 3.0
         streamer.start()
         self.streamers[client] = streamer
         w, h = streamer.frame_size()
@@ -2689,7 +2939,12 @@ class Agent:
                 "max_width": streamer.max_width,
                 "subsampling": streamer.subsampling,
                 "adaptive": streamer.adaptive, "w": w, "h": h,
-                "ack": streamer.acks, "monitor": rect}
+                "ack": streamer.acks, "monitor": rect,
+                "cursor": "client" if streamer.client_cursor else "frame",
+                # The phone's first pointer position, in the reply so it
+                # can't arrive before the phone knows to draw it; `cursor`
+                # events follow every change.
+                "pointer": self._cursor_data(client)}
 
     async def h_remote_info(self, msg):
         """How a paired phone reaches this PC from outside the home network:
@@ -3375,8 +3630,11 @@ class Agent:
                 continue
             if pos != last:
                 last = pos
-                for s in list(self.streamers.values()):
+                for client, s in list(self.streamers.items()):
                     s.wake()
+                    # The PC's own mouse (or another phone) moved it.
+                    if s.client_cursor:
+                        self.push_cursor(client)
             # Keep the PC user's mouse off the phone screen they can't see
             # (a no-op unless it is plugged in).
             if self.phone is not None and self.phone.enabled:
@@ -3427,6 +3685,7 @@ class Agent:
                 await self.send({"event": "clipboard.changed", "data": {"text": text}})
 
     async def drop_client(self, client_id):
+        self._input_seq.pop(client_id, None)
         lane = self._lanes.pop(client_id, None)
         if lane:
             lane[1].cancel()

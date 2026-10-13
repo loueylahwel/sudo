@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -23,14 +24,20 @@ enum _TwoFingerMode { pinch, scroll }
 /// fps lower simply send fewer frames.
 ///
 /// `ack`: this app acks every frame it receives (`screen.ack`), and the
-/// agent keeps at most two frames unacked — so frames can never queue up on
-/// a slow or bursty Wi-Fi link (the picture lagging behind the cursor).
+/// agent keeps only as many frames unacked as the link's round trip needs
+/// — so frames can never queue up on a slow or bursty link (the picture
+/// lagging behind the cursor).
+///
+/// `cursor: 'client'`: this app draws the PC pointer itself (see
+/// [_ScreenPageState._localCursor]); agents that can't answer
+/// `cursor: 'frame'` and paint it into the frames as before.
 const Map<String, dynamic> _streamParams = {
   'codec': 'jpeg',
   'preset': 'auto',
   'fps': 60,
   'binary': true,
   'ack': true,
+  'cursor': 'client',
 };
 
 /// What this app sent before presets existed, for agents that ignore
@@ -106,6 +113,18 @@ class _ScreenPageState extends State<ScreenPage>
   double _pendingDy = 0;
   Timer? _moveFlushTimer;
   static const double _sensitivity = 1.5;
+
+  // Client-drawn pointer (screen.start answered `cursor: 'client'`): drawn
+  // here at the PC's last reported position plus the moves the PC hasn't
+  // applied yet, so it follows the finger at once however slow the link
+  // (over the internet a frame takes 100-300 ms to come back). Every
+  // move_rel carries a `seq`; `cursor` events report the position with
+  // the last seq applied, and the moves up to it are dropped.
+  bool _localCursor = false;
+  int _moveSeq = 0;
+  Offset? _cursorBase; // PC-reported position, fraction of the monitor
+  final List<(int, double, double)> _unappliedMoves = [];
+  final ValueNotifier<Offset?> _cursorPos = ValueNotifier(null);
 
   // Gesture state machine, driven by raw Listener pointer events (no gesture
   // arena, so a slow micro-drag can never be hijacked by the long-press
@@ -213,6 +232,7 @@ class _ScreenPageState extends State<ScreenPage>
       _cachedH = _frameH;
     }
     _pulseCtrl.dispose();
+    _cursorPos.dispose();
     unawaited(_speech.stop());
     _client.send('screen.stop');
     super.dispose();
@@ -261,7 +281,15 @@ class _ScreenPageState extends State<ScreenPage>
       setState(() {
         _binaryMode = resp['binary'] == true;
         _acks = resp['ack'] == true;
+        _localCursor = resp['cursor'] == 'client';
       });
+      // A new stream: moves sent before it were applied or lost with the
+      // old connection; the reply's pointer is the fresh starting point.
+      _unappliedMoves.clear();
+      _cursorBase = null;
+      final pointer = resp['pointer'];
+      if (pointer is Map) _onCursor(pointer.cast<String, dynamic>());
+      _updateLocalCursor();
     } catch (e) {
       if (mounted) showError(context, e);
     } finally {
@@ -313,6 +341,10 @@ class _ScreenPageState extends State<ScreenPage>
 
   void _onEvent(RelayEvent event) {
     if (!mounted) return;
+    if (event.name == 'cursor') {
+      _onCursor(event.data);
+      return;
+    }
     if (event.name == 'agent.online') {
       // Agent (re)connected: hide the overlay and restart the stream.
       // Idempotent — the agent replaces any old streamer server-side.
@@ -335,6 +367,45 @@ class _ScreenPageState extends State<ScreenPage>
     }
   }
 
+  /// The PC reported its pointer (`cursor` event or the screen.start
+  /// reply): the new base, minus the moves it has already applied.
+  void _onCursor(Map<String, dynamic> data) {
+    final x = (data['x'] as num?)?.toDouble();
+    final y = (data['y'] as num?)?.toDouble();
+    if (x == null || y == null) return;
+    final seq = (data['seq'] as num?)?.toInt() ?? 0;
+    _cursorBase = Offset(x, y);
+    _unappliedMoves.removeWhere((m) => m.$1 <= seq);
+    _updateLocalCursor();
+  }
+
+  /// Where to draw the pointer: the PC's position with every move it
+  /// hasn't applied yet (sent or still queued) on top. Steps clamp to the
+  /// screen edge like the PC's pointer does; off this monitor it's hidden.
+  void _updateLocalCursor() {
+    final base = _cursorBase;
+    if (!_localCursor || base == null) {
+      _cursorPos.value = null;
+      return;
+    }
+    // A pointer on another monitor isn't held at this one's edges.
+    final inside =
+        base.dx >= 0 && base.dx <= 1 && base.dy >= 0 && base.dy <= 1;
+    double step(double v, double d) =>
+        inside ? (v + d).clamp(0.0, 1.0).toDouble() : v + d;
+    var x = base.dx;
+    var y = base.dy;
+    for (final m in _unappliedMoves) {
+      x = step(x, m.$2);
+      y = step(y, m.$3);
+    }
+    x = step(x, _pendingDx);
+    y = step(y, _pendingDy);
+    _cursorPos.value = x >= 0 && x <= 1 && y >= 0 && y <= 1
+        ? Offset(x, y)
+        : null;
+  }
+
   /// Accumulates a touchpad pixel delta and schedules a single `move_rel`
   /// send on the next frame, so rapid drag events coalesce into at most one
   /// message per frame.
@@ -342,6 +413,8 @@ class _ScreenPageState extends State<ScreenPage>
     if (_imageRect.isEmpty || pixelDelta == Offset.zero) return;
     _pendingDx += pixelDelta.dx / _imageRect.width * _sensitivity;
     _pendingDy += pixelDelta.dy / _imageRect.height * _sensitivity;
+    // The drawn pointer moves now; the PC catches up when the send lands.
+    if (_localCursor) _updateLocalCursor();
     // A Timer, NOT addPostFrameCallback: post-frame callbacks only run when
     // the UI renders a new frame — and on an idle PC screen no new video
     // frames arrive, nothing renders, and the deltas would sit here unsent
@@ -357,7 +430,14 @@ class _ScreenPageState extends State<ScreenPage>
     _pendingDx = 0;
     _pendingDy = 0;
     if (dx == 0 && dy == 0) return;
-    _client.send('input', {'action': 'move_rel', 'dx': dx, 'dy': dy});
+    final seq = ++_moveSeq;
+    _client.send('input', {
+      'action': 'move_rel',
+      'dx': dx,
+      'dy': dy,
+      'seq': seq,
+    });
+    if (_localCursor) _unappliedMoves.add((seq, dx, dy));
   }
 
   /// Click at the PC cursor's current position (no x/y coordinates).
@@ -854,7 +934,22 @@ class _ScreenPageState extends State<ScreenPage>
                     top: _zoomScale > 1.0 ? _zoomOrigin.dy : _imageRect.top,
                     width: _imageRect.width * _zoomScale,
                     height: _imageRect.height * _zoomScale,
-                    child: FrameImage(_decoder),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        FrameImage(_decoder),
+                        // Repaints on its own when the pointer moves:
+                        // never a rebuild of the page or the picture.
+                        if (_localCursor)
+                          IgnorePointer(
+                            child: RepaintBoundary(
+                              child: CustomPaint(
+                                painter: _PointerPainter(_cursorPos),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                   Positioned.fill(
                     child: Listener(
@@ -1023,4 +1118,43 @@ class _ScreenPageState extends State<ScreenPage>
       ),
     );
   }
+}
+
+/// The PC pointer drawn by the phone (client-drawn cursor): the same arrow
+/// the agent paints into frames otherwise, tip at [position] (a fraction of
+/// the picture), scaled with the picture.
+class _PointerPainter extends CustomPainter {
+  _PointerPainter(this.position) : super(repaint: position);
+
+  final ValueNotifier<Offset?> position;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final p = position.value;
+    if (p == null || size.isEmpty) return;
+    final x = p.dx * size.width;
+    final y = p.dy * size.height;
+    final s = math.max(11.0, size.width / 90);
+    final path = Path()
+      ..moveTo(x, y)
+      ..lineTo(x, y + s * 1.4)
+      ..lineTo(x + s * 0.38, y + s * 1.05)
+      ..lineTo(x + s * 0.58, y + s * 1.5)
+      ..lineTo(x + s * 0.78, y + s * 1.42)
+      ..lineTo(x + s * 0.58, y + s * 0.98)
+      ..lineTo(x + s * 0.95, y + s * 0.95)
+      ..close();
+    canvas.drawPath(path, Paint()..color = Colors.white);
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = Colors.black
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_PointerPainter oldDelegate) =>
+      oldDelegate.position != position;
 }

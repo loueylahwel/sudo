@@ -2037,6 +2037,9 @@ class EmbeddedRelay:
         from remote_access import FailureLimiter
         self.limiter = FailureLimiter()
         self._unauth = {}  # peer ip -> remote sockets not yet authenticated
+        # Local port of a tunnel bridge connection -> the phone's real
+        # address (tunnel.serve_bridge), so limits apply per phone.
+        self.peer_alias = {}
 
     def _serve(self, handler, port, max_size=8 * 1024 * 1024, **extra):
         return websockets.serve(
@@ -2062,6 +2065,7 @@ class EmbeddedRelay:
                                    ssl=self.remote_ssl,
                                    max_size=1024 * 1024):
                 print(f"[agent] remote access (TLS) on :{self.remote_port}")
+                await self.agent.start_tunnel(self)
                 await asyncio.Future()  # serve forever
 
     async def _handle_remote(self, ws):
@@ -2116,6 +2120,9 @@ class EmbeddedRelay:
         client_id = uuid.uuid4().hex
         paired = False
         peer = ws.remote_address[0] if ws.remote_address else ""
+        if remote and peer in ("127.0.0.1", "::1"):
+            # Through the tunnel bridge: use the phone's own address.
+            peer = self.peer_alias.get(ws.remote_address[1], peer)
         if remote:
             try:
                 token = await self._remote_auth(ws, peer)
@@ -2314,6 +2321,10 @@ class Agent:
         # Remote access from outside the LAN (remote_access.RemoteAccess),
         # set up in run() for the embedded relay.
         self.remote = None
+        # The Cloudflare quick tunnel (tunnel.QuickTunnel) and its bridge,
+        # for networks whose provider blocks incoming connections.
+        self.tunnel = None
+        self._bridge = None
 
     def _status(self, text):
         cb = self.on_status
@@ -2683,20 +2694,56 @@ class Agent:
     async def h_remote_info(self, msg):
         """How a paired phone reaches this PC from outside the home network:
         the router's public address, the forwarded TLS port and the
-        certificate fingerprint to pin. The phone stores it while on the
-        LAN (and refreshes it on every connection)."""
+        certificate fingerprint to pin, plus the tunnel address (`tunnel`)
+        and the secret topic that always holds its latest value
+        (`rendezvous`). The phone stores it while on the LAN (and refreshes
+        it on every connection)."""
+        return self._remote_info()
+
+    def _remote_info(self):
         if self.remote is None:
             return {"available": False, "error": "no secure port"}
-        return self.remote.info()
+        info = self.remote.info()
+        if self.tunnel is not None:
+            t = self.tunnel.info()
+            info.update(tunnel=t["url"], tunnelError=t["error"],
+                        rendezvous=t["rendezvous"])
+        return info
 
-    def _remote_changed(self, info):
-        """RemoteAccess thread: the public address or mapping changed —
-        tell connected phones so they keep the new address."""
+    def _remote_changed(self, _info=None):
+        """RemoteAccess/QuickTunnel thread: the public address, mapping or
+        tunnel changed — tell connected phones so they keep the new one."""
         loop = self.loop
         if loop is None:
             return
+        info = self._remote_info()
         loop.call_soon_threadsafe(lambda: asyncio.ensure_future(
             self.send({"event": "remote.changed", "data": info})))
+
+    async def start_tunnel(self, relay):
+        """The Cloudflare quick tunnel into the TLS port (tunnel.py), unless
+        remote access or the tunnel is switched off in config. Its topic is
+        made once and kept: paired phones hold it."""
+        if self.remote is None or not self.cfg.get("remote_access", True) \
+                or not self.cfg.get("tunnel", True):
+            return
+        import tunnel
+        topic = self.cfg.get("tunnel_topic")
+        if not topic:
+            topic = self.cfg["tunnel_topic"] = tunnel.new_topic()
+            save_config(self.cfg)
+        server = str(self.cfg.get("ntfy_server") or tunnel.NTFY_SERVER)
+        try:
+            self._bridge, port = await tunnel.serve_bridge(
+                self.remote.port, relay.peer_alias)
+        except OSError as e:
+            print(f"[agent] tunnel disabled: {e}")
+            return
+        self.tunnel = tunnel.QuickTunnel(
+            port, _default_config_path().parent,
+            f"{server.rstrip('/')}/{topic}")
+        self.tunnel.on_change = self._remote_changed
+        self.tunnel.start()
 
     def _setup_remote(self):
         """The TLS listener (cert, context) and, unless remote access is
@@ -3443,6 +3490,8 @@ class Agent:
             try:
                 await self.embedded.serve()
             finally:
+                if self.tunnel is not None:
+                    self.tunnel.stop()
                 if self.remote is not None:
                     self.remote.stop()
             return

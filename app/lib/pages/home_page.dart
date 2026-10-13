@@ -9,12 +9,17 @@ import '../device_store.dart';
 import '../discovery.dart';
 import '../pc_widget.dart';
 import '../relay_client.dart';
+import '../tunnel.dart';
 import '../util.dart';
 import 'camera_page.dart';
 import 'files_page.dart';
 import 'phone_monitor_page.dart';
 import 'screen_page.dart';
 import 'window_switcher.dart';
+
+/// How a connect attempt reaches the PC: its LAN address, the router's
+/// forward of its TLS port (direct), or its Cloudflare tunnel.
+enum _Route { lan, direct, tunnel }
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -369,13 +374,30 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // Set when the winning connection is the internet route (remote).
     var viaRemote = false;
 
-    /// One connect+pair try. [remote]: through the PC's internet address
-    /// (TLS, certificate pinned) instead of its LAN address.
+    /// One connect+pair try over [route]. The internet routes always use
+    /// TLS with the PC's certificate pinned; [tunnelUrl] overrides the
+    /// saved tunnel address.
     Future<PairResult?> attempt(
       RelayClient c,
       SavedDevice d, {
-      bool remote = false,
+      _Route route = _Route.lan,
+      String? tunnelUrl,
     }) async {
+      final remote = route != _Route.lan;
+      final tunnel = route == _Route.tunnel;
+      final String url;
+      try {
+        url = switch (route) {
+          _Route.lan => _lanUrl(d),
+          _Route.direct => d.remoteUrl,
+          _Route.tunnel =>
+            await TunnelProxy.instance.localUrl(tunnelUrl ?? d.tunnelUrl),
+        };
+      } catch (e) {
+        _dbg('tunnel proxy failed: $e');
+        failure = e;
+        return null;
+      }
       // Hard OUTER timeout: on a blackholed address (phone switched
       // networks) inner socket timeouts have proven unreliable — a
       // connect attempt hung forever and froze the whole retry loop.
@@ -390,17 +412,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         });
       }
 
-      armOuter(const Duration(seconds: 6));
+      // The tunnel adds a hop through Cloudflare: allow it more time.
+      armOuter(Duration(seconds: tunnel ? 10 : 6));
       try {
         return await Future.any<PairResult?>([
           connectAndPair(
             c,
-            relayUrl: remote ? d.remoteUrl : _lanUrl(d),
+            relayUrl: url,
             pinSha256: d.hasPin ? d.certSha256 : null,
             code: remote ? null : d.code,
             token: d.token,
             name: await DeviceStore.phoneName(),
-            timeout: const Duration(seconds: 4),
+            timeout: Duration(seconds: tunnel ? 8 : 4),
             onApprovalPending: () {
               armOuter(const Duration(seconds: 60));
               noteApprovalPending();
@@ -411,7 +434,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
         ]);
       } catch (e) {
-        _dbg('connect to ${remote ? d.remoteUrl : _lanUrl(d)} failed: $e');
+        _dbg('connect via ${route.name} ($url) failed: $e');
         failure = e;
         unawaited(
           c.disconnect().timeout(const Duration(seconds: 2), onTimeout: () {}),
@@ -422,7 +445,60 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
     }
 
-    if (auto) {
+    /// Away from home: the router forward and the tunnel, raced; the first
+    /// to pair wins. A tunnel address that stopped answering (the PC
+    /// restarted) is swapped once for the one the PC last posted to its
+    /// topic; the PC's remote.info then saves it.
+    Future<(RelayClient, PairResult)?> internet(SavedDevice d) {
+      final legs = <Future<(RelayClient, PairResult)?>>[
+        if (d.hasRemote)
+          () async {
+            final c = RelayClient();
+            final r = await attempt(c, d, route: _Route.direct);
+            return r == null ? null : (c, r);
+          }(),
+        if (d.hasTunnel)
+          () async {
+            final c = RelayClient();
+            if (d.tunnelUrl.isNotEmpty) {
+              final r = await attempt(c, d, route: _Route.tunnel);
+              if (r != null) return (c, r);
+              if (isDenial(failure)) return null;
+            }
+            if (d.rendezvous.isEmpty) return null;
+            final fresh = await latestTunnelUrl(d.rendezvous);
+            if (fresh == null || fresh == d.tunnelUrl) return null;
+            _dbg('tunnel moved to $fresh');
+            final r =
+                await attempt(c, d, route: _Route.tunnel, tunnelUrl: fresh);
+            return r == null ? null : (c, r);
+          }(),
+      ];
+      if (legs.isEmpty) return Future.value(null);
+      final done = Completer<(RelayClient, PairResult)?>();
+      var left = legs.length;
+      for (final leg in legs) {
+        unawaited(leg.then((res) {
+          if (res == null) {
+            if (--left == 0 && !done.isCompleted) done.complete(null);
+          } else if (done.isCompleted) {
+            // The other route won: don't leave this session open.
+            unawaited(res.$1.disconnect().timeout(
+                  const Duration(seconds: 2),
+                  onTimeout: () {},
+                ));
+          } else {
+            done.complete(res);
+          }
+        }));
+      }
+      return done.future;
+    }
+
+    // Reconnects, and every connect to a PC with an internet route (paired
+    // before, so no approval prompt): race all routes instead of trying
+    // the LAN first, so away from home the internet answers in seconds.
+    if (auto || current.hasInternet) {
       // Recovery after a network switch: race the saved address against a
       // fresh discovery — first success wins; if both fail we're out in
       // ~6s instead of hanging or grinding sequential timeouts.
@@ -430,8 +506,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       var failures = 0;
       final c1 = RelayClient();
       final c2 = RelayClient();
-      final c3 = RelayClient();
-      final routes = current.hasRemote ? 3 : 2;
+      final routes = current.hasInternet ? 3 : 2;
       void win(RelayClient c, PairResult r, {bool remote = false}) {
         if (race.isCompleted) {
           // Another route won meanwhile: don't leave this session open.
@@ -453,9 +528,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         if (++failures == routes && !race.isCompleted) race.complete();
       }
 
-      if (current.hasRemote) {
+      if (current.hasInternet) {
         // Away from home the LAN tries fail fast or hang; the internet
-        // route starts a moment later so that at home the LAN still wins.
+        // routes start a moment later so that at home the LAN still wins.
         final remoteDevice = current;
         unawaited(() async {
           await Future<void>.delayed(const Duration(milliseconds: 1500));
@@ -463,9 +538,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             lose();
             return;
           }
-          final r = await attempt(c3, remoteDevice, remote: true);
+          final r = await internet(remoteDevice);
           if (r != null) {
-            win(c3, r, remote: true);
+            win(r.$1, r.$2, remote: true);
           } else {
             lose();
           }
@@ -498,13 +573,19 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       // Wait for a winner (or both attempts failing). While the PC shows
       // an approval dialog the user needs time to react, so the bound
       // stretches from 12s to ~65s (dialog auto-denies after 30s).
+      // The internet leg may need a second tunnel try after reading the
+      // PC's topic, hence its longer bound.
       final waitStart = DateTime.now();
       while (!race.isCompleted) {
-        final budget = Duration(seconds: approvalSeen ? 65 : 12);
+        final budget = Duration(
+            seconds: approvalSeen ? 65 : (current.hasInternet ? 30 : 12));
         if (DateTime.now().difference(waitStart) >= budget) break;
         await Future<void>.delayed(const Duration(milliseconds: 200));
       }
-      for (final c in [c1, c2, c3]) {
+      // Closed for good: a route that pairs after this is disconnected
+      // by win() instead of replacing the outcome.
+      if (!race.isCompleted) race.complete();
+      for (final c in [c1, c2]) {
         if (!identical(c, winner)) {
           unawaited(
             c.disconnect().timeout(
@@ -528,11 +609,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           current = rediscovered;
           result = await attempt(client, current);
         }
-      }
-      if (result == null && !isDenial(failure) && current.hasRemote) {
-        // Not on the home network: go through the PC's internet address.
-        result = await attempt(client, current, remote: true);
-        viaRemote = result != null;
       }
       if (result != null) {
         winner = client;
@@ -672,15 +748,25 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     final url = info['available'] == true && host.isNotEmpty
         ? 'wss://$host:$port'
         : device.remoteUrl;
+    // The tunnel while it is up (a down one keeps the last address: the
+    // topic leads to the next), and the topic it is always posted to.
+    final tunnel = '${info['tunnel'] ?? ''}';
+    final tunnelUrl = tunnel.startsWith('https://') ? tunnel : device.tunnelUrl;
+    final topic = '${info['rendezvous'] ?? ''}';
+    final rendezvous = topic.startsWith('https://') ? topic : device.rendezvous;
     if (url == device.remoteUrl &&
         fingerprint == device.certSha256 &&
-        port == device.tlsPort) {
+        port == device.tlsPort &&
+        tunnelUrl == device.tunnelUrl &&
+        rendezvous == device.rendezvous) {
       return;
     }
     final updated = device.copyWith(
       remoteUrl: url,
       certSha256: fingerprint,
       tlsPort: port,
+      tunnelUrl: tunnelUrl,
+      rendezvous: rendezvous,
     );
     // save() dedupes by code+relayUrl: same key, replaced in place.
     unawaited(_store.save(updated));

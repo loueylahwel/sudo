@@ -538,6 +538,12 @@ class ScreenStreamer:
         self._rtts = deque()         # (time, seconds) ack round trips
         self._min_rtt = None         # base round trip, last RTT_WINDOW s
         self._srtt = None            # smoothed round trip
+        # Probing the base round trip (see _rtt_sample): when the next
+        # probe is due, and the window to go back to after one.
+        self._probe_at = time.monotonic() + self.PROBE_EVERY
+        self._probe_until = 0.0
+        self._probe_window = None
+        self._last_sent = 0.0        # when the last frame went out
         self._stats_at = time.monotonic()
         self._stats_frames = 0
         self._last_thumb = None      # capture thread only
@@ -593,7 +599,9 @@ class ScreenStreamer:
     MAX_UNACKED = 8
     ACK_TIMEOUT = 1.0
     RTT_WINDOW = 10.0   # the base round trip is the minimum over this long
-    STATS_EVERY = 15.0  # log line while frames flow (journalctl diagnostics)
+    # Log line while frames flow (journalctl diagnostics); the
+    # SUDO_STATS_EVERY environment variable overrides it for test runs.
+    STATS_EVERY = float(os.environ.get("SUDO_STATS_EVERY") or 15.0)
 
     def ack(self):
         """The phone received a frame (screen.ack). Acks come in frame
@@ -639,26 +647,73 @@ class ScreenStreamer:
             return False
         return self._srtt - self._min_rtt > max(0.02, 0.3 * self._min_rtt)
 
+    # Frames allowed to sit in a queue somewhere on the route (TCP Vegas):
+    # the window grows while fewer are queued, and is cut by the excess
+    # when more are.
+    QUEUE_LOW = 1.0
+    QUEUE_HIGH = 2.0
+    # A link that is busy all the time never shows its true round trip:
+    # every sample includes the standing queue, the base looks longer than
+    # it is, and the window would keep that queue. So every PROBE_EVERY s
+    # the window drops to MIN_UNACKED for about a round trip (like BBR's
+    # ProbeRTT), the queue drains, and the samples show the real base.
+    PROBE_EVERY = 4.0
+    # After this long without a frame, the next burst starts from
+    # MIN_UNACKED again (like TCP's restart after idle): the link may have
+    # slowed meanwhile, and a full window sent into it would queue.
+    IDLE_RESTART = 1.0
+
+    def probing(self, now=None):
+        return (now or time.monotonic()) < self._probe_until
+
     def _rtt_sample(self, rtt, now):
-        """One frame's ack round trip. Once per round trip the window moves
-        one step: down while frames queue, else up towards what covers the
-        base round trip at the target fps (delay-based, like TCP Vegas, so
-        it never fills the link's buffers)."""
+        """One frame's ack round trip. The frames queued on the route are
+        estimated as window x (rtt - base) / rtt. Above QUEUE_HIGH the
+        window is cut by the excess at once (at most once per base round
+        trip, judged on the latest sample), so a link that slows down, as
+        mobile data does, is answered within a round trip. Below QUEUE_LOW
+        it grows one step per round trip towards what covers the base
+        round trip at the target fps."""
         self._rtts.append((now, rtt))
         while now - self._rtts[0][0] > self.RTT_WINDOW:
             self._rtts.popleft()
         self._min_rtt = min(r for _, r in self._rtts)
         self._srtt = rtt if self._srtt is None \
             else 0.75 * self._srtt + 0.25 * rtt
-        if now - self._window_at < max(self._srtt, 0.05):
+        if self._probe_window is not None:
+            if now < self._probe_until:
+                return
+            # Probe over: back to the window from before, judged afresh
+            # against the base the probe found.
+            self._window = self._probe_window
+            self._probe_window = None
+            self._srtt = rtt
+            self._window_at = now
+            return
+        if now >= self._probe_at:
+            self._probe_at = now + self.PROBE_EVERY
+            if self._window > self.MIN_UNACKED:
+                self._probe_window = self._window
+                self._probe_until = now + max(self._srtt, 0.1)
+                self._window = self.MIN_UNACKED
+                return
+        recent = max(rtt, self._srtt)
+        queued = self._window * (recent - self._min_rtt) / recent \
+            if recent > 0 else 0.0
+        since = now - self._window_at
+        if queued > self.QUEUE_HIGH:
+            if since >= max(self._min_rtt, 0.05):
+                self._window_at = now
+                cut = math.ceil(queued - self.QUEUE_HIGH)
+                self._window = max(self.MIN_UNACKED, self._window - cut)
+            return
+        if since < max(self._srtt, 0.05):
             return
         self._window_at = now
         need = min(self.MAX_UNACKED,
                    max(self.MIN_UNACKED,
                        math.ceil(self._min_rtt * self.fps) + 1))
-        if self._queued():
-            self._window = max(self.MIN_UNACKED, self._window - 1)
-        elif self._window < need:
+        if queued < self.QUEUE_LOW and self._window < need:
             self._window += 1
         elif self._window > need:
             self._window = need
@@ -937,7 +992,8 @@ class ScreenStreamer:
                     # slow link: only waits while frames queue count, or
                     # the auto ladder would shrink the picture for nothing.
                     waited = time.monotonic() - t
-                    self._link_sample(waited if self._queued() else 0.0)
+                    self._link_sample(waited if self._queued()
+                                      and not self.probing() else 0.0)
                     continue
                 grab_at = time.monotonic()
                 self._refresh_rect(grab_at)
@@ -1065,6 +1121,10 @@ class ScreenStreamer:
                 return
             t = time.monotonic()
             if self.acks:
+                if t - self._last_sent > self.IDLE_RESTART \
+                        and self._probe_window is None:
+                    self._window = self.MIN_UNACKED
+                self._last_sent = t
                 # Before the send: its ack may be handled before this
                 # coroutine resumes from the send.
                 self._sent_at.append(t)

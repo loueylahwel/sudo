@@ -858,7 +858,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _cancelReconnect();
     // Leaving the PC hands its sound back to it, over the live client
     // (before the teardown below closes it).
-    unawaited(PcAudio.instance.setEnabled(false));
+    unawaited(PcAudio.instance.setEnabled(false, reason: 'left the dashboard'));
     _tearDownClient();
     setState(() {
       _selected = null;

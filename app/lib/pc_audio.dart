@@ -63,6 +63,12 @@ class PcAudio extends ChangeNotifier {
   // would stay muted until TCP gave up, minutes later.
   Timer? _alive;
 
+  // Packets that came off the socket while on, and those handed to the
+  // native player: with its own counters (`stats`) they ride along with the
+  // heartbeat, and the PC's log shows where the sound gets stuck.
+  int _rx = 0;
+  int _fwd = 0;
+
   // Bumped by every start and stop: an `audio.start` reply that arrives
   // after the user flipped the switch again (or after a newer start on a
   // newer client) must not touch the state any more.
@@ -101,22 +107,39 @@ class PcAudio extends ChangeNotifier {
 
   /// Flips the switch. On: start the phone's player, then ask the PC for
   /// its sound. Off: hand the sound back to the PC and stop the player.
-  Future<void> setEnabled(bool on) async {
+  Future<void> setEnabled(bool on, {String reason = 'switched off'}) async {
     if (on == _enabled) return;
     _error = null;
     if (on) {
       _enabled = true;
       _elsewhere = false;
-      _alive ??= Timer.periodic(const Duration(seconds: 5), (_) {
-        final client = _client;
-        if (_enabled && client != null && client.isConnected) {
-          client.send('audio.alive');
-        }
-      });
+      _rx = 0;
+      _fwd = 0;
+      _alive ??= Timer.periodic(
+          const Duration(seconds: 5), (_) => unawaited(_heartbeat()));
       notifyListeners();
       await _start();
     } else {
-      _stop(tellPc: true);
+      _stop(tellPc: true, reason: reason);
+    }
+  }
+
+  /// audio.alive, with what the phone's player is doing.
+  Future<void> _heartbeat() async {
+    final client = _client;
+    if (!_enabled || client == null || !client.isConnected) return;
+    Map<String, dynamic> stats = {};
+    try {
+      final native = await _native.invokeMethod<Map>('stats');
+      if (native != null) stats = native.cast<String, dynamic>();
+    } catch (e) {
+      stats = {'stats_error': '$e'};
+    }
+    stats['rx'] = _rx;
+    stats['fwd'] = _fwd;
+    stats['dart_playing'] = _playing;
+    if (identical(client, _client) && client.isConnected) {
+      client.send('audio.alive', {'stats': stats});
     }
   }
 
@@ -158,7 +181,9 @@ class PcAudio extends ChangeNotifier {
   }
 
   void _onPacket(OpusPacket packet) {
+    if (_enabled) _rx++;
     if (!_enabled || !_nativeOn) return;
+    _fwd++;
     unawaited(_native
         .invokeMethod<void>('write', packet.data)
         .then((_) {}, onError: (_) {}));
@@ -186,7 +211,7 @@ class PcAudio extends ChangeNotifier {
     final reason = call.arguments is String ? call.arguments as String : '';
     _nativeOn = false;
     if (_enabled) {
-      _stop(tellPc: true);
+      _stop(tellPc: true, reason: 'phone: $reason');
       if (reason.isNotEmpty) _notices.add(reason);
     }
     return null;
@@ -258,7 +283,7 @@ class PcAudio extends ChangeNotifier {
   /// start that timed out may still have gone through on the PC and left
   /// its speakers muted.
   void _fail(RelayClient? client, String message) {
-    _stop(tellPc: client != null);
+    _stop(tellPc: client != null, reason: 'failed: $message');
     _error = message;
     notifyListeners();
   }
@@ -266,7 +291,7 @@ class PcAudio extends ChangeNotifier {
   /// Switch off: [tellPc] hands the sound back to the PC (best effort; if
   /// the link is down, the agent restores it by itself after its grace
   /// period).
-  void _stop({required bool tellPc}) {
+  void _stop({required bool tellPc, String reason = ''}) {
     _gen++;
     _enabled = false;
     _alive?.cancel();
@@ -276,7 +301,7 @@ class PcAudio extends ChangeNotifier {
     final client = _client;
     if (tellPc && client != null && client.isConnected) {
       unawaited(client
-          .request('audio.stop')
+          .request('audio.stop', {'reason': reason})
           .then((_) => true, onError: (_) => false));
     }
     _nativeOn = false;

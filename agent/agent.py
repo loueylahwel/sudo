@@ -2564,6 +2564,7 @@ class Agent:
         self._pc_audio_alive_at = 0.0
         self._pc_audio_heartbeat = set()
         self._pc_audio_watch = None
+        self._pc_audio_stats_at = 0.0
         # Remote access from outside the LAN (remote_access.RemoteAccess),
         # set up in run() for the embedded relay.
         self.remote = None
@@ -3471,6 +3472,9 @@ class Agent:
         off. With the listener gone (in its grace period, or back under a
         new connection) any phone may stop it."""
         client = msg.get("from")
+        reason = str(msg.get("reason") or "").strip()
+        if reason:
+            print(f"[agent] the phone asked to stop its sound: {reason[:200]}")
         listener = self._pc_audio_client
         if listener not in (None, client) and listener in self.known_clients:
             return {"enabled": False}
@@ -3491,8 +3495,17 @@ class Agent:
     PC_AUDIO_SILENT_S = 30
 
     async def h_audio_alive(self, msg):
-        """audio.alive (no reply): the listening phone's heartbeat."""
+        """audio.alive (no reply): the listening phone's heartbeat. Newer
+        apps add `stats`, what the phone's player is doing; logged every
+        ~10 s (journalctl), since a phone on a hotspot has no reachable
+        log of its own."""
         self._pc_audio_heartbeat.add(msg.get("from"))
+        stats = msg.get("stats")
+        now = time.monotonic()
+        if isinstance(stats, dict) and now - self._pc_audio_stats_at >= 9.5:
+            self._pc_audio_stats_at = now
+            line = ", ".join(f"{k}={v}" for k, v in stats.items())
+            print(f"[agent] phone sound: {line[:600]}")
         return {}
 
     async def _pc_audio_watchdog(self):

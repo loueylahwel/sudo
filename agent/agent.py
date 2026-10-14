@@ -2551,6 +2551,19 @@ class Agent:
         # created on first phone.audio, streams to one client at a time.
         self.phone_audio = None
         self._phone_audio_client = None
+        # The PC's whole sound played on a phone (pc_audio.py, audio.*):
+        # created on the first audio.start, one listening phone at a time.
+        # Its socket going away starts a grace period (_pc_audio_grace)
+        # instead of stopping at once.
+        self.pc_audio = None
+        self._pc_audio_client = None
+        self._pc_audio_grace = None
+        self._pc_audio_lock = asyncio.Lock()  # start/stop one at a time
+        # Last message from the listener, and the listeners that send
+        # audio.alive heartbeats (see _pc_audio_watchdog).
+        self._pc_audio_alive_at = 0.0
+        self._pc_audio_heartbeat = set()
+        self._pc_audio_watch = None
         # Remote access from outside the LAN (remote_access.RemoteAccess),
         # set up in run() for the embedded relay.
         self.remote = None
@@ -3374,6 +3387,254 @@ class Agent:
         await self._phone_audio_stop()
         await self._phone_change(self.phone.disable)
 
+    # ---- the PC's sound on the phone (see pc_audio.py) ----
+
+    # How long the sound stays routed to a phone whose socket went away: a
+    # network switch or a tunnel hiccup reconnects well within it.
+    PC_AUDIO_GRACE_S = 20
+    # The PC's default output from before it was switched to the phone,
+    # kept in config while it is switched (see _pc_audio_persist).
+    PC_AUDIO_KEY = "pc_audio_prev_sink"
+
+    async def h_audio_start(self, msg):
+        """audio.start {mute_pc?, bitrate?}: everything the PC plays comes
+        out of THIS phone, as Opus in OPS1 packets, on the LAN or through
+        the tunnel alike. With mute_pc (the default) the PC's speakers go
+        quiet. One phone at a time: another phone's audio.start takes over,
+        and the one before hears audio.stopped. A phone back within the
+        grace period just carries on."""
+        import pc_audio
+        client = msg.get("from")
+        mute_pc = bool(msg.get("mute_pc", True))
+        bitrate = pc_audio.clamp_bitrate(
+            msg.get("bitrate") or pc_audio.DEFAULT_BITRATE)
+        grace, self._pc_audio_grace = self._pc_audio_grace, None
+        if grace is not None:
+            grace.cancel()
+        started = False
+        try:
+            before = await self._pc_audio_start(client, mute_pc, bitrate)
+            started = True
+        finally:
+            # Failed, or cancelled (drop_client cancels the lane mid-start,
+            # and the start thread still finishes the switch): the grace
+            # cancelled above is gone, so arm it again unless another phone
+            # is still the listener, or the PC could stay muted for good.
+            # _pc_audio_grace_off only stops a running capture nobody owns.
+            if not started and self._pc_audio_client is None:
+                self._pc_audio_left()
+        if before not in (None, client) and before in self.known_clients:
+            # Never waited on: the phone being replaced may be gone with a
+            # backed-up socket, and a send to it would block for minutes.
+            asyncio.ensure_future(self._pc_audio_tell_stopped(
+                before, "another phone took over"))
+        return {"enabled": True, "codec": "opus", "rate": pc_audio.RATE,
+                "channels": pc_audio.CHANNELS, "frame_ms": pc_audio.FRAME_MS,
+                "mute_pc": mute_pc, "bitrate": bitrate}
+
+    async def _pc_audio_start(self, client, mute_pc, bitrate):
+        """h_audio_start's switch, under the lock. Returns the listener from
+        before."""
+        import pc_audio
+        async with self._pc_audio_lock:
+            if self.pc_audio is None:
+                loop = asyncio.get_running_loop()
+                self.pc_audio = pc_audio.PcAudio(
+                    on_packet=lambda seq, data: loop.call_soon_threadsafe(
+                        self._pc_audio_send, seq, data),
+                    persist=self._pc_audio_persist,
+                    on_ended=lambda reason: loop.call_soon_threadsafe(
+                        self._pc_audio_ended, reason))
+            if self.cfg.get(self.PC_AUDIO_KEY) and not self.pc_audio.running:
+                # A previous agent died with the sound on a phone and the
+                # startup restore hasn't run yet: undo that first, or its
+                # leftover default would be saved as "the PC's output".
+                await self._pc_audio_restore_saved()
+            before = self._pc_audio_client
+            try:
+                await asyncio.to_thread(self.pc_audio.start, mute_pc, bitrate)
+            except Exception:
+                if not self.pc_audio.running:
+                    self._pc_audio_client = None
+                raise
+            self._pc_audio_client = client
+            self._pc_audio_alive_at = time.monotonic()
+            if self._pc_audio_watch is None or self._pc_audio_watch.done():
+                self._pc_audio_watch = asyncio.create_task(
+                    self._pc_audio_watchdog())
+            return before
+
+    async def h_audio_stop(self, msg):
+        """audio.stop: the PC's sound back on the PC. From a phone that
+        isn't the listener while the listener is still connected it changes
+        nothing: that phone was taken over and must not cut the other one
+        off. With the listener gone (in its grace period, or back under a
+        new connection) any phone may stop it."""
+        client = msg.get("from")
+        listener = self._pc_audio_client
+        if listener not in (None, client) and listener in self.known_clients:
+            return {"enabled": False}
+        grace, self._pc_audio_grace = self._pc_audio_grace, None
+        if grace is not None:
+            grace.cancel()
+        async with self._pc_audio_lock:
+            self._pc_audio_client = None
+            if self.pc_audio is not None and self.pc_audio.running:
+                await asyncio.to_thread(self.pc_audio.stop)
+        return {"enabled": False}
+
+    # A listener that sends heartbeats (audio.alive, every 5 s) and then
+    # says nothing for this long is gone, even if its socket looks open: a
+    # phone that walked off the Wi-Fi leaves no FIN, and a screen stream's
+    # backlog can hold off the keepalive ping that would notice. Its
+    # connection is dropped, so the grace period starts.
+    PC_AUDIO_SILENT_S = 30
+
+    async def h_audio_alive(self, msg):
+        """audio.alive (no reply): the listening phone's heartbeat."""
+        self._pc_audio_heartbeat.add(msg.get("from"))
+        return {}
+
+    async def _pc_audio_watchdog(self):
+        while self.pc_audio is not None and self.pc_audio.running:
+            await asyncio.sleep(5)
+            client = self._pc_audio_client
+            if client is None or client not in self._pc_audio_heartbeat:
+                continue
+            if time.monotonic() - self._pc_audio_alive_at \
+                    < self.PC_AUDIO_SILENT_S:
+                continue
+            print("[agent] the phone playing the PC's sound stopped "
+                  "answering — dropping its connection")
+            ws = self.embedded.clients.get(client) if self.embedded else None
+            if ws is not None:
+                ws.transport.abort()  # ends its handler: drop_client
+            else:
+                self._pc_audio_left()
+
+    async def h_audio_status(self, msg):
+        """For an app that reconnected: is the sound still on a phone, and
+        is that phone this connection (`mine`)?"""
+        on = self.pc_audio is not None and self.pc_audio.running
+        return {"enabled": on, "mute_pc": on and self.pc_audio.mute_pc,
+                "mine": on and self._pc_audio_client == msg.get("from")}
+
+    # Audio backlog allowed per phone, under websockets' 32 KiB write limit:
+    # a paused transport would block the keepalive ping, and a phone that
+    # vanished (walked off the Wi-Fi) would go unnoticed until TCP gives
+    # up, ~15 min, with the PC muted all along. 16 KB is ~1 s of sound.
+    PC_AUDIO_BACKLOG_BYTES = 16 * 1024
+
+    def _pc_audio_send(self, seq, data):
+        """Loop thread: one 20 ms Opus packet to the listening phone.
+        Dropped when its link is backed up: late sound is worse than a gap,
+        and the gap in `seq` tells the phone."""
+        client = self._pc_audio_client
+        if client is None:
+            return
+        if self.embedded:
+            try:
+                if self.embedded.write_buffer_size(client) \
+                        > self.PC_AUDIO_BACKLOG_BYTES:
+                    return
+            except Exception:
+                return
+        elif self.congested(client):
+            return
+        header = b'{"seq":%d,"ms":20}' % seq
+        packet = b"OPS1" + len(header).to_bytes(4, "little") + header + data
+        asyncio.ensure_future(self.send_bytes_to(client, packet))
+
+    async def _pc_audio_tell_stopped(self, client, reason):
+        try:
+            await asyncio.wait_for(self.send_to(client, {
+                "event": "audio.stopped", "data": {"reason": reason}}), 5)
+        except Exception:
+            pass  # that phone is gone already, or its link is backed up
+
+    def _pc_audio_ended(self, reason):
+        """Loop thread: the capture died on its own (the sound server
+        restarted...). pc_audio already put the PC's output back; the
+        listener turns its switch off."""
+        client, self._pc_audio_client = self._pc_audio_client, None
+        if client is not None:
+            asyncio.ensure_future(self._pc_audio_tell_stopped(client, reason))
+
+    def _pc_audio_left(self):
+        """The listening phone's socket is gone: no more packets, but the
+        routing and capture stay for PC_AUDIO_GRACE_S, so a phone that
+        reconnects and sends audio.start again carries on without the PC's
+        speakers blaring in between."""
+        self._pc_audio_client = None
+        if self._pc_audio_grace is None or self._pc_audio_grace.done():
+            self._pc_audio_grace = asyncio.create_task(
+                self._pc_audio_grace_off())
+
+    async def _pc_audio_grace_off(self):
+        await asyncio.sleep(self.PC_AUDIO_GRACE_S)
+        async with self._pc_audio_lock:
+            if self._pc_audio_client is None and self.pc_audio is not None \
+                    and self.pc_audio.running:
+                print("[agent] the phone playing the PC's sound didn't come "
+                      "back — sound back on the PC")
+                await asyncio.to_thread(self.pc_audio.stop)
+
+    def _pc_audio_persist(self, prev):
+        """The PC's default output from before it was switched to the
+        phone, written BEFORE the switch and cleared once it is back.
+        PipeWire remembers a picked default for good, so an agent that dies
+        meanwhile must leave a note for the next one (restore_pc_audio).
+        Same rule as _power_persist: only this key is written over what is
+        on disk."""
+        key = self.PC_AUDIO_KEY
+        if prev:
+            self.cfg[key] = prev
+        else:
+            self.cfg.pop(key, None)
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+            if not isinstance(data, dict):
+                raise ValueError("config.json is not a JSON object")
+            if prev:
+                data[key] = prev
+            elif key in data:
+                data.pop(key)
+            else:
+                return
+            save_config(data)
+        except (OSError, ValueError) as e:
+            print(f"[agent] could not persist the PC's default output: {e}")
+
+    async def _pc_audio_restore_saved(self):
+        """With _pc_audio_lock held: put back the default output a previous
+        agent left on the phone's sink, then forget it. Raises when the
+        sound server can't be reached."""
+        import pc_audio
+        done = await asyncio.to_thread(pc_audio.restore_after_crash,
+                                       self.cfg[self.PC_AUDIO_KEY])
+        print(f"[agent] PC sound left on a phone by the last run: {done}")
+        self._pc_audio_persist(None)
+
+    async def restore_pc_audio(self):
+        """Startup: an agent that died while the PC's sound played on a
+        phone (crash, kill, `systemctl stop`: none of them reach run()'s
+        finally) left the phone's sink as the PC's picked default output.
+        Put the saved one back. Retried for a minute: at login the agent can
+        be up before the sound server."""
+        error = None
+        for _ in range(12):
+            async with self._pc_audio_lock:
+                if not self.cfg.get(self.PC_AUDIO_KEY) or (
+                        self.pc_audio is not None and self.pc_audio.running):
+                    return  # nothing to do, or an audio.start did it
+                try:
+                    await self._pc_audio_restore_saved()
+                    return
+                except Exception as e:
+                    error = e
+            await asyncio.sleep(5)
+        print(f"[agent] could not put the PC's default output back: {error}")
+
     async def h_notify_subscribe(self, msg):
         raise ValueError(
             "notification mirroring is not implemented yet "
@@ -3433,6 +3694,10 @@ class Agent:
         "phone.key": h_phone_key,
         "phone.wheel": h_phone_wheel,
         "phone.audio": h_phone_audio,
+        "audio.start": h_audio_start,
+        "audio.stop": h_audio_stop,
+        "audio.status": h_audio_status,
+        "audio.alive": h_audio_alive,
         "notify.subscribe": h_notify_subscribe,
     }
 
@@ -3746,6 +4011,7 @@ class Agent:
 
     async def drop_client(self, client_id):
         self._input_seq.pop(client_id, None)
+        self._pc_audio_heartbeat.discard(client_id)
         lane = self._lanes.pop(client_id, None)
         if lane:
             lane[1].cancel()
@@ -3763,6 +4029,8 @@ class Agent:
                 await cam.stop()
             if client_id == self._phone_audio_client:
                 await self._phone_audio_stop()
+            if client_id == self._pc_audio_client:
+                self._pc_audio_left()
             if self.portal is not None and not self.known_clients and (
                     self._portal_idle_task is None
                     or self._portal_idle_task.done()):
@@ -3795,6 +4063,7 @@ class Agent:
         asyncio.create_task(self.cursor_watcher())
         asyncio.create_task(self.restore_power_schedule())
         asyncio.create_task(self.restore_phone_audio())
+        asyncio.create_task(self.restore_pc_audio())
         host = urlparse(self.cfg["relay"]).hostname
         if host in (None, "127.0.0.1", "localhost", "::1"):
             # Standalone: the relay is embedded — the phone connects straight
@@ -3811,6 +4080,8 @@ class Agent:
             finally:
                 if self.tunnel is not None:
                     self.tunnel.stop()
+                if self.pc_audio is not None:
+                    self.pc_audio.stop()  # the PC's sound back on the PC
                 if self.remote is not None:
                     self.remote.stop()
             return
@@ -3869,6 +4140,8 @@ class Agent:
             await self.drop_client(msg.get("clientId"))
             return
         client = msg.get("from")
+        if client is not None and client == self._pc_audio_client:
+            self._pc_audio_alive_at = time.monotonic()
         if client and client not in self.known_clients:
             self.known_clients.add(client)
             self._status("Phone connected")
@@ -3898,7 +4171,9 @@ class Agent:
                            "phone.text", "phone.key", "phone.wheel",
                            # opening the Screen page must not wait behind a
                            # slow request, and acks pace the stream
-                           "screen.start", "screen.stop", "screen.ack"})
+                           "screen.start", "screen.stop", "screen.ack",
+                           # never queued behind a slow request
+                           "audio.alive"})
 
     async def _lane_worker(self, queue):
         while True:
@@ -3999,6 +4274,16 @@ def ensure_startup_shortcut():
         pass
 
 
+def stop_on_sigterm():
+    """systemd stops and restarts the service with SIGTERM, which would end
+    the process without Agent.run()'s finally. Take the Ctrl+C path instead,
+    so the PC's sound comes back from a phone and the tunnel is stopped."""
+    if sys.platform != "win32":
+        import signal
+        signal.signal(signal.SIGTERM,
+                      lambda *_: signal.raise_signal(signal.SIGINT))
+
+
 def main():
     if not ensure_single_instance():
         print("[agent] another instance is already running — exiting")
@@ -4013,6 +4298,7 @@ def main():
     print("  Scan the QR or enter the code in the mobile app.")
     print("=" * 52)
     agent = Agent(cfg)
+    stop_on_sigterm()
     try:
         asyncio.run(agent.run())
     except KeyboardInterrupt:

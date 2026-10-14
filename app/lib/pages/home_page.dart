@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../client_registry.dart';
 import '../device_store.dart';
 import '../discovery.dart';
+import '../pc_audio.dart';
 import '../pc_widget.dart';
 import '../relay_client.dart';
 import '../tunnel.dart';
@@ -83,6 +84,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // Lock tap on the home screen widget, forwarded by WidgetActionReceiver.
   static const _widgetActionsChannel = MethodChannel('pcocket/widget_actions');
 
+  // "PC sound on this phone" ended without the switch being touched
+  // (another phone took over, the notification's Stop...): say why.
+  StreamSubscription<String>? _pcAudioNoticeSub;
+
   // Media sleep timer: pauses whatever plays on the PC when it expires. One
   // timer at a time; _sleepTick just refreshes the countdown chip once a
   // second, _sleepTimer does the actual firing.
@@ -149,6 +154,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _widgetActionsChannel.setMethodCallHandler((call) async {
       if (call.method == 'lock') _lockFromWidget();
     });
+    _pcAudioNoticeSub = PcAudio.instance.notices.listen((note) {
+      if (mounted) showMessage(context, note);
+    });
   }
 
   /// Back from the background: Android freezes a backgrounded app, so a
@@ -177,6 +185,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _connectivitySub?.cancel();
     _volumeKeysChannel.setMethodCallHandler(null);
     _widgetActionsChannel.setMethodCallHandler(null);
+    _pcAudioNoticeSub?.cancel();
     _cancelSleepTimer(update: false);
     _powerTick?.cancel();
     _cancelReconnect();
@@ -847,6 +856,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _leaveDashboard() {
     _cancelReconnect();
+    // Leaving the PC hands its sound back to it, over the live client
+    // (before the teardown below closes it).
+    unawaited(PcAudio.instance.setEnabled(false));
     _tearDownClient();
     setState(() {
       _selected = null;
@@ -1543,6 +1555,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 const SizedBox(height: 8),
                 _buildMediaCard(theme),
                 const SizedBox(height: 8),
+                _buildPcSoundCard(theme),
+                const SizedBox(height: 8),
                 _buildDisplayCard(theme),
                 const SizedBox(height: 8),
                 _buildClipboardCard(theme),
@@ -1827,6 +1841,62 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ],
         ),
       ),
+    );
+  }
+
+  /// "PC sound on this phone": its own switch, separate from the media
+  /// controls above (those still act on the PC's player). On, everything
+  /// the PC plays comes out of this phone and the PC goes quiet; the sound
+  /// follows reconnects by itself (see PcAudio).
+  Widget _buildPcSoundCard(ThemeData theme) {
+    return ListenableBuilder(
+      listenable: PcAudio.instance,
+      builder: (context, _) {
+        final audio = PcAudio.instance;
+        final unsupported = audio.supported == false;
+        // Turning it on needs the PC; turning it off never does (the agent
+        // gives the PC its sound back by itself if it can't be told).
+        final canSwitch = audio.enabled || (_socketUp && !unsupported);
+        final error = audio.error;
+        final String subtitle;
+        if (error != null) {
+          subtitle = error;
+        } else if (unsupported) {
+          subtitle = 'The Sudo agent on this PC is too old for this. '
+              'Update it on the PC.';
+        } else if (audio.enabled && audio.playing) {
+          subtitle = 'Playing here. The PC is quiet.';
+        } else if (audio.enabled && !_socketUp) {
+          subtitle = 'Waiting for the connection to come back…';
+        } else if (audio.enabled) {
+          subtitle = 'Starting…';
+        } else if (audio.elsewhere) {
+          subtitle = 'Playing on another phone right now. '
+              'Turn on to move it here.';
+        } else {
+          subtitle = 'Plays what the PC plays. The PC goes quiet.';
+        }
+        return Card(
+          clipBehavior: Clip.antiAlias,
+          child: SwitchListTile(
+            secondary: Icon(
+              audio.playing ? Icons.headphones : Icons.headphones_outlined,
+              size: 32,
+            ),
+            title: const Text('PC sound on this phone'),
+            subtitle: Text(
+              subtitle,
+              style: error == null
+                  ? null
+                  : TextStyle(color: theme.colorScheme.error),
+            ),
+            value: audio.enabled,
+            onChanged: canSwitch
+                ? (on) => unawaited(audio.setEnabled(on))
+                : null,
+          ),
+        );
+      },
     );
   }
 

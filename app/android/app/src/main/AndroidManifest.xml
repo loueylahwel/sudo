@@ -5,6 +5,13 @@
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
+    <!-- "PC sound on this phone": PcAudioService keeps the sound playing with
+         the screen off (foreground media playback + wake and Wi-Fi locks),
+         its notification carries the Stop button. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:label="Sudo"
         android:requestLegacyExternalStorage="true"
@@ -45,6 +52,10 @@
         <receiver
             android:name=".WidgetActionReceiver"
             android:exported="false" />
+        <service
+            android:name=".PcAudioService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

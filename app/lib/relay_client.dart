@@ -55,6 +55,20 @@ class VideoChunk {
   int get ts => (header['ts'] as num?)?.toInt() ?? 0;
 }
 
+/// One `OPS1` packet after `audio.start` ("PC sound on this phone"): exactly
+/// one Opus packet holding 20 ms of everything the PC plays, 48 kHz stereo.
+class OpusPacket {
+  OpusPacket(this.seq, this.data);
+
+  /// The agent's frame counter, +1 per 20 ms encoded. A gap means the agent
+  /// dropped frames (it skips them while this phone's link is congested:
+  /// late sound is worse than a gap).
+  final int seq;
+
+  /// The Opus packet itself, ready for the decoder.
+  final Uint8List data;
+}
+
 /// Outcome of [connectAndPair]: the `paired` handshake reply plus the
 /// address that was used.
 class PairResult {
@@ -141,6 +155,8 @@ class RelayClient {
       StreamController<VideoChunk>.broadcast();
   final StreamController<Uint8List> _audioChunksCtrl =
       StreamController<Uint8List>.broadcast();
+  final StreamController<OpusPacket> _opusPacketsCtrl =
+      StreamController<OpusPacket>.broadcast();
   final StreamController<bool> _connCtrl = StreamController<bool>.broadcast();
   final StreamController<Map<String, dynamic>> _commandsCtrl =
       StreamController<Map<String, dynamic>>.broadcast();
@@ -169,6 +185,11 @@ class RelayClient {
   /// `PCM1` packets after `phone.audio {enabled: true}`: 40 ms of the PC's
   /// phone-screen sound as 16-bit little-endian stereo PCM at 48 kHz.
   Stream<Uint8List> get audioChunks => _audioChunksCtrl.stream;
+
+  /// `OPS1` packets after `audio.start`: everything the PC plays, one 20 ms
+  /// Opus packet each (see [OpusPacket]). Unrelated to [audioChunks], which
+  /// only carries the phone-screen apps' sound.
+  Stream<OpusPacket> get opusPackets => _opusPacketsCtrl.stream;
 
   /// Emits `true` when the socket comes up, `false` when it drops.
   Stream<bool> get connectionState => _connCtrl.stream;
@@ -412,9 +433,10 @@ class RelayClient {
     }
   }
 
-  /// Handles a binary WebSocket frame. `PJF1` (JPEG screen/camera) and
-  /// `H264` (hardware-decoded screen video) packets are understood;
-  /// anything else is dropped.
+  /// Handles a binary WebSocket frame. `PJF1` (JPEG screen/camera), `H264`
+  /// (hardware-decoded screen video), `PCM1` (phone-screen sound) and
+  /// `OPS1` (all of the PC's sound, Opus) packets are understood; anything
+  /// else is dropped.
   ///
   /// `PJF1` layout: `[4B "PJF1"][4B LE uint32 headerLen][headerLen bytes
   /// UTF-8 JSON header {"w","h","src"}][JPEG bytes]`. `src` is `"screen"`
@@ -423,6 +445,9 @@ class RelayClient {
   /// `H264` layout: `[4B "H264"][4B LE uint32 headerLen][headerLen bytes
   /// UTF-8 JSON header {"w","h","codec","encoder","capture","fps","key",
   /// "ts"}][one Annex-B access unit]`.
+  ///
+  /// `OPS1` layout: `[4B "OPS1"][4B LE uint32 headerLen][headerLen bytes
+  /// UTF-8 JSON header {"seq","ms"}][one Opus packet]`.
   void _onBinaryMessage(dynamic raw) {
     // web_socket_channel normally delivers Uint8List, but accept any
     // List<int> so a different implementation can't silently break us.
@@ -447,6 +472,14 @@ class RelayClient {
       if (bytes.length > 8 + headerLen) {
         _audioChunksCtrl.add(Uint8List.sublistView(bytes, 8 + headerLen));
       }
+      return;
+    }
+    // 0x4F 'O', 0x50 'P', 0x53 'S', 0x31 '1': the PC's sound, Opus.
+    if (bytes[0] == 0x4F &&
+        bytes[1] == 0x50 &&
+        bytes[2] == 0x53 &&
+        bytes[3] == 0x31) {
+      _onOpusPacket(bytes);
       return;
     }
     // 0x50 'P', 0x4A 'J', 0x46 'F', 0x31 '1'.
@@ -484,6 +517,23 @@ class RelayClient {
       _videoChunksCtrl.add(VideoChunk(header, data));
     } catch (_) {
       // Malformed packet; drop it and wait for the next one.
+    }
+  }
+
+  /// Parses one `OPS1` packet (see [_onBinaryMessage] for the layout) and
+  /// emits it on [opusPackets]. Only `seq` is read from the header: every
+  /// packet is 20 ms, the codec settings came with the `audio.start` reply.
+  void _onOpusPacket(Uint8List bytes) {
+    final headerLen = ByteData.sublistView(bytes).getUint32(4, Endian.little);
+    if (bytes.length <= 8 + headerLen) return;
+    try {
+      final headerJson = utf8.decode(bytes.sublist(8, 8 + headerLen));
+      final header = (jsonDecode(headerJson) as Map).cast<String, dynamic>();
+      final seq = (header['seq'] as num?)?.toInt() ?? 0;
+      _opusPacketsCtrl.add(
+          OpusPacket(seq, Uint8List.sublistView(bytes, 8 + headerLen)));
+    } catch (_) {
+      // Malformed packet; drop it (the decoder copes with a 20 ms gap).
     }
   }
 

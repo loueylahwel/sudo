@@ -1,10 +1,13 @@
 package io.github.loueylahwel.sudo
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -28,16 +31,26 @@ class MainActivity : FlutterActivity() {
     // they adjust the PC's volume instead of the phone's. Dart switches the
     // forwarding off ("setForwarding", false) while the phone itself plays
     // the PC's sound (phone screen), so the keys control what you hear.
+    // "PC sound on this phone" does the same on its own: while OpusPlayer
+    // runs the keys are never forwarded (see dispatchKeyEvent).
     private var volumeKeysChannel: MethodChannel? = null
     @Volatile private var forwardVolumeKeys = true
 
     // Sound of the PC's phone-screen apps (PCM1 packets), see PcmPlayer.
     private var pcmPlayer: PcmPlayer? = null
 
+    // "PC sound on this phone": all of the PC's sound (OPS1 packets), see
+    // OpusPlayer; PcAudioService keeps it going with the screen off.
+    private var opusPlayer: OpusPlayer? = null
+
     companion object {
         // Lock taps from the home screen widget reach Dart through this
         // channel while the app process is alive (see WidgetActionReceiver).
         var widgetActionsChannel: MethodChannel? = null
+
+        private const val NATIVE_PREFS = "sudo_native"
+        private const val ASKED_NOTIFICATIONS = "asked_post_notifications"
+        private const val REQUEST_NOTIFICATIONS = 4107
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -96,6 +109,7 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+        configurePcAudio(flutterEngine)
         widgetActionsChannel =
             MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "pcocket/widget_actions")
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, downloadsChannel)
@@ -165,21 +179,109 @@ class MainActivity : FlutterActivity() {
             }
     }
 
+    /**
+     * "sudo/pcaudio": `start` (no args; throws with a message for the user
+     * when the phone can't play), `write` (one Opus packet as bytes), `stop`.
+     * Native -> Dart: `stopped(reason)` when the phone ended it by itself
+     * (notification's Stop, another app took the audio focus, decoder
+     * failure); Dart then hands the sound back to the PC.
+     */
+    private fun configurePcAudio(flutterEngine: FlutterEngine) {
+        val player = OpusPlayer(this)
+        opusPlayer = player
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "sudo/pcaudio")
+        player.onStopped = { reason ->
+            endPcAudio()
+            channel.invokeMethod("stopped", reason)
+        }
+        PcAudioService.stopListener = { reason ->
+            if (player.isRunning) {
+                endPcAudio()
+                channel.invokeMethod("stopped", reason)
+            }
+        }
+        channel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start" -> {
+                    try {
+                        val wasRunning = player.isRunning
+                        player.start()
+                        if (!wasRunning) {
+                            askForNotificationsOnce()
+                            PcAudioService.start(this)
+                            // The volume keys now set the phone's media
+                            // volume, even between two sounds.
+                            volumeControlStream = AudioManager.STREAM_MUSIC
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("pcaudio", e.message ?: "The phone can't play the PC sound", null)
+                    }
+                }
+                "write" -> {
+                    val bytes = call.arguments as? ByteArray
+                    if (bytes != null) player.write(bytes)
+                    result.success(null)
+                }
+                "stop" -> {
+                    endPcAudio()
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    private fun endPcAudio() {
+        opusPlayer?.stop()
+        PcAudioService.stop(this)
+        volumeControlStream = AudioManager.USE_DEFAULT_STREAM_TYPE
+    }
+
+    /** Android 13+: the foreground service's notification (with its Stop
+     * button) needs the notification permission. Asked once, the first time
+     * the PC sound starts; the sound plays either way. */
+    private fun askForNotificationsOnce() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        val prefs = getSharedPreferences(NATIVE_PREFS, MODE_PRIVATE)
+        if (prefs.getBoolean(ASKED_NOTIFICATIONS, false)) return
+        prefs.edit().putBoolean(ASKED_NOTIFICATIONS, true).apply()
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+    }
+
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
         volumeKeysChannel = null
         widgetActionsChannel = null
         super.cleanUpFlutterEngine(flutterEngine)
     }
 
+    // Back on the dashboard (the root route) ends in SystemNavigator.pop,
+    // which would finish() this activity and, through onDestroy, stop the
+    // PC sound without telling the PC. While it plays here, behave like a
+    // music app instead: go to the background.
+    override fun popSystemNavigator(): Boolean {
+        if (opusPlayer?.isRunning == true) {
+            moveTaskToBack(true)
+            return true
+        }
+        return super.popSystemNavigator()
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         // Consume volume keys while the activity is in the foreground and
-        // forward them to Dart; the phone's own volume is left alone.
+        // forward them to Dart; the phone's own volume is left alone. Not
+        // while the PC's sound plays here: then they set what you hear.
         val direction = when (event.keyCode) {
             KeyEvent.KEYCODE_VOLUME_UP -> "up"
             KeyEvent.KEYCODE_VOLUME_DOWN -> "down"
             else -> null
         }
-        if (direction != null && forwardVolumeKeys) {
+        if (direction != null && forwardVolumeKeys && opusPlayer?.isRunning != true) {
             if (event.action == KeyEvent.ACTION_DOWN) {
                 volumeKeysChannel?.invokeMethod("volumeKey", direction)
             }
@@ -193,6 +295,11 @@ class MainActivity : FlutterActivity() {
         videoDecoder = null
         pcmPlayer?.release()
         pcmPlayer = null
+        // The engine (and the Dart side with its socket) dies with this
+        // activity: nothing would feed the player any more.
+        PcAudioService.stopListener = null
+        endPcAudio()
+        opusPlayer = null
         super.onDestroy()
     }
 

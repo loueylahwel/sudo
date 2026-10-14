@@ -68,7 +68,7 @@ except input and stream control (`ping`, `input`, `media`, `phone.touch`,
 that needs input to follow a request must wait for that request's reply.
 
 Clients should not offer `permessage-deflate`, and the embedded relay
-declines it: frames are JPEG/H.264/PCM, which don't compress.
+declines it: frames are JPEG/H.264/PCM/Opus, which don't compress.
 
 ## 3. Responses and events (agent -> client)
 
@@ -127,6 +127,9 @@ Events are pushed without an `id`:
 | `input` | see below | `{}` |
 | `notify.subscribe` | – | currently returns `ok:false` (not implemented yet) |
 | `remote.info` | – | `{ available, host, port, fingerprint, error, tunnel, tunnelError, rendezvous }` – how to reach the PC from other networks, see [Remote access](#remote-access); changes are pushed as `remote.changed` events with the same data |
+| `audio.start` | `mute_pc?` (dflt `true`), `bitrate?` (bits/s, 32000-256000, dflt 128000) | `{ enabled: true, codec: "opus", rate: 48000, channels: 2, frame_ms: 20, mute_pc, bitrate }` – the PC's sound streams to this phone as OPS1 packets, see [PC sound on the phone](#pc-sound-on-the-phone-audio) |
+| `audio.stop` | – | `{ enabled: false }` – the PC's sound back on the PC |
+| `audio.status` | – | `{ enabled, mute_pc, mine }` – `mine`: this connection is the one listening |
 
 ### `screen.start`
 
@@ -311,6 +314,69 @@ certificate the phone pins (`fingerprint`, SHA-256 of the DER), and only a
 
 Config (`config.json`): `remote_access: false` turns off every route;
 `tunnel: false` only the tunnel; `ntfy_server` replaces `https://ntfy.sh`.
+
+### PC sound on the phone (`audio.*`)
+
+Everything the PC plays comes out of the phone instead (or as well), on the
+home network and through the tunnel alike. Separate from `phone.audio` (the
+sound of the phone-screen apps, Windows, PCM1 packets): this is the PC's
+whole mix, compressed to fit a 2-3 Mbit/s mobile link.
+
+```json
+{ "id": "a1", "cmd": "audio.start", "mute_pc": true, "bitrate": 128000 }
+{ "id": "a1", "ok": true, "data": { "enabled": true, "codec": "opus", "rate": 48000, "channels": 2, "frame_ms": 20, "mute_pc": true, "bitrate": 128000 } }
+{ "id": "a2", "cmd": "audio.stop" }
+{ "id": "a3", "cmd": "audio.status" }
+```
+
+- `mute_pc` (default `true`): the PC's speakers go quiet, its sound moves to
+  the phone. `false`: the PC keeps playing and the phone gets a copy. A
+  phone that sends `audio.start` again while it is already the listener
+  just carries on (a new `bitrate` applies at once, `seq` keeps counting);
+  a different `mute_pc` restarts the capture.
+- **Packets** (binary, to the listening phone only):
+
+  ```
+  [4 bytes]  "OPS1" magic
+  [4 bytes]  header length N, little-endian uint32
+  [N bytes]  header JSON: {"seq": 1234, "ms": 20}
+  [rest]     exactly one Opus packet: 20 ms, 48 kHz, stereo
+  ```
+
+  Feed every packet to one Opus decoder (48 kHz, 2 channels; the encoder's
+  pre-skip is 312 samples). `seq` goes up by one per encoded frame, so a gap
+  means frames were dropped: the agent drops a packet rather than queue it
+  when that phone's socket is backed up (late sound is worse than a gap).
+  The stream is continuous: silence is sent too (as tiny packets).
+- **One phone listens at a time.** An `audio.start` from another phone takes
+  over; the previous listener gets
+  `{ "event": "audio.stopped", "data": { "reason": "another phone took over" } }`
+  and should turn its switch off **without** sending `audio.stop`. An
+  `audio.stop` from a phone that isn't the listener, while the listener is
+  still connected, changes nothing (answers `{ enabled: false }`).
+  `audio.stopped` (with another `reason`) also comes when the capture dies
+  on its own, e.g. the PC's sound server restarted; the PC's sound is then
+  already back on the PC.
+- **Reconnects:** the listener's socket going away does not stop the sound
+  at once. For 20 s the routing and capture stay, so a phone that comes
+  back (network switch, tunnel hiccup) and sends `audio.start` again
+  continues without the PC's speakers blaring in between; any phone's
+  `audio.stop` in that time stops it. After 20 s with nobody back: stop. An
+  app that reconnects asks `audio.status`: `enabled: true, mine: false`
+  means its sound is still routed and waiting for that `audio.start`.
+- **Errors** (`ok: false`): Windows -> "Playing the PC's sound on the phone
+  isn't available on Windows yet". Linux without the tools -> the message
+  names what is missing and the package (`pipewire-bin` for `pw-cli`,
+  `pulseaudio-utils` for `pactl`/`parec`, `libopus0`).
+
+On Linux (PipeWire) the agent creates an output "Phone (Sudo)"
+(`sudo_phone`, owned by a `pw-cli` child, so it disappears when the agent
+dies), makes it the default output, moves the streams still on the old
+default onto it, and records its monitor with `parec`. `audio.stop`, the
+grace period's end and agent shutdown put the old default back. The old
+default is kept in `config.json` (`pc_audio_prev_sink`) while it is
+switched: after a crash the next agent start restores it (unless the user
+picked another output since) and clears the key.
 
 ## 5. Typical flows
 

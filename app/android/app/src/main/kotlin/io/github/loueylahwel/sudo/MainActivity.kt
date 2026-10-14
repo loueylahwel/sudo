@@ -227,6 +227,7 @@ class MainActivity : FlutterActivity() {
                     endPcAudio()
                     result.success(true)
                 }
+                "stats" -> result.success(player.stats())
                 else -> result.notImplemented()
             }
         }

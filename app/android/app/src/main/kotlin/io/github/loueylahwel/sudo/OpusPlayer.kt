@@ -82,6 +82,18 @@ class OpusPlayer(context: Context) {
 
     @Volatile private var muted = false
     @Volatile private var ducked = false
+
+    // Diagnostics for [stats] (Dart sends them to the PC, whose log shows
+    // them: the phone's own log isn't reachable over a hotspot).
+    @Volatile private var statIn = 0L
+    @Volatile private var statDecoded = 0L
+    @Volatile private var statWrittenMs = 0L
+    @Volatile private var statPlaying = false
+    @Volatile private var statCushionMs = 0L
+    @Volatile private var statTargetMs = 0L
+    @Volatile private var statUnderruns = 0
+    @Volatile private var statCodecErrors = 0
+    @Volatile private var statLastError: String? = null
     private var focusRequest: AudioFocusRequest? = null
 
     private val attributes = AudioAttributes.Builder()
@@ -130,6 +142,13 @@ class OpusPlayer(context: Context) {
         muted = false
         ducked = false
         packets.clear()
+        statIn = 0
+        statDecoded = 0
+        statWrittenMs = 0
+        statPlaying = false
+        statUnderruns = 0
+        statCodecErrors = 0
+        statLastError = null
         val id = session + 1
         session = id
         running = true
@@ -146,9 +165,28 @@ class OpusPlayer(context: Context) {
     /** Queues one Opus packet; returns at once. */
     fun write(packet: ByteArray) {
         if (!running) return
+        statIn++
         // A stalled player thread must not hoard memory: keep the newest.
         while (!packets.offer(packet)) packets.poll()
     }
+
+    /** What the player is doing, for the PC's log (see the stat fields). */
+    fun stats(): Map<String, Any?> = mapOf(
+        "running" to running,
+        "in" to statIn,
+        "decoded" to statDecoded,
+        "written_ms" to statWrittenMs,
+        "playing" to statPlaying,
+        "cushion_ms" to statCushionMs,
+        "target_ms" to statTargetMs,
+        "underruns" to statUnderruns,
+        "codec_errors" to statCodecErrors,
+        "last_error" to statLastError,
+        "muted" to muted,
+        "ducked" to ducked,
+        "volume" to audioManager.getStreamVolume(AudioManager.STREAM_MUSIC),
+        "volume_max" to audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
+    )
 
     /** Stops playing and gives the audio focus back. Idempotent. */
     fun stop() {
@@ -307,6 +345,8 @@ class OpusPlayer(context: Context) {
                     } catch (e: Exception) {
                         // A broken decoder: a fresh one picks up from the
                         // next packet (Opus resyncs within a packet or two).
+                        statCodecErrors++
+                        statLastError = "${e.javaClass.simpleName}: ${e.message}"
                         releaseCodec()
                         if (++codecFailures >= MAX_CODEC_FAILURES) {
                             mainHandler.post {
@@ -315,8 +355,12 @@ class OpusPlayer(context: Context) {
                             break
                         }
                     }
-                    watchCushion()
-                    applyVolume()
+                    try {
+                        watchCushion()
+                        applyVolume()
+                    } catch (e: Exception) {
+                        statLastError = "${e.javaClass.simpleName}: ${e.message}"
+                    }
                 }
             } catch (_: InterruptedException) {
                 // Not used for stopping, but never leak the codec over it.
@@ -368,7 +412,10 @@ class OpusPlayer(context: Context) {
                 waitUs = 0
                 if (index >= 0) {
                     val pcm = decoder.getOutputBuffer(index)
-                    if (pcm != null && info.size > 0) play(pcm, info.offset, info.size)
+                    if (pcm != null && info.size > 0) {
+                        statDecoded++
+                        play(pcm, info.offset, info.size)
+                    }
                     decoder.releaseOutputBuffer(index, false)
                 } else if (index == MediaCodec.INFO_TRY_AGAIN_LATER) {
                     return
@@ -393,10 +440,13 @@ class OpusPlayer(context: Context) {
             pcm.limit(offset + size)
             val written = track.write(pcm, size, AudioTrack.WRITE_NON_BLOCKING)
             if (written > 0) framesWritten += written / BYTES_PER_FRAME
+            if (written < 0) statLastError = "AudioTrack.write error $written"
+            statWrittenMs = framesWritten * 1000 / SAMPLE_RATE
             // Buffered enough (or the track is full): go.
             if (!playing && (cushionMs() >= targetMs || written < size)) {
                 track.play()
                 playing = true
+                statPlaying = true
                 restartWindow(SystemClock.elapsedRealtime())
             }
         }
@@ -407,9 +457,13 @@ class OpusPlayer(context: Context) {
             if (!playing) return
             val now = SystemClock.elapsedRealtime()
             val cushion = cushionMs()
+            statCushionMs = cushion
+            statTargetMs = targetMs
             if (cushion < UNDERRUN_MS && packets.isEmpty()) {
                 track.pause()
                 playing = false
+                statPlaying = false
+                statUnderruns++
                 dropping = false
                 targetMs = minOf(MAX_TARGET_MS, targetMs + TARGET_UP_MS)
                 targetChangedAt = now

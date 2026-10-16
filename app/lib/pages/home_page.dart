@@ -983,6 +983,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  /// Unlock the PC's lock screen with the PC user's password, typed here.
+  /// The agent checks it (PAM) and only accepts it over TLS; the app never
+  /// keeps it.
+  Future<void> _unlockPc() async {
+    final client = _client;
+    if (client == null || !_socketUp) {
+      showMessage(context, 'Not connected');
+      return;
+    }
+    final password = await showDialog<String>(
+      context: context,
+      builder: (_) => const _UnlockDialog(),
+    );
+    if (password == null || password.isEmpty || !mounted) return;
+    try {
+      await client.request('session.unlock', {'password': password});
+      if (mounted) showMessage(context, 'PC unlocked');
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
   Future<void> _power(
     String action,
     String label, {
@@ -2241,6 +2263,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 onPressed: () => _power('lock', 'Lock'),
               ),
               _quickAction(
+                tooltip: 'Unlock with your PC password',
+                icon: Icons.lock_open,
+                onPressed: _unlockPc,
+              ),
+              _quickAction(
                 tooltip: 'Sleep',
                 icon: Icons.bedtime_outlined,
                 onPressed: () => _power('sleep', 'Sleep'),
@@ -2322,6 +2349,59 @@ class _ControlCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Asks for the PC user's password; returns it (or null when cancelled).
+class _UnlockDialog extends StatefulWidget {
+  const _UnlockDialog();
+
+  @override
+  State<_UnlockDialog> createState() => _UnlockDialogState();
+}
+
+class _UnlockDialogState extends State<_UnlockDialog> {
+  final _controller = TextEditingController();
+  bool _hidden = true;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() => Navigator.pop(context, _controller.text);
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Unlock the PC'),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        obscureText: _hidden,
+        enableSuggestions: false,
+        autocorrect: false,
+        keyboardType: TextInputType.visiblePassword,
+        textInputAction: TextInputAction.done,
+        onSubmitted: (_) => _submit(),
+        decoration: InputDecoration(
+          labelText: "The PC user's password",
+          suffixIcon: IconButton(
+            tooltip: _hidden ? 'Show' : 'Hide',
+            icon: Icon(_hidden ? Icons.visibility : Icons.visibility_off),
+            onPressed: () => setState(() => _hidden = !_hidden),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(onPressed: _submit, child: const Text('Unlock')),
+      ],
     );
   }
 }

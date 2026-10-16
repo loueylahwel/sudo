@@ -3574,6 +3574,8 @@ class Agent:
             if on:
                 if self._wlock is not None:
                     await self._wlock_release_locked()
+                self.kde_apps.on_lock_ended = lambda: asyncio.ensure_future(
+                    self.window_unlock("the locked window closed"))
                 r = await self.kde_apps.lock_window(msg.get("window") or None)
                 self._wlock = {"id": r["id"], "title": r.get("title") or "",
                                "prev_above": bool(r.get("prev_above"))}

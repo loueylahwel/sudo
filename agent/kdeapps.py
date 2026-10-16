@@ -116,7 +116,11 @@ if (!locked || !locked.normalWindow) {
     locked.keepAbove = true;
     if (locked.minimized) locked.minimized = false;
     workspace.activeWindow = locked;
-    locked.closed.connect(function () { gone = true; });
+    locked.closed.connect(function () {
+        // Tell the agent: the lock is over (the phone's button goes off).
+        gone = true;
+        callDBus(SERVICE, %(path)s, %(iface)s, "LockEnded", TOKEN);
+    });
     function tame(w) {
         if (gone || !w || w === locked) return false;
         if (!(w.normalWindow || w.dialog || w.utility)) return false;
@@ -162,6 +166,9 @@ class KdeApps:
         self._icons = {}          # icon key -> base64 PNG or None
         self._apps = None         # cached apps.list entries
         self._app_icon_names = {}  # app id -> Icon= value
+        # Called (loop thread) when the locked window closes by itself.
+        self.on_lock_ended = None
+        self._lock_token = None
 
     # ---------------------------------------------------------- KWin calls
 
@@ -174,10 +181,17 @@ class KdeApps:
             from dbus_fast.service import ServiceInterface, method
 
             waiting = self._waiting
+            owner = self
 
             class Receiver(ServiceInterface):
                 def __init__(self):
                     super().__init__(IFACE)
+
+                @method()
+                def LockEnded(self, token: "s") -> None:
+                    if token == owner._lock_token and owner.on_lock_ended:
+                        owner._lock_token = None
+                        owner.on_lock_ended()
 
                 @method()
                 def Result(self, token: "s", payload: "s") -> None:
@@ -242,7 +256,9 @@ class KdeApps:
         text = _PRELUDE % {"service": json.dumps(bus.unique_name),
                            "token": json.dumps(token),
                            "path": json.dumps(OBJ_PATH),
-                           "iface": json.dumps(IFACE)} + _LOCK % {"id": wid}
+                           "iface": json.dumps(IFACE)} + _LOCK % {
+                               "id": wid, "path": json.dumps(OBJ_PATH),
+                               "iface": json.dumps(IFACE)}
         path = Path(tempfile.gettempdir()) / f"{LOCK_SCRIPT}.js"
         fut = asyncio.get_running_loop().create_future()
         self._waiting[token] = fut
@@ -262,11 +278,13 @@ class KdeApps:
         if r.get("error"):
             await self.drop_lock_script()
             raise ValueError(r["error"])
+        self._lock_token = token
         return r
 
     async def drop_lock_script(self):
         """Unloads the lock script, if loaded (also one a crashed agent
         left in KWin)."""
+        self._lock_token = None
         try:
             bus = await self._connect()
             await self._kwin(bus, "/Scripting", "org.kde.kwin.Scripting",

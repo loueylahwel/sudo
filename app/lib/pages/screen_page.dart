@@ -942,7 +942,8 @@ class _ScreenPageState extends State<ScreenPage>
         appBar: fullscreen
             ? null
             : AppBar(
-                title: const Text('Screen'),
+                // No title: with the lock, five actions leave it "S…".
+                titleSpacing: 0,
                 actions: [
                   // Hold-to-talk dictation. A GestureDetector (not IconButton) so
                   // long-press start/end drive listen/stop.

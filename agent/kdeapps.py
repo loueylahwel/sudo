@@ -100,6 +100,57 @@ def _window_id(window_id):
     return wid
 
 
+# Window lock (window.lock): stays loaded while the lock is on. The locked
+# window is kept above everything; a window that opens meanwhile opens
+# underneath it and doesn't keep the keyboard (a terminal or a debugger
+# popping up over a film). Reports the locked window once, at start.
+_LOCK = """\
+const wanted = %(id)s;
+const locked = wanted ? findWindow(wanted) : workspace.activeWindow;
+if (!locked || !locked.normalWindow) {
+    report({error: "no window to lock (click the window on the PC first)"});
+} else {
+    const prevAbove = locked.keepAbove;
+    let gone = false;
+    const fresh = new Set();
+    locked.keepAbove = true;
+    if (locked.minimized) locked.minimized = false;
+    workspace.activeWindow = locked;
+    locked.closed.connect(function () { gone = true; });
+    function tame(w) {
+        if (gone || !w || w === locked) return false;
+        if (!(w.normalWindow || w.dialog || w.utility)) return false;
+        if (w.keepAbove) w.keepAbove = false;
+        return true;
+    }
+    workspace.windowAdded.connect(function (w) {
+        if (!tame(w)) return;
+        fresh.add(w);
+        w.closed.connect(function () { fresh.delete(w); });
+        if (workspace.activeWindow === w) workspace.activeWindow = locked;
+    });
+    workspace.windowActivated.connect(function (w) {
+        // Only a new window's own first activation is undone: a window the
+        // user clicks on the PC gets the keyboard (it still stays under).
+        if (gone || !w || !fresh.has(w)) return;
+        fresh.delete(w);
+        workspace.activeWindow = locked;
+    });
+    report({id: String(locked.internalId), title: locked.caption,
+            prev_above: prevAbove});
+}
+"""
+
+# Undoes a lock: keepAbove back to what it was before.
+_UNLOCK = """\
+const w = findWindow(%(id)s);
+if (w) w.keepAbove = %(prev)s;
+report({ok: true, found: !!w});
+"""
+
+LOCK_SCRIPT = "sudo_agent_window_lock"
+
+
 class KdeApps:
     def __init__(self, monitors_fn=None):
         # monitors_fn: the agent's list_monitors (mss numbering) for the
@@ -177,6 +228,59 @@ class KdeApps:
             except Exception:
                 pass
             os.unlink(path)
+
+    # --------------------------------------------------------- window lock
+
+    async def lock_window(self, window_id=None):
+        """Loads the lock script (kept loaded until unlock_window) on
+        `window_id`, or on the active window. Returns {id, title,
+        prev_above}; raises ValueError when there is nothing to lock."""
+        await self.drop_lock_script()   # never two locks at once
+        bus = await self._connect()
+        token = secrets.token_hex(8)
+        wid = json.dumps(_window_id(window_id)) if window_id else "null"
+        text = _PRELUDE % {"service": json.dumps(bus.unique_name),
+                           "token": json.dumps(token),
+                           "path": json.dumps(OBJ_PATH),
+                           "iface": json.dumps(IFACE)} + _LOCK % {"id": wid}
+        path = Path(tempfile.gettempdir()) / f"{LOCK_SCRIPT}.js"
+        fut = asyncio.get_running_loop().create_future()
+        self._waiting[token] = fut
+        try:
+            path.write_text(text)
+            (script_id,) = await self._kwin(bus, "/Scripting", "org.kde.kwin.Scripting",
+                                            "loadScript", "ss", [str(path), LOCK_SCRIPT])
+            if script_id < 0:
+                raise RuntimeError("KWin refused the lock script")
+            await self._kwin(bus, f"/Scripting/Script{script_id}", "org.kde.kwin.Script", "run")
+            r = json.loads(await asyncio.wait_for(fut, SCRIPT_TIMEOUT))
+        except BaseException:
+            await self.drop_lock_script()
+            raise
+        finally:
+            self._waiting.pop(token, None)
+        if r.get("error"):
+            await self.drop_lock_script()
+            raise ValueError(r["error"])
+        return r
+
+    async def drop_lock_script(self):
+        """Unloads the lock script, if loaded (also one a crashed agent
+        left in KWin)."""
+        try:
+            bus = await self._connect()
+            await self._kwin(bus, "/Scripting", "org.kde.kwin.Scripting",
+                             "unloadScript", "s", [LOCK_SCRIPT])
+        except Exception:
+            pass
+
+    async def unlock_window(self, window_id, prev_above=False):
+        """Ends a lock: unloads its script and gives the window its own
+        keepAbove back."""
+        await self.drop_lock_script()
+        if window_id and _UUID.match(str(window_id)):
+            await self._script(_UNLOCK % {"id": json.dumps(str(window_id)),
+                                          "prev": "true" if prev_above else "false"})
 
     # ------------------------------------------------------------- windows
 

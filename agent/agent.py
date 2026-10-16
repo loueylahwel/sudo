@@ -2630,6 +2630,13 @@ class Agent:
         # period, left paused otherwise. The task is the pause in flight.
         self._pc_audio_paused = []
         self._pc_audio_pausing = None
+        # Window lock (window.lock, KDE): the locked window's {id, title,
+        # prev_above}, also in cfg[WINDOW_LOCK_KEY] while on, so a crashed
+        # agent's lock is undone by the next one. Released when no phone is
+        # left for WINDOW_LOCK_GRACE_S.
+        self._wlock = None
+        self._wlock_lock = asyncio.Lock()
+        self._wlock_grace = None
         # Remote access from outside the LAN (remote_access.RemoteAccess),
         # set up in run() for the embedded relay.
         self.remote = None
@@ -3463,6 +3470,114 @@ class Agent:
         await self._phone_audio_stop()
         await self._phone_change(self.phone.disable)
 
+    # ---- window lock (kdeapps.py _LOCK) ----
+
+    WINDOW_LOCK_KEY = "window_lock"
+    WINDOW_LOCK_GRACE_S = 20
+
+    def _wlock_status(self):
+        w = self._wlock
+        return {"locked": w is not None, "title": w["title"] if w else ""}
+
+    def _wlock_persist(self, value):
+        if value:
+            self.cfg[self.WINDOW_LOCK_KEY] = value
+        else:
+            self.cfg.pop(self.WINDOW_LOCK_KEY, None)
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+            if not isinstance(data, dict):
+                return
+            if value:
+                data[self.WINDOW_LOCK_KEY] = value
+            elif self.WINDOW_LOCK_KEY in data:
+                data.pop(self.WINDOW_LOCK_KEY)
+            else:
+                return
+            save_config(data)
+        except (OSError, ValueError) as e:
+            print(f"[agent] could not persist the window lock: {e}")
+
+    async def h_window_lock(self, msg):
+        """window.lock {on, window?}: on keeps the PC's active window (or
+        `window`, a wm.list id) above everything; windows that open
+        meanwhile open underneath it without taking the keyboard. Every
+        phone hears `window.lock` {locked, title}."""
+        if self.kde_apps is None:
+            raise ValueError("The window lock needs KDE Plasma on the PC "
+                             "for now")
+        on = bool(msg.get("on", True))
+        async with self._wlock_lock:
+            if on:
+                if self._wlock is not None:
+                    await self._wlock_release_locked()
+                r = await self.kde_apps.lock_window(msg.get("window") or None)
+                self._wlock = {"id": r["id"], "title": r.get("title") or "",
+                               "prev_above": bool(r.get("prev_above"))}
+                self._wlock_persist(self._wlock)
+                print(f"[agent] window lock: on ({self._wlock['title'][:80]})")
+            elif self._wlock is not None:
+                await self._wlock_release_locked()
+                print("[agent] window lock: off")
+        status = self._wlock_status()
+        asyncio.ensure_future(self._wlock_tell(status))
+        return status
+
+    async def h_window_lock_status(self, msg):
+        return self._wlock_status()
+
+    async def _wlock_tell(self, status):
+        try:
+            await self.send({"event": "window.lock", "data": status})
+        except Exception:
+            pass
+
+    async def _wlock_release_locked(self):
+        """With _wlock_lock held: undo the lock (script out, keepAbove back)."""
+        w, self._wlock = self._wlock, None
+        try:
+            if w is not None and self.kde_apps is not None:
+                await self.kde_apps.unlock_window(w["id"], w["prev_above"])
+        finally:
+            self._wlock_persist(None)
+
+    async def window_unlock(self, why):
+        async with self._wlock_lock:
+            if self._wlock is None:
+                return
+            await self._wlock_release_locked()
+        print(f"[agent] window lock: off ({why})")
+        await self._wlock_tell(self._wlock_status())
+
+    def _wlock_phones_changed(self):
+        """A phone left: with none left, the lock goes after a grace
+        period (a reconnect keeps it)."""
+        if self._wlock is None or self.known_clients:
+            return
+        if self._wlock_grace is None or self._wlock_grace.done():
+            self._wlock_grace = asyncio.create_task(self._wlock_grace_off())
+
+    async def _wlock_grace_off(self):
+        await asyncio.sleep(self.WINDOW_LOCK_GRACE_S)
+        if not self.known_clients:
+            await self.window_unlock("no phone connected")
+
+    async def restore_window_lock(self):
+        """Startup: a lock a previous agent left on (crash, kill) is undone."""
+        saved = self.cfg.get(self.WINDOW_LOCK_KEY)
+        if self.kde_apps is None:
+            return
+        await self.kde_apps.drop_lock_script()
+        if isinstance(saved, dict) and saved.get("id"):
+            try:
+                await self.kde_apps.unlock_window(saved["id"],
+                                                  bool(saved.get("prev_above")))
+                print("[agent] window lock left on by the last run: released")
+            except Exception as e:
+                print(f"[agent] couldn't release the last run's window lock: {e}")
+        if saved:
+            self._wlock_persist(None)
+
     # ---- the PC's sound on the phone (see pc_audio.py) ----
 
     # How long the sound stays routed to a phone whose socket went away: a
@@ -3838,6 +3953,8 @@ class Agent:
         "audio.start": h_audio_start,
         "audio.stop": h_audio_stop,
         "audio.status": h_audio_status,
+        "window.lock": h_window_lock,
+        "window.lock.status": h_window_lock_status,
         "audio.alive": h_audio_alive,
         "notify.subscribe": h_notify_subscribe,
     }
@@ -4241,6 +4358,7 @@ class Agent:
                 await self._phone_audio_stop()
             if client_id == self._pc_audio_client:
                 self._pc_audio_left()
+            self._wlock_phones_changed()
             if self.portal is not None and not self.known_clients and (
                     self._portal_idle_task is None
                     or self._portal_idle_task.done()):
@@ -4275,6 +4393,7 @@ class Agent:
         asyncio.create_task(self.restore_power_schedule())
         asyncio.create_task(self.restore_phone_audio())
         asyncio.create_task(self.restore_pc_audio())
+        asyncio.create_task(self.restore_window_lock())
         host = urlparse(self.cfg["relay"]).hostname
         if host in (None, "127.0.0.1", "localhost", "::1"):
             # Standalone: the relay is embedded — the phone connects straight
@@ -4293,6 +4412,11 @@ class Agent:
                     self.tunnel.stop()
                 if self.pc_audio is not None:
                     self.pc_audio.stop()  # the PC's sound back on the PC
+                try:
+                    await asyncio.wait_for(
+                        self.window_unlock("the agent stopped"), 3)
+                except BaseException:
+                    pass  # the next start releases it (restore_window_lock)
                 if self.remote is not None:
                     self.remote.stop()
             return

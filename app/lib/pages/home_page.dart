@@ -14,9 +14,8 @@ import '../tunnel.dart';
 import '../util.dart';
 import 'camera_page.dart';
 import 'files_page.dart';
-import 'phone_monitor_page.dart';
 import 'screen_page.dart';
-import 'window_switcher.dart';
+import 'terminal_page.dart';
 
 /// How a connect attempt reaches the PC: its LAN address, the router's
 /// forward of its TLS port (direct), its Cloudflare tunnel, or the USB
@@ -1605,19 +1604,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ),
             )
           : ListView(
-              padding: const EdgeInsets.all(16),
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
               children: [
                 _buildHeaderCard(device, statusText, online),
-                const SizedBox(height: 12),
-                _buildSysInfoCard(theme),
-                const SizedBox(height: 24),
-                Text('Control', style: theme.textTheme.titleMedium),
-                const SizedBox(height: 8),
+                const _SectionLabel('Control'),
                 Row(
                   children: [
                     Expanded(
                       child: _ControlCard(
-                        icon: Icons.monitor,
+                        icon: Icons.desktop_windows_outlined,
                         label: 'Screen',
                         onTap: () => _open(ScreenPage(client: _client!)),
                       ),
@@ -1625,7 +1620,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     const SizedBox(width: 8),
                     Expanded(
                       child: _ControlCard(
-                        icon: Icons.folder_open,
+                        icon: Icons.folder_outlined,
                         label: 'Files',
                         onTap: () => _open(FilesPage(client: _client!)),
                       ),
@@ -1633,40 +1628,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     const SizedBox(width: 8),
                     Expanded(
                       child: _ControlCard(
-                        icon: Icons.videocam,
+                        icon: Icons.videocam_outlined,
                         label: 'Camera',
                         onTap: () => _open(CameraPage(client: _client!)),
                       ),
                     ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                // Phone as a second monitor: one PC app (Discord, say) lives
-                // on a virtual screen only this phone sees, while the PC's
-                // own screen keeps showing whatever the PC user is doing.
-                Card(
-                  child: ListTile(
-                    leading: const Icon(Icons.phonelink, size: 32),
-                    title: const Text('Phone screen'),
-                    subtitle: const Text(
-                      'Open a PC app here while the PC shows something else',
-                    ),
-                    trailing: const Icon(Icons.chevron_right),
-                    onTap: () => _open(
-                      PhoneMonitorPage(
-                        client: _client!,
-                        onAddApp: _pickAppForPhone,
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _ControlCard(
+                        icon: Icons.terminal,
+                        label: 'Terminal',
+                        onTap: () => _open(TerminalPage(client: _client!)),
                       ),
                     ),
-                  ),
+                  ],
                 ),
-                const SizedBox(height: 24),
-                Text('Quick actions', style: theme.textTheme.titleMedium),
-                const SizedBox(height: 8),
+                const _SectionLabel('Now playing'),
                 _buildMediaCard(theme),
-                const SizedBox(height: 8),
-                _buildPcSoundCard(theme),
-                const SizedBox(height: 8),
+                const _SectionLabel('PC'),
                 _buildDisplayCard(theme),
                 const SizedBox(height: 8),
                 _buildClipboardCard(theme),
@@ -1677,109 +1656,163 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// The PC at a glance: connection state (with the way back in when it
+  /// is down), platform, route, and live CPU / RAM / uptime. Tapping it
+  /// refreshes the numbers.
   Widget _buildHeaderCard(SavedDevice device, String statusText, bool online) {
     final theme = Theme.of(context);
-    final platform = '${_sysInfo?['platform'] ?? ''}';
-    return Container(
-      decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFF0D9488), Color(0xFF22C55E)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(16),
-      ),
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.computer, color: Colors.white, size: 32),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  device.name.isEmpty ? device.code : device.name,
-                  style: theme.textTheme.titleLarge?.copyWith(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
-                  ),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              if (!online)
-                _reconnecting
-                    ? const SizedBox(
-                        width: 24,
-                        height: 24,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white70,
-                        ),
-                      )
-                    : Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          FilledButton.icon(
-                            onPressed: () => _connect(device),
-                            icon: const Icon(Icons.refresh, size: 18),
-                            label: const Text('Reconnect'),
-                            style: FilledButton.styleFrom(
-                              backgroundColor: Colors.white,
-                              foregroundColor: const Color(0xFF0D9488),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          // The way out when the saved address is hopeless
-                          // (e.g. new network): the plain PC search, no
-                          // deleting the saved device needed.
-                          OutlinedButton.icon(
-                            onPressed: _addDevice,
-                            icon: const Icon(Icons.wifi_find, size: 18),
-                            label: const Text('Find PC'),
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: Colors.white,
-                              side: const BorderSide(color: Colors.white70),
-                            ),
-                          ),
-                        ],
-                      ),
-            ],
+    final info = _sysInfo;
+    final accent = online
+        ? const Color(0xFF2DD4BF)
+        : _reconnecting
+        ? Colors.amberAccent
+        : Colors.white38;
+    final details = [
+      '${info?['platform'] ?? ''}',
+      _viaText ?? '',
+    ].where((t) => t.isNotEmpty).join('  ·  ');
+    final cpu = (info?['cpu_percent'] as num?)?.toDouble();
+    final memUsed = (info?['mem_used'] as num?)?.toDouble() ?? 0;
+    final memTotal = (info?['mem_total'] as num?)?.toDouble() ?? 0;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: online ? _refreshSysInfo : null,
+        borderRadius: BorderRadius.circular(20),
+        child: Ink(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [
+                const Color(0xFF0D9488).withValues(alpha: online ? 0.30 : 0.12),
+                const Color(0xFF0F0F0F),
+              ],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: accent.withValues(alpha: 0.35)),
           ),
-          const SizedBox(height: 12),
-          Row(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Icon(
-                Icons.circle,
-                size: 10,
-                color: online
-                    ? Colors.greenAccent
-                    : _reconnecting
-                    ? Colors.amberAccent
-                    : Colors.white38,
-              ),
-              const SizedBox(width: 8),
-              Text(statusText, style: const TextStyle(color: Colors.white70)),
-              if (platform.isNotEmpty) ...[
-                const Text('  ·  ', style: TextStyle(color: Colors.white38)),
-                Flexible(
-                  child: Text(
-                    platform,
-                    style: const TextStyle(color: Colors.white70),
-                    overflow: TextOverflow.ellipsis,
+              Row(
+                children: [
+                  Container(
+                    width: 48,
+                    height: 48,
+                    decoration: BoxDecoration(
+                      color: accent.withValues(alpha: 0.15),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(Icons.computer, color: accent),
                   ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(Icons.circle, size: 8, color: accent),
+                            const SizedBox(width: 6),
+                            Flexible(
+                              child: Text(
+                                statusText,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (details.isNotEmpty)
+                          Text(
+                            details,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.hintColor,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  if (online && _sysInfoLoading)
+                    const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  else if (!online && _reconnecting)
+                    const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.amberAccent,
+                      ),
+                    ),
+                ],
+              ),
+              if (!online && !_reconnecting) ...[
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: () => _connect(device),
+                        icon: const Icon(Icons.refresh, size: 18),
+                        label: const Text('Reconnect'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    // The way out when the saved address is hopeless
+                    // (e.g. new network): the plain PC search, no
+                    // deleting the saved device needed.
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _addDevice,
+                        icon: const Icon(Icons.wifi_find, size: 18),
+                        label: const Text('Find PC'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+              if (online && info != null) ...[
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _StatTile(
+                        label: 'CPU',
+                        value: cpu == null ? '?' : '${cpu.round()}%',
+                        fraction: cpu == null ? null : cpu / 100,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _StatTile(
+                        label: 'RAM',
+                        value: formatBytes(memUsed),
+                        fraction: memTotal > 0 ? memUsed / memTotal : null,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _StatTile(
+                        label: 'Up',
+                        value: formatUptime((info['uptime'] as num?) ?? 0),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ],
           ),
-          if (_viaText != null) ...[
-            const SizedBox(height: 6),
-            Text(
-              _viaText!,
-              style: const TextStyle(color: Colors.white54, fontSize: 12),
-            ),
-          ],
-        ],
+        ),
       ),
     );
   }
@@ -2012,6 +2045,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 ),
               ]),
             ],
+            const Divider(height: 16),
+            _buildPcSoundRow(theme),
           ],
         ),
       ),
@@ -2022,7 +2057,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// controls above (those still act on the PC's player). On, everything
   /// the PC plays comes out of this phone and the PC goes quiet; the sound
   /// follows reconnects by itself (see PcAudio).
-  Widget _buildPcSoundCard(ThemeData theme) {
+  Widget _buildPcSoundRow(ThemeData theme) {
     return ListenableBuilder(
       listenable: PcAudio.instance,
       builder: (context, _) {
@@ -2050,12 +2085,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         } else {
           subtitle = 'Plays what the PC plays. The PC goes quiet.';
         }
-        return Card(
-          clipBehavior: Clip.antiAlias,
-          child: SwitchListTile(
+        return SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
             secondary: Icon(
               audio.playing ? Icons.headphones : Icons.headphones_outlined,
-              size: 32,
+              color: audio.playing ? theme.colorScheme.primary : null,
             ),
             title: const Text('PC sound on this phone'),
             subtitle: Text(
@@ -2068,7 +2103,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             onChanged: canSwitch
                 ? (on) => unawaited(audio.setEnabled(on))
                 : null,
-          ),
         );
       },
     );
@@ -2234,75 +2268,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildSysInfoCard(ThemeData theme) {
-    final info = _sysInfo;
-    return Card(
-      // The whole card doubles as a refresh button (the icon stays too).
-      child: InkWell(
-        onTap: _refreshSysInfo,
-        borderRadius: BorderRadius.circular(12),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Text('System', style: theme.textTheme.titleMedium),
-                  const Spacer(),
-                  if (_sysInfoLoading)
-                    const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  else
-                    IconButton(
-                      tooltip: 'Refresh',
-                      icon: const Icon(Icons.refresh),
-                      onPressed: _refreshSysInfo,
-                    ),
-                ],
-              ),
-              if (info == null)
-                const Text('No data yet')
-              else ...[
-                _InfoRow('Name', '${info['name'] ?? '?'}'),
-                _InfoRow('Platform', '${info['platform'] ?? '?'}'),
-                _InfoRow(
-                  'CPU',
-                  '${(info['cpu_percent'] as num?)?.toStringAsFixed(0) ?? '?'}%',
-                  strong: true,
-                ),
-                _InfoRow(
-                  'RAM',
-                  '${formatBytes((info['mem_used'] as num?) ?? 0)} / '
-                      '${formatBytes((info['mem_total'] as num?) ?? 0)}',
-                  strong: true,
-                ),
-                _InfoRow('Uptime', formatUptime((info['uptime'] as num?) ?? 0)),
-              ],
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// "Add app" on the phone screen: the shared window switcher, picking a
-  /// window moves it onto the phone screen instead of focusing it on the PC.
-  Future<void> _pickAppForPhone(BuildContext context) {
-    final client = ClientRegistry.instance.client ?? _client;
-    if (client == null) return Future.value();
-    return showWindowSwitcher(
-      context,
-      client,
-      title: 'Show on phone',
-      allowLaunch: false,
-      onPick: (w) => client.request('phone.move', {'window': w['id']}),
-    );
-  }
-
   Future<void> _open(Widget page) async {
     if (_client == null || !_socketUp) {
       showMessage(context, 'Not connected');
@@ -2328,18 +2293,31 @@ class _ControlCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Card(
+      margin: EdgeInsets.zero,
+      clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(12),
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 24),
+          padding: const EdgeInsets.symmetric(vertical: 16),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: 40),
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.primary.withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Icon(icon, color: theme.colorScheme.primary),
+              ),
               const SizedBox(height: 8),
-              Text(label, style: Theme.of(context).textTheme.titleSmall),
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(label, style: theme.textTheme.labelLarge),
+              ),
             ],
           ),
         ),
@@ -2348,35 +2326,75 @@ class _ControlCard extends StatelessWidget {
   }
 }
 
-class _InfoRow extends StatelessWidget {
-  const _InfoRow(this.label, this.value, {this.strong = false});
+/// A small heading between the dashboard's groups.
+class _SectionLabel extends StatelessWidget {
+  const _SectionLabel(this.text);
 
-  final String label;
-  final String value;
-
-  /// Renders the value with slightly stronger typography (used for the
-  /// live CPU/RAM numbers).
-  final bool strong;
+  final String text;
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
+      padding: const EdgeInsets.fromLTRB(4, 20, 4, 8),
+      child: Text(
+        text.toUpperCase(),
+        style: theme.textTheme.labelMedium?.copyWith(
+          color: theme.hintColor,
+          letterSpacing: 1.2,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+}
+
+/// One live number in the header (CPU, RAM, uptime), with a thin bar when
+/// it is a share of something.
+class _StatTile extends StatelessWidget {
+  const _StatTile({required this.label, required this.value, this.fraction});
+
+  final String label;
+  final String value;
+  final double? fraction;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.04),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(
-            width: 80,
-            child: Text(
-              label,
-              style: TextStyle(color: Theme.of(context).hintColor),
-            ),
-          ),
-          Expanded(
+          Text(label,
+              style: theme.textTheme.labelSmall
+                  ?.copyWith(color: theme.hintColor)),
+          const SizedBox(height: 2),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
             child: Text(
               value,
-              style: strong
-                  ? const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)
-                  : null,
+              style: theme.textTheme.titleSmall
+                  ?.copyWith(fontWeight: FontWeight.w600),
+            ),
+          ),
+          const SizedBox(height: 6),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(2),
+            child: LinearProgressIndicator(
+              value: (fraction ?? 0).clamp(0.0, 1.0),
+              minHeight: 3,
+              backgroundColor: Colors.white.withValues(alpha: 0.06),
+              color: fraction == null
+                  ? Colors.transparent
+                  : (fraction! > 0.85
+                      ? Colors.redAccent
+                      : theme.colorScheme.primary),
             ),
           ),
         ],

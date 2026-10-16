@@ -8,6 +8,7 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
@@ -32,16 +33,34 @@ import java.util.concurrent.TimeUnit
  *  - the track only starts once `target` ms are buffered, and when it runs
  *    dry it pauses and rebuffers to `target` instead of stuttering along on
  *    whatever trickles in;
- *  - `target` adapts to the link: +40 ms per rebuffer (max 400), -20 ms
- *    after 30 s without one (min 80);
+ *  - `target` adapts to the link. It starts at 80 ms: on a home Wi-Fi the
+ *    packets leave the PC within ~5 ms of their schedule and the Wi-Fi adds
+ *    a few tens, while the old 150 (and the 230 two rebuffers made of it)
+ *    was most of the ~400 ms the sound lagged. A rebuffer raises it by
+ *    40 ms, and at least to the longest gap between two packets of the
+ *    last ~10 s + 20 ms, so a clumpy link (the tunnel on mobile data) gets
+ *    what it needs in one step instead of a rebuffer per 40 ms (max 400).
+ *    It comes down 20 ms every 10 s (min 50) once the cushion stayed above
+ *    40 ms for three minutes without a rebuffer, and as long as it keeps
+ *    doing so: a link that nearly ran dry in the last three minutes keeps
+ *    its target (simulated: with a one-minute memory the target decays
+ *    between two Wi-Fi hiccups and rebuffers on the next one, twice as
+ *    often as the old rules did);
  *  - latency stays bounded: above target + 300 ms (the burst after a stall)
  *    the decoded sound is dropped until it is back near target, and a
- *    cushion that stayed more than 60 ms above target for 3 s straight is
+ *    cushion that stayed more than 40 ms above target for 3 s straight is
  *    trimmed the same way. One skip beats lagging behind the PC's picture
  *    for the rest of the session.
  * Every packet is decoded, even when its sound is then dropped: Opus
  * carries state from packet to packet, and skipping input would garble
  * the sound after the gap.
+ *
+ * The track asks for Android's low-latency output (API 26+). A plain music
+ * track goes to the power-saving "deep buffer" output on many phones,
+ * which holds tens to over a hundred ms more below the playback head, out
+ * of reach of every rule above. A phone that doesn't grant it plays the
+ * track as a normal one ([stats] says which: perf_mode, and out_ms, the
+ * whole delay from write to speaker).
  *
  * Audio focus: it asks for the focus like any music app. Another app taking
  * it for good (the user starts music on the phone) ends the session through
@@ -96,6 +115,24 @@ class OpusPlayer(context: Context) {
     @Volatile private var statUnderruns = 0
     @Volatile private var statCodecErrors = 0
     @Volatile private var statLastError: String? = null
+    // For tuning the targets from the PC's log: the delay from write to the
+    // speaker (AudioTimestamp; cushion + the mixer and driver below it), the
+    // performance mode Android granted (1 = low latency, 0 = none, -1 =
+    // can't tell before API 26), the mixer's own underrun count, the lowest
+    // cushion of the last 10 s period (0 after an underrun), and the
+    // trims/drops.
+    @Volatile private var statOutMs = -1L
+    @Volatile private var statPerfMode = -1
+    @Volatile private var statTrackUnderruns = 0
+    @Volatile private var statFloorMs = -1L
+    @Volatile private var statTrims = 0
+    // Packet arrivals ([write], main thread): the longest gap between two
+    // in the current and the previous GAP_WINDOW_MS window. Read by the
+    // player thread (the target after a rebuffer) and [stats].
+    @Volatile private var lastPacketAt = 0L
+    @Volatile private var gapWindowAt = 0L
+    @Volatile private var gapMaxNow = 0L
+    @Volatile private var gapMaxBefore = 0L
     private var focusRequest: AudioFocusRequest? = null
 
     private val attributes = AudioAttributes.Builder()
@@ -128,6 +165,8 @@ class OpusPlayer(context: Context) {
      */
     fun start() {
         if (running) return
+        // First: newTrack notes what it couldn't set up in statLastError.
+        resetStats()
         val track = newTrack()
         val codec = try {
             newDecoder()
@@ -144,15 +183,6 @@ class OpusPlayer(context: Context) {
         muted = false
         ducked = false
         packets.clear()
-        statIn = 0
-        statDecoded = 0
-        statWrittenMs = 0
-        statPlaying = false
-        statFlowing = false
-        statStalls = 0
-        statUnderruns = 0
-        statCodecErrors = 0
-        statLastError = null
         val id = session + 1
         session = id
         running = true
@@ -170,9 +200,25 @@ class OpusPlayer(context: Context) {
     fun write(packet: ByteArray) {
         if (!running) return
         statIn++
+        noteArrival(SystemClock.elapsedRealtime())
         // A stalled player thread must not hoard memory: keep the newest.
         while (!packets.offer(packet)) packets.poll()
     }
+
+    /** [write]'s thread only: keeps the longest recent gap between packets. */
+    private fun noteArrival(now: Long) {
+        val last = lastPacketAt
+        lastPacketAt = now
+        if (now - gapWindowAt >= GAP_WINDOW_MS) {
+            gapMaxBefore = gapMaxNow
+            gapMaxNow = 0
+            gapWindowAt = now
+        }
+        if (last != 0L && now - last > gapMaxNow) gapMaxNow = now - last
+    }
+
+    /** The longest gap between two packets in the last 5-10 s. */
+    private fun recentGapMs(): Long = maxOf(gapMaxNow, gapMaxBefore)
 
     /** What the player is doing, for the PC's log (see the stat fields). */
     fun stats(): Map<String, Any?> = mapOf(
@@ -185,7 +231,13 @@ class OpusPlayer(context: Context) {
         "stalls" to statStalls,
         "cushion_ms" to statCushionMs,
         "target_ms" to statTargetMs,
+        "floor_ms" to statFloorMs,
+        "out_ms" to statOutMs,
+        "gap_max_ms" to recentGapMs(),
         "underruns" to statUnderruns,
+        "track_underruns" to statTrackUnderruns,
+        "trims" to statTrims,
+        "perf_mode" to statPerfMode,
         "codec_errors" to statCodecErrors,
         "last_error" to statLastError,
         "muted" to muted,
@@ -193,6 +245,29 @@ class OpusPlayer(context: Context) {
         "volume" to audioManager.getStreamVolume(AudioManager.STREAM_MUSIC),
         "volume_max" to audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
     )
+
+    private fun resetStats() {
+        statIn = 0
+        statDecoded = 0
+        statWrittenMs = 0
+        statPlaying = false
+        statFlowing = false
+        statStalls = 0
+        statCushionMs = 0
+        statTargetMs = 0
+        statUnderruns = 0
+        statCodecErrors = 0
+        statLastError = null
+        statOutMs = -1
+        statPerfMode = -1
+        statTrackUnderruns = 0
+        statFloorMs = -1
+        statTrims = 0
+        lastPacketAt = 0
+        gapWindowAt = 0
+        gapMaxNow = 0
+        gapMaxBefore = 0
+    }
 
     /** Stops playing and gives the audio focus back. Idempotent. */
     fun stop() {
@@ -250,7 +325,20 @@ class OpusPlayer(context: Context) {
         }
     }
 
+    /** The low-latency track where Android has one (see the class comment),
+     * else a normal one. */
     private fun newTrack(): AudioTrack {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                return buildTrack(lowLatency = true)
+            } catch (e: Exception) {
+                statLastError = "low-latency track: ${e.message}"
+            }
+        }
+        return buildTrack(lowLatency = false)
+    }
+
+    private fun buildTrack(lowLatency: Boolean): AudioTrack {
         val format = AudioFormat.Builder()
             .setSampleRate(SAMPLE_RATE)
             .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
@@ -260,16 +348,26 @@ class OpusPlayer(context: Context) {
             SAMPLE_RATE, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT,
         )
         // ~1 s: room for the largest cushion (400 ms target + 300 ms burst)
-        // so a write never has to wait for the speaker.
-        val track = AudioTrack.Builder()
+        // so a write never has to wait for the speaker. A low-latency track
+        // may be that big: the latency is what it holds, not its capacity.
+        val builder = AudioTrack.Builder()
             .setAudioAttributes(attributes)
             .setAudioFormat(format)
             .setBufferSizeInBytes(maxOf(min, SAMPLE_RATE * BYTES_PER_FRAME))
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
+        if (lowLatency && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+        }
+        val track = builder.build()
         if (track.state != AudioTrack.STATE_INITIALIZED) {
             track.release()
             throw IllegalStateException("The phone's audio output didn't open")
+        }
+        // What Android granted: it may hand out a normal track instead.
+        statPerfMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            track.performanceMode
+        } else {
+            -1
         }
         // By default the mixer starts a track only once its WHOLE buffer is
         // full (1 s here), and disables it after ~1 s of waiting. The
@@ -344,12 +442,23 @@ class OpusPlayer(context: Context) {
         private var headAtPlay = 0L
         private var playAt = 0L
         private var targetMs = START_TARGET_MS
-        private var targetChangedAt = SystemClock.elapsedRealtime()
+        // Rebuffering after an underrun (not the first fill): the target
+        // also follows the gap that caused it (raiseForGap).
+        private var rebuffering = false
+        // The calm rule: the lowest cushion of each of the last
+        // FLOOR_PERIODS periods of CALM_PERIOD_MS, counted since the target
+        // last went up.
+        private val floors = LongArray(FLOOR_PERIODS)
+        private var periods = 0
+        private var periodStart = SystemClock.elapsedRealtime()
+        private var periodMinMs = Long.MAX_VALUE
         // Throwing decoded sound away until the cushion is back near target.
         private var dropping = false
         // Lowest cushion seen in the current trim window.
         private var windowStart = 0L
         private var windowMinMs = Long.MAX_VALUE
+        private val timestamp = AudioTimestamp()
+        private var measuredAt = 0L
         private var volume = 1f
         private var codecFailures = 0
 
@@ -460,6 +569,7 @@ class OpusPlayer(context: Context) {
                 dropping = false
             } else if (playing && flowing && cushion > targetMs + MAX_ABOVE_TARGET_MS) {
                 dropping = true
+                statTrims++
                 return
             }
             pcm.position(offset)
@@ -468,10 +578,36 @@ class OpusPlayer(context: Context) {
             if (written > 0) framesWritten += written / BYTES_PER_FRAME
             if (written < 0) statLastError = "AudioTrack.write error $written"
             statWrittenMs = framesWritten * 1000 / SAMPLE_RATE
-            // Buffered enough (or the track is full): go.
-            if (!playing && (cushionMs() >= targetMs || written < size)) {
-                startTrack()
+            if (!playing) {
+                if (rebuffering) raiseForGap()
+                // Buffered enough (or the track is full): go.
+                if (cushionMs() >= targetMs || written < size) {
+                    rebuffering = false
+                    startTrack()
+                }
             }
+        }
+
+        /**
+         * Rebuffering after an underrun: the target becomes at least the
+         * longest recent gap between packets + GAP_MARGIN_MS (by now the
+         * packets that ended the hole are in, so it is counted). A gap over
+         * MAX_TARGET_MS is an outage (a reconnect), not jitter: no cushion
+         * rides that out, so it leaves the target alone.
+         */
+        private fun raiseForGap() {
+            val gap = recentGapMs()
+            if (gap > MAX_TARGET_MS) return
+            val wanted = minOf(MAX_TARGET_MS, gap + GAP_MARGIN_MS)
+            if (wanted > targetMs) raiseTarget(wanted, SystemClock.elapsedRealtime())
+        }
+
+        private fun raiseTarget(value: Long, now: Long) {
+            targetMs = value
+            statTargetMs = value
+            periods = 0
+            periodStart = now
+            periodMinMs = Long.MAX_VALUE
         }
 
         private fun startTrack() {
@@ -486,7 +622,8 @@ class OpusPlayer(context: Context) {
         }
 
         /** Underrun -> pause and rebuffer with a bigger target; a calm link
-         * lowers the target; a cushion that stays too deep gets trimmed. */
+         * lowers the target; a cushion that stays too deep gets trimmed.
+         * Rules and numbers: the class comment. */
         private fun watchCushion() {
             if (!playing) return
             val now = SystemClock.elapsedRealtime()
@@ -509,25 +646,57 @@ class OpusPlayer(context: Context) {
                 }
                 return
             }
+            measureOutput(now)
             if (cushion < UNDERRUN_MS && packets.isEmpty()) {
                 track.pause()
                 playing = false
                 statPlaying = false
                 statUnderruns++
+                statFloorMs = 0
                 dropping = false
-                targetMs = minOf(MAX_TARGET_MS, targetMs + TARGET_UP_MS)
-                targetChangedAt = now
+                rebuffering = true
+                raiseTarget(minOf(MAX_TARGET_MS, targetMs + TARGET_UP_MS), now)
                 return
             }
-            if (now - targetChangedAt >= CALM_PERIOD_MS && targetMs > MIN_TARGET_MS) {
-                targetMs = maxOf(MIN_TARGET_MS, targetMs - TARGET_DOWN_MS)
-                targetChangedAt = now
+            periodMinMs = minOf(periodMinMs, cushion)
+            if (now - periodStart >= CALM_PERIOD_MS) {
+                floors[periods % FLOOR_PERIODS] = periodMinMs
+                periods++
+                statFloorMs = periodMinMs
+                // Calm for FLOOR_PERIODS periods in a row, and the cushion
+                // never came near running dry in any of them: one step down.
+                val floor = floors.minOrNull() ?: 0L
+                if (periods >= FLOOR_PERIODS && targetMs > MIN_TARGET_MS &&
+                    floor >= TARGET_DOWN_MS + FLOOR_MARGIN_MS
+                ) {
+                    targetMs = maxOf(MIN_TARGET_MS, targetMs - TARGET_DOWN_MS)
+                }
+                periodStart = now
+                periodMinMs = Long.MAX_VALUE
             }
             windowMinMs = minOf(windowMinMs, cushion)
             if (now - windowStart >= TRIM_WINDOW_MS) {
-                if (windowMinMs > targetMs + TRIM_ABOVE_TARGET_MS) dropping = true
+                if (windowMinMs > targetMs + TRIM_ABOVE_TARGET_MS) {
+                    dropping = true
+                    statTrims++
+                }
                 restartWindow(now)
             }
+        }
+
+        /** out_ms (write -> speaker) and the mixer's underrun count, for
+         * [stats]; once a second (getTimestamp isn't free). */
+        private fun measureOutput(now: Long) {
+            if (now - measuredAt < MEASURE_EVERY_MS) return
+            measuredAt = now
+            statTrackUnderruns = track.underrunCount
+            if (!track.getTimestamp(timestamp)) return
+            // The frame at the speaker at nanoTime, moved on to now. Its low
+            // 32 bits wrap like the head's.
+            val ageNs = System.nanoTime() - timestamp.nanoTime
+            val presented = timestamp.framePosition + ageNs * SAMPLE_RATE / 1_000_000_000L
+            val frames = (framesWritten - presented) and 0xFFFFFFFFL
+            if (frames <= Int.MAX_VALUE) statOutMs = frames * 1000 / SAMPLE_RATE
         }
 
         private fun restartWindow(now: Long) {
@@ -561,25 +730,40 @@ class OpusPlayer(context: Context) {
         const val CHANNELS = 2
         const val BYTES_PER_FRAME = CHANNELS * 2
         const val FRAME_US = 20_000L
-        // The agent's libopus encoder delay at 48 kHz.
-        const val PRE_SKIP = 312
+        // The agent's libopus encoder delay at 48 kHz: 120 since it encodes
+        // with RESTRICTED_LOWDELAY (agent/pc_audio.py), 312 before. Only the
+        // first samples of a session depend on it: an older agent's extra
+        // 4 ms of encoder priming (near silence) play, nothing else changes.
+        const val PRE_SKIP = 120
         const val SEEK_PREROLL_NS = 80_000_000L
         // libopus never makes a packet bigger than the agent's 4000 B buffer.
         const val MAX_PACKET_BYTES = 8192
         // 2 s of packets; only reached when the player thread is stuck.
         const val MAX_QUEUED_PACKETS = 100
 
-        const val START_TARGET_MS = 150L
-        const val MIN_TARGET_MS = 80L
+        // The jitter buffer (class comment). 50 at least: packets come 20 ms
+        // at a time and the head moves in mixer bursts.
+        const val START_TARGET_MS = 80L
+        const val MIN_TARGET_MS = 50L
         const val MAX_TARGET_MS = 400L
         const val TARGET_UP_MS = 40L
+        const val GAP_MARGIN_MS = 20L
         const val TARGET_DOWN_MS = 20L
-        const val CALM_PERIOD_MS = 30_000L
+        // One step down per period, once FLOOR_PERIODS of them in a row
+        // (3 min) kept the cushion FLOOR_MARGIN_MS above the step: a Wi-Fi
+        // that hiccups every minute or two keeps the target that rides its
+        // hiccups out, instead of rebuffering on every other one.
+        const val CALM_PERIOD_MS = 10_000L
+        const val FLOOR_PERIODS = 18
+        const val FLOOR_MARGIN_MS = 20L
         const val MAX_ABOVE_TARGET_MS = 300L
         const val RESUME_ABOVE_TARGET_MS = 20L
         const val TRIM_WINDOW_MS = 3_000L
-        const val TRIM_ABOVE_TARGET_MS = 60L
+        const val TRIM_ABOVE_TARGET_MS = 40L
         const val UNDERRUN_MS = 5L
+        // Packet gaps are kept per window of this (the last 5-10 s count).
+        const val GAP_WINDOW_MS = 5_000L
+        const val MEASURE_EVERY_MS = 1_000L
         // 20 ms: the mixer may start the track as soon as it holds this.
         const val START_THRESHOLD_FRAMES = SAMPLE_RATE / 50
         // A played track whose head hasn't moved after this is stuck.

@@ -158,14 +158,29 @@ exactly what they always got.
 | `balanced` | 1280 | 70 | 20 | 4:2:0 |
 | `hd` | native | 80 | 24 | 4:2:0 |
 | `max` | native | 90 | 30 | 4:4:4 (crisp coloured text) |
-| `auto` | starts at 1280 | starts at 70 | 20 | 4:2:0 |
+| `auto` | starts at 1280 (internet: 800) | starts at 70 (internet: 50) | 20 | 4:2:0 |
 
-`auto` adapts per client: when that phone's link backs up (the stream
-spent over 60% of the last 2 s blocked sending to it, or waiting for acks
-while they come back late, or its socket is congested) it steps down a rung of 1280/q70 → 1120/q62 → 960/q55 →
-800/q50 → 640/q45, at most one rung per second, and back up one rung
-after ~6 s (and 20+ frames) under 25%. Pinning `quality` or `max_width`
-alongside `auto` turns the adaptation off (reported as preset `custom`).
+`auto` adapts per client along the rungs 1280/q70 → 1120/q62 → 960/q55 →
+800/q50 → 640/q45 → 480/q40 → 360/q35. A phone on the LAN starts on the
+top rung; one connected from the internet (router forward or tunnel)
+starts on 800/q50, so the first frames don't take seconds on mobile data.
+Two rules step it down:
+
+- **Busy:** the stream spent over 60% of the last 2 s blocked sending to
+  the phone, waiting for acks while they come back late, or with its
+  socket congested: one rung down, at most one per second, never under
+  640/q45.
+- **Bandwidth** (with `ack`): the delivery rate measured from the acks,
+  divided by the current rung's frame size, says the link carries under
+  12 frames/s while it is the link that sets the pace: straight down to
+  the biggest rung that carries 16, several rungs at once if need be, at
+  most once per round trip. This is what reaches 480 and 360.
+
+It steps back up one rung after ~6 s (and 20+ frames) under 25% busy, and
+only to a rung the measured rate would still carry at 20 frames/s. The
+`stream:` line in the agent's log shows the estimate (`rate … Mbit/s`).
+Pinning `quality` or `max_width` alongside `auto` turns the adaptation
+off (reported as preset `custom`).
 
 `"primary"` is the monitor whose rect starts at (0,0). The monitor list is
 re-queried on every `screen.start` (displays can be added at runtime), so

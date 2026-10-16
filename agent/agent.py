@@ -411,9 +411,20 @@ SCREEN_PRESETS = {
 SCREEN_DEFAULTS = {"fps": 10, "quality": 50, "max_width": 960,
                    "subsampling": "420"}
 # `auto` (width, quality) rungs, lowest first. It starts on the top rung
-# (= balanced) and walks down when the client's link backs up, back up
-# after AUTO_UP_AFTER seconds of headroom.
-AUTO_LADDER = [(640, 45), (800, 50), (960, 55), (1120, 62), (1280, 70)]
+# (= balanced) for phones on the LAN, on AUTO_START_INTERNET for phones
+# from the internet, walks down when the client's link backs up or can't
+# carry the frames, and back up after AUTO_UP_AFTER seconds of headroom.
+# The two rungs under 640w are for mobile data at 1-2 Mbit/s, where even a
+# 640w frame takes 150 ms to arrive.
+AUTO_LADDER = [(360, 35), (480, 40), (640, 45), (800, 50), (960, 55),
+               (1120, 62), (1280, 70)]
+# 800w: a 1280w frame (60-150 KB) takes a second on 1 Mbit/s mobile data,
+# so internet phones start mid-ladder and climb once the link shows it can.
+AUTO_START_INTERNET = 3
+# Queueing alone (the busy rule below) never takes the stream under 640w,
+# the ladder's floor before the small rungs: those are for links whose
+# measured rate can't carry 640w (the bandwidth rule).
+AUTO_BUSY_FLOOR = 2
 # The link is judged by how much of the last AUTO_BUSY_WINDOW seconds the
 # stream spent blocked in sends — not by single sends: the kernel absorbs a
 # send buffer's worth instantly and then blocks for seconds, so a saturated
@@ -422,12 +433,26 @@ AUTO_BUSY_WINDOW = 2.0
 AUTO_DOWN_BUSY = 0.6   # blocked >60% of the window: step a rung down
 AUTO_UP_BUSY = 0.25    # under 25% for AUTO_UP_AFTER s (and 20+ frames): up
 AUTO_UP_AFTER = 6.0
+# Bandwidth rule (ScreenStreamer._rate_sample / _check_rate): on a slow
+# link one big frame's transfer IS most of the round trip, so nothing looks
+# queued and the busy rule never fires. The frames/s the link carries at a
+# rung = measured delivery rate / that rung's frame size. Under
+# AUTO_MIN_FPS while the link sets the pace, jump down to the biggest rung
+# that carries AUTO_TARGET_FPS; step up only to a rung that would still
+# carry AUTO_UP_FPS. AUTO_RATE_WINDOW: seconds of streaming (idle time
+# doesn't count) the delivery-rate max filter remembers.
+AUTO_MIN_FPS = 12
+AUTO_TARGET_FPS = 16
+AUTO_UP_FPS = 20
+AUTO_RATE_WINDOW = 3.0
 SUBSAMPLING = {"420": 2, "422": 1, "444": 0}  # PIL's values for each
 
 
-def screen_settings(msg, native_width):
+def screen_settings(msg, native_width, internet=False):
     """Effective JPEG stream settings for a screen.start message: the preset
     (or the legacy defaults without one), explicit params on top, clamped.
+    `internet`: the phone connects from outside the LAN, so `auto` starts on
+    AUTO_START_INTERNET instead of the top rung (`level`).
     Raises ValueError for an unknown preset or subsampling."""
     preset = str(msg.get("preset") or "").lower() or None
     explicit = {k: msg[k] for k in ("fps", "quality", "max_width",
@@ -436,6 +461,7 @@ def screen_settings(msg, native_width):
     if preset is None:
         base = dict(SCREEN_DEFAULTS)
     elif preset == "auto":
+        # The top rung is the cap the ladder climbs to, wherever it starts.
         width, quality = AUTO_LADDER[-1]
         base = {"fps": SCREEN_PRESETS["balanced"]["fps"], "quality": quality,
                 "max_width": width, "subsampling": "420"}
@@ -460,6 +486,7 @@ def screen_settings(msg, native_width):
         "max_width": min(width, native_width),  # never upscale
         "subsampling": sub,
         "adaptive": adaptive,
+        "level": AUTO_START_INTERNET if internet else len(AUTO_LADDER) - 1,
     }
 
 
@@ -527,7 +554,9 @@ class ScreenStreamer:
         # base round trip (frames queueing). See _rtt_sample.
         self._window = self.MIN_UNACKED
         self._window_at = 0.0
-        self._sent_at = deque()      # send times of frames not acked yet
+        # Frames sent and not acked yet, oldest first: _Sent records (send
+        # time, bytes, and the delivery state when it left, for the rate).
+        self._sent_at = deque()
         # The oldest _sent_at entries written off after ACK_TIMEOUT: their
         # acks still come (a stalled mobile link delivers them late) and
         # are absorbed, never paired with newer frames.
@@ -539,6 +568,21 @@ class ScreenStreamer:
         self._rtts = deque()         # (time, seconds) ack round trips
         self._min_rtt = None         # base round trip, last RTT_WINDOW s
         self._srtt = None            # smoothed round trip
+        self._queue = 0.0            # frames queued on the route (Vegas)
+        # Delivery rate (see _rate_sample): bytes acked so far, when the
+        # last ack came (or the send that restarted an empty pipe), the
+        # send time of the newest frame acked, the streaming clock samples
+        # age on, and the max filter's samples / its value (bytes/s).
+        self._delivered = 0
+        self._delivered_at = 0.0
+        self._first_sent_at = 0.0
+        self._last_ack = None
+        self._flight_acked = False   # an ack came since the pipe was empty
+        self._limited_since = None   # acks link-limited since (_check_rate)
+        self._late = False           # acks written off, not caught up yet
+        self._active = 0.0
+        self._rates = deque()        # (active time, bytes/s), max first
+        self._rate = None
         # Probing the base round trip (see _rtt_sample): when the next
         # probe is due, and the window to go back to after one.
         self._probe_at = time.monotonic() + self.PROBE_EVERY
@@ -561,7 +605,9 @@ class ScreenStreamer:
         self._enc_pool = ThreadPoolExecutor(1, "sudo-screen-encode")
         self._errors = 0
         # auto preset state: current AUTO_LADDER rung + link bookkeeping
-        self._level = len(AUTO_LADDER) - 1
+        self._level = settings.get("level", len(AUTO_LADDER) - 1)
+        self._size = None            # average frame bytes at this rung
+        self._size_fresh = False     # _size is a guess (see _set_level)
         self._sends = deque()        # (end time, seconds blocked) per frame
         self._good_since = time.monotonic()
         self._good_frames = 0
@@ -615,16 +661,171 @@ class ScreenStreamer:
             self._stale_acks = 0
         if self._written_off > 0:
             # A frame written off after ACK_TIMEOUT: already out of
-            # _outstanding, and its round trip includes the stall.
+            # _outstanding, and its round trip includes the stall. Its bytes
+            # did arrive, so they count towards the delivery rate: on a link
+            # too slow for its frames, late acks are all there is.
             self._written_off -= 1
             if self._sent_at:
-                self._sent_at.popleft()
+                self._rate_sample(self._sent_at.popleft(), now)
+                self._check_rate(now)
             return
         if self._sent_at:
-            self._rtt_sample(now - self._sent_at.popleft(), now)
+            self._late = False  # caught up: every written-off ack is in
+            sent = self._sent_at.popleft()
+            self._rtt_sample(now - sent.t, now)
+            self._rate_sample(sent, now)
+            self._check_rate(now)
         if self._outstanding > 0:
             self._outstanding -= 1
         self._ack_event.set()
+
+    class _Sent:
+        """One frame on its way: when it went out, its size, and the
+        delivery state then (see _rate_sample). `limited`: it filled the
+        window, so its ack measures the link, not how often the screen
+        changes."""
+        __slots__ = ("t", "size", "delivered", "delivered_at",
+                     "first_sent", "limited")
+
+        def __init__(self, t, size, delivered, delivered_at, first_sent,
+                     limited):
+            self.t = t
+            self.size = size
+            self.delivered = delivered
+            self.delivered_at = delivered_at
+            self.first_sent = first_sent
+            self.limited = limited
+
+    def _sent(self, t, size):
+        """A frame of `size` bytes goes out now (t): its _Sent record. An
+        empty pipe restarts the delivery clock, so the idle time before
+        this frame doesn't count as slow delivery. Frames sent before the
+        first ack of such a fresh flight don't count as filling the window
+        (as in BBR): their samples include the trip of the flight's first
+        frame into the empty route, not just the link's pace."""
+        if not self._sent_at:
+            self._delivered_at = self._first_sent_at = t
+            self._flight_acked = False
+        return self._Sent(t, size, self._delivered, self._delivered_at,
+                          self._first_sent_at,
+                          self._outstanding >= self._window
+                          and self._flight_acked and not self.probing(t))
+
+    # Shortest interval a delivery-rate sample may span: under it, timer
+    # noise dominates.
+    RATE_MIN_INTERVAL = 0.005
+    # The clock the rate filter ages on runs only while frames fill the
+    # window, and by at most this much between two acks (a stall).
+    RATE_IDLE_STEP = 0.5
+
+    def _rate_sample(self, sent, now):
+        """One acked frame's delivery-rate sample, as BBR takes them: the
+        bytes acked from the last ack before the frame went out up to its
+        own ack, over that time — or over the time those bytes took to send,
+        if longer, so acks arriving in a bunch can't fake a fast link.
+        Frame sizes are taken at send time.
+
+        The estimate (self._rate, bytes/s) is the max over the last
+        AUTO_RATE_WINDOW s of window-limited streaming. Only frames that
+        filled the window set it and age it: a frame sent into an idle link
+        (the screen changed once) measures the round trip more than the
+        link, so such samples may only raise it, and a still or quiet
+        screen, however long, never makes the link look slow. A stall
+        (acks late, see _acks_late) only lowers samples, which the max
+        ignores while faster ones are fresh."""
+        self._delivered += sent.size
+        limited = sent.limited
+        if limited and self._last_ack is not None:
+            self._active += min(now - self._last_ack, self.RATE_IDLE_STEP)
+        self._last_ack = now
+        self._delivered_at = now
+        self._first_sent_at = sent.t
+        self._flight_acked = True
+        interval = max(now - sent.delivered_at, sent.t - sent.first_sent)
+        if interval < self.RATE_MIN_INTERVAL:
+            return
+        rate = (self._delivered - sent.delivered) / interval
+        rates = self._rates
+        while rates and self._active - rates[0][0] > AUTO_RATE_WINDOW:
+            rates.popleft()
+        if limited or not rates or rate > rates[0][1]:
+            # Monotonic deque: an older sample at or below a newer one can
+            # never be the max again.
+            while rates and rates[-1][1] <= rate:
+                rates.pop()
+            rates.append((self._active, rate))
+        self._rate = rates[0][1] if rates else None
+
+    def _link_fps(self, level=None):
+        """Frames/s the link carries at `level` (default: the current rung):
+        the measured delivery rate over that rung's frame size. None until
+        both are known."""
+        size = self._size_at(self._level if level is None else level)
+        if self._rate is None or not size:
+            return None
+        return self._rate / size
+
+    def _size_at(self, level):
+        """Expected frame bytes at `level`: the recent average at the
+        current rung, scaled by the rungs' relative cost (see _cost)."""
+        if self._size is None:
+            return None
+        return self._size * self._cost(level) / self._cost(self._level)
+
+    def _cost(self, level):
+        """Relative JPEG size of a rung's frames: ~pixels^0.8 (a smaller
+        frame packs more detail into each pixel) x quality^0.7. Measured
+        here on two desktops (a terminal and IDE; a code editor, text page
+        and video), the real ratios along the ladder are within 20% of it.
+        The rung the stream lands on measures its own frames, so a miss is
+        corrected a round trip later."""
+        width, quality = AUTO_LADDER[level]
+        width = max(1, min(width, self.max_width, self.rect["width"]))
+        return width ** 1.6 * quality ** 0.7
+
+    def _link_limited(self):
+        """The link, not the window, sets the pace: a frame or more waits in
+        a queue on the route (see _rtt_sample), so the link never idles and
+        the delivery rate is its rate — or acks come later than
+        ACK_TIMEOUT (one frame takes over a second: a fast link that merely
+        stalled still shows its rate in the filter, so it doesn't jump). A
+        window still growing towards the round trip (a long route found
+        fresh, or after idle) leaves the link idle part of the time: its
+        acks measure window / round trip, not the link, and must not read
+        as a slow link."""
+        return self._late or self._queue >= self.QUEUE_LOW
+
+    def _check_rate(self, now):
+        """auto preset, on every ack: when the link carries fewer than
+        AUTO_MIN_FPS frames/s at this rung and it is the link that limits
+        (frames have queued for a round trip, see _link_limited: a moment's
+        queue is just a window that grew, and the acks of the frames that
+        kept the link busy that long have set the rate), jump straight to
+        the biggest rung that carries AUTO_TARGET_FPS — several at once if
+        need be (360w frames are 10-15x smaller than 1280w ones) — at most
+        once per round trip, so the frames of the new size are measured
+        before the next jump."""
+        if not self.adaptive:
+            return
+        if not self._link_limited():
+            self._limited_since = None
+            return
+        if self._limited_since is None:
+            # Acks later than ACK_TIMEOUT are a second of evidence already:
+            # every big frame sent meanwhile is seconds of backlog.
+            self._limited_since = now - (self.ACK_TIMEOUT if self._late
+                                         else 0.0)
+        wait = max(self._srtt or 0.0, 0.25)
+        if self._level == 0 or now - self._limited_since < wait \
+                or now - self._level_at < wait:
+            return
+        fps = self._link_fps()
+        if fps is None or fps >= AUTO_MIN_FPS:
+            return
+        level = self._level - 1
+        while level > 0 and self._link_fps(level) < AUTO_TARGET_FPS:
+            level -= 1
+        self._set_level(level, now, f"link carries {fps:.1f} fps")
 
     def _acks_late(self):
         """ACK_TIMEOUT with frames out: write off the ones already sent so
@@ -635,6 +836,8 @@ class ScreenStreamer:
         fresh = len(self._sent_at) - self._written_off
         self._written_off = len(self._sent_at)
         self._outstanding = max(0, self._outstanding - fresh)
+        if fresh > 0:
+            self._late = True
         if self._written_off > 4 * self.MAX_UNACKED:
             # Acks really stopped coming (an app bug): forget them.
             self._sent_at.clear()
@@ -701,6 +904,7 @@ class ScreenStreamer:
         recent = max(rtt, self._srtt)
         queued = self._window * (recent - self._min_rtt) / recent \
             if recent > 0 else 0.0
+        self._queue = queued
         since = now - self._window_at
         if queued > self.QUEUE_HIGH:
             if since >= max(self._min_rtt, 0.05):
@@ -711,13 +915,17 @@ class ScreenStreamer:
         if since < max(self._srtt, 0.05):
             return
         self._window_at = now
-        need = min(self.MAX_UNACKED,
-                   max(self.MIN_UNACKED,
-                       math.ceil(self._min_rtt * self.fps) + 1))
+        need = self._need()
         if queued < self.QUEUE_LOW and self._window < need:
             self._window += 1
         elif self._window > need:
             self._window = need
+
+    def _need(self):
+        """The window that covers the base round trip at the target fps."""
+        return min(self.MAX_UNACKED,
+                   max(self.MIN_UNACKED,
+                       math.ceil((self._min_rtt or 0.0) * self.fps) + 1))
 
     def _stats(self, now):
         """Every STATS_EVERY s while frames flow: what the phone gets."""
@@ -730,6 +938,8 @@ class ScreenStreamer:
         rtt = "" if self._srtt is None else \
             f", rtt {self._srtt * 1000:.0f} ms (base " \
             f"{self._min_rtt * 1000:.0f}), window {self._window}"
+        if self._rate is not None:
+            rtt += f", rate {self._rate * 8 / 1e6:.1f} Mbit/s"
         print(f"[agent] stream: {fps:.0f} fps, {width}w q{quality}{rtt}")
 
     def _frame_gone(self):
@@ -1104,12 +1314,28 @@ class ScreenStreamer:
         """Encode one grabbed frame (overlapping the previous frame's send),
         then send it once `prev` — the frame before it — is out."""
         shot, pos, rect = grabbed
+        level = self._level
         width, quality = self._current()
-        t = None
+        sent = None
         try:
             jpeg, w, h = await asyncio.get_running_loop().run_in_executor(
                 self._enc_pool, encode_frame, shot, rect, pos, width,
                 quality, self.subsampling)
+            if self.binary:
+                header = json.dumps({
+                    "w": w, "h": h, "src": "screen",
+                    # effective settings, for the app's stats overlay
+                    # (older apps ignore unknown keys)
+                    "q": quality, "preset": self.preset,
+                }).encode()
+                packet = b"PJF1" + len(header).to_bytes(4, "little") \
+                    + header + jpeg
+                size = len(packet)
+            else:
+                packet = {"event": "screen.frame",
+                          "data": {"jpeg": base64.b64encode(jpeg).decode(),
+                                   "w": w, "h": h}}
+                size = len(packet["data"]["jpeg"]) + 64
             if prev is not None:
                 await prev  # frames leave in capture order
             if self.agent.congested(self.client_id):
@@ -1120,6 +1346,10 @@ class ScreenStreamer:
                 self._frame_gone()
                 self._link_sample(None)
                 return
+            if level == self._level:
+                # A frame encoded before a rung change says nothing about
+                # the new rung's size.
+                self._frame_bytes(size)
             t = time.monotonic()
             if self.acks:
                 if t - self._last_sent > self.IDLE_RESTART \
@@ -1128,24 +1358,12 @@ class ScreenStreamer:
                 self._last_sent = t
                 # Before the send: its ack may be handled before this
                 # coroutine resumes from the send.
-                self._sent_at.append(t)
+                sent = self._sent(t, size)
+                self._sent_at.append(sent)
             if self.binary:
-                header = json.dumps({
-                    "w": w, "h": h, "src": "screen",
-                    # effective settings, for the app's stats overlay
-                    # (older apps ignore unknown keys)
-                    "q": quality, "preset": self.preset,
-                }).encode()
-                await self.agent.send_bytes_to(
-                    self.client_id,
-                    b"PJF1" + len(header).to_bytes(4, "little") + header
-                    + jpeg)
+                await self.agent.send_bytes_to(self.client_id, packet)
             else:
-                await self.agent.send_to(self.client_id, {
-                    "event": "screen.frame",
-                    "data": {"jpeg": base64.b64encode(jpeg).decode(),
-                             "w": w, "h": h},
-                })
+                await self.agent.send_to(self.client_id, packet)
             now = time.monotonic()
             self._link_sample(now - t)
             self._stats(now)
@@ -1154,9 +1372,10 @@ class ScreenStreamer:
             raise
         except Exception as e:
             gone = True
-            if t is not None and t in self._sent_at:
+            index = next((i for i, s in enumerate(self._sent_at)
+                          if s is sent), None) if sent is not None else None
+            if index is not None:
                 # Never sent: no ack will come for it.
-                index = self._sent_at.index(t)
                 del self._sent_at[index]
                 if index < self._written_off:
                     # Written off already (and out of _outstanding).
@@ -1172,11 +1391,13 @@ class ScreenStreamer:
     def _link_sample(self, seconds):
         """auto preset: one frame went out after blocking `seconds` in the
         send (None = dropped because the socket was congested, counted as a
-        whole frame interval). Steps down a rung when the stream spent over
-        AUTO_DOWN_BUSY of the last AUTO_BUSY_WINDOW seconds blocked; back up
-        only after AUTO_UP_AFTER seconds (and 20+ frames) under AUTO_UP_BUSY.
-        The gap between the thresholds plus the hold times keeps a marginal
-        link from oscillating."""
+        whole frame interval). Steps down a rung (not under AUTO_BUSY_FLOOR)
+        when the stream spent over AUTO_DOWN_BUSY of the last
+        AUTO_BUSY_WINDOW seconds blocked; back up only after AUTO_UP_AFTER
+        seconds (and 20+ frames) under AUTO_UP_BUSY, and only to a rung the
+        measured delivery rate carries (_fits). The gap between the
+        thresholds plus the hold times keeps a marginal link from
+        oscillating. Slow links are the bandwidth rule's (_check_rate)."""
         if not self.adaptive:
             return
         now = time.monotonic()
@@ -1189,22 +1410,50 @@ class ScreenStreamer:
             self._good_since, self._good_frames = now, 0
         else:
             self._good_frames += 1
-        if busy > AUTO_DOWN_BUSY and self._level > 0 \
+        if busy > AUTO_DOWN_BUSY and self._level > AUTO_BUSY_FLOOR \
                 and now - self._level_at >= 1.0:
             self._set_level(self._level - 1, now)
         elif self._level < len(AUTO_LADDER) - 1 \
                 and now - self._good_since >= AUTO_UP_AFTER \
                 and self._good_frames >= 20 \
-                and now - self._level_at >= AUTO_UP_AFTER:
+                and now - self._level_at >= AUTO_UP_AFTER \
+                and self._fits(self._level + 1):
             self._set_level(self._level + 1, now)
 
-    def _set_level(self, level, now):
+    def _fits(self, level):
+        """Whether the link's measured rate would still carry AUTO_UP_FPS
+        frames/s at `level`. With nothing measured, the busy rule alone
+        decides, as it always did: without acks, and on a route so short
+        (USB through adb reverse: 2-4 ms) that every frame is acked before
+        the next goes out, under RATE_MIN_INTERVAL, so no rate sample is
+        ever taken. A slow link always has samples by the time the hold
+        times allow a step up."""
+        if not self.acks:
+            return True
+        fps = self._link_fps(level)
+        return fps is None or fps >= AUTO_UP_FPS
+
+    def _frame_bytes(self, size):
+        """A frame of `size` bytes, encoded at the current rung, goes out:
+        the rung's average frame size follows it. The first frame after a
+        rung change replaces the cost model's guess outright."""
+        if self._size is None or self._size_fresh:
+            self._size, self._size_fresh = float(size), False
+        else:
+            self._size = 0.8 * self._size + 0.2 * size
+
+    def _set_level(self, level, now, why=None):
+        if self._size is not None:
+            # The new rung's frames, guessed until its first one is out.
+            self._size = self._size_at(level)
+            self._size_fresh = True
         self._level = level
         self._level_at = now
         # Judge the new rung on its own sends, not the old rung's backlog.
         self._sends.clear()
         width, quality = self._current()
-        print(f"[agent] auto quality -> {width}w q{quality}")
+        print(f"[agent] auto quality -> {width}w q{quality}"
+              + (f" ({why})" if why else ""))
 
 
 # ---------------------------------------------------------------- input
@@ -2328,6 +2577,9 @@ class EmbeddedRelay:
         # Local port of a tunnel bridge connection -> the phone's real
         # address (tunnel.serve_bridge), so limits apply per phone.
         self.peer_alias = {}
+        # Phones connected from outside the LAN (the router forward or the
+        # tunnel): likely mobile data, so their screen stream starts lower.
+        self.internet_clients = set()
 
     def _serve(self, handler, port, max_size=8 * 1024 * 1024, **extra):
         return websockets.serve(
@@ -2443,6 +2695,9 @@ class EmbeddedRelay:
                 self.clients.pop(client_id, None)
                 return
             if not is_lan_address(peer):
+                # Router forward, or the tunnel bridge (its alias is the
+                # phone's Cf-Connecting-Ip, or "tunnel").
+                self.internet_clients.add(client_id)
                 print(f"[agent] remote phone connected from {peer}")
             self.agent._status("Phone connected")
         elif peer and not is_lan_address(peer):
@@ -2516,6 +2771,7 @@ class EmbeddedRelay:
             if paired:
                 self.clients.pop(client_id, None)
                 self.tls_clients.discard(client_id)
+                self.internet_clients.discard(client_id)
                 await self.agent.drop_client(client_id)
 
     async def send_to(self, client_id, obj):
@@ -2630,6 +2886,12 @@ class Agent:
         self._pc_audio_heartbeat = set()
         self._pc_audio_watch = None
         self._pc_audio_stats_at = 0.0
+        # The PC's half of those stats, since the last logged line: packets
+        # sent, dropped (backed-up link), and the longest wait between a
+        # packet's encoding and the event loop sending it.
+        self._pc_audio_sent = 0
+        self._pc_audio_dropped = 0
+        self._pc_audio_lag = 0.0
         # Media players paused because the listening phone dropped (see
         # _pc_audio_pause): played again if it comes back within the grace
         # period, left paused otherwise. The task is the pause in flight.
@@ -2709,6 +2971,12 @@ class Agent:
                 > self.RELAY_CONGESTED_BYTES
         except Exception:
             return False
+
+    def internet_client(self, client_id):
+        """True for a phone connected from outside the home network (see
+        EmbeddedRelay.internet_clients)."""
+        return self.embedded is not None \
+            and client_id in self.embedded.internet_clients
 
     def resolve_monitor(self, spec="primary", max_age=MONITORS_TTL):
         """Capture rect {left, top, width, height} for a screen.start
@@ -3059,7 +3327,8 @@ class Agent:
             rect = await asyncio.to_thread(self.resolve_monitor, spec, 0)
         settings = None
         if codec != "h264":
-            settings = screen_settings(msg, rect["width"])
+            settings = screen_settings(msg, rect["width"],
+                                       internet=self.internet_client(client))
         old = self.streamers.pop(client, None)
         stale = 0
         if old:
@@ -3698,7 +3967,7 @@ class Agent:
                 loop = asyncio.get_running_loop()
                 self.pc_audio = pc_audio.PcAudio(
                     on_packet=lambda seq, data: loop.call_soon_threadsafe(
-                        self._pc_audio_send, seq, data),
+                        self._pc_audio_send, seq, data, time.monotonic()),
                     persist=self._pc_audio_persist,
                     on_ended=lambda reason: loop.call_soon_threadsafe(
                         self._pc_audio_ended, reason))
@@ -3801,7 +4070,15 @@ class Agent:
         if isinstance(stats, dict) and now - self._pc_audio_stats_at >= 9.5:
             self._pc_audio_stats_at = now
             line = ", ".join(f"{k}={v}" for k, v in stats.items())
-            print(f"[agent] phone sound: {line[:600]}")
+            # With the PC's side since the last line: dropped packets are
+            # holes the phone can only rebuffer over, and a long loop lag
+            # is jitter the phone's cushion has to absorb.
+            pc = (f"pc_sent={self._pc_audio_sent}, "
+                  f"pc_dropped={self._pc_audio_dropped}, "
+                  f"pc_loop_lag_max_ms={self._pc_audio_lag * 1000:.0f}")
+            self._pc_audio_sent = self._pc_audio_dropped = 0
+            self._pc_audio_lag = 0.0
+            print(f"[agent] phone sound: {line[:900]} | {pc}")
         return {}
 
     async def _pc_audio_watchdog(self):
@@ -3834,22 +4111,29 @@ class Agent:
     # up, ~15 min, with the PC muted all along. 16 KB is ~1 s of sound.
     PC_AUDIO_BACKLOG_BYTES = 16 * 1024
 
-    def _pc_audio_send(self, seq, data):
+    def _pc_audio_send(self, seq, data, made_at=None):
         """Loop thread: one 20 ms Opus packet to the listening phone.
         Dropped when its link is backed up: late sound is worse than a gap,
-        and the gap in `seq` tells the phone."""
+        and the gap in `seq` tells the phone. made_at: when the reader
+        thread encoded it (time.monotonic), for the loop-lag stat."""
         client = self._pc_audio_client
         if client is None:
             return
+        if made_at is not None:
+            self._pc_audio_lag = max(self._pc_audio_lag,
+                                     time.monotonic() - made_at)
         if self.embedded:
             try:
-                if self.embedded.write_buffer_size(client) \
-                        > self.PC_AUDIO_BACKLOG_BYTES:
-                    return
+                backed_up = self.embedded.write_buffer_size(client) \
+                    > self.PC_AUDIO_BACKLOG_BYTES
             except Exception:
-                return
-        elif self.congested(client):
+                backed_up = True
+        else:
+            backed_up = self.congested(client)
+        if backed_up:
+            self._pc_audio_dropped += 1
             return
+        self._pc_audio_sent += 1
         header = b'{"seq":%d,"ms":20}' % seq
         packet = b"OPS1" + len(header).to_bytes(4, "little") + header + data
         asyncio.ensure_future(self.send_bytes_to(client, packet))

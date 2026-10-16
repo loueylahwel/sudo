@@ -2316,6 +2316,7 @@ class EmbeddedRelay:
     the LAN — no pairing codes, no approval prompts from the internet."""
 
     def __init__(self, agent, port, remote_port=None, remote_ssl=None):
+        self.tls_clients = set()
         self.agent = agent
         self.port = port
         self.remote_port = remote_port
@@ -2425,6 +2426,9 @@ class EmbeddedRelay:
                 return
             paired = True
             self.clients[client_id] = ws
+            # TLS (LAN with the pin, router forward, tunnel): the only
+            # connections a password may cross (session.unlock).
+            self.tls_clients.add(client_id)
             self._limit_send_buffer(ws)
             try:
                 await ws.send(json.dumps({
@@ -2511,6 +2515,7 @@ class EmbeddedRelay:
         finally:
             if paired:
                 self.clients.pop(client_id, None)
+                self.tls_clients.discard(client_id)
                 await self.agent.drop_client(client_id)
 
     async def send_to(self, client_id, obj):
@@ -2634,6 +2639,9 @@ class Agent:
         # prev_above}, also in cfg[WINDOW_LOCK_KEY] while on, so a crashed
         # agent's lock is undone by the next one. Released when no phone is
         # left for WINDOW_LOCK_GRACE_S.
+        self._unlock_lock = asyncio.Lock()
+        self._unlock_fails = 0
+        self._unlock_blocked_until = 0.0
         self._wlock = None
         self._wlock_lock = asyncio.Lock()
         self._wlock_grace = None
@@ -3470,6 +3478,61 @@ class Agent:
         await self._phone_audio_stop()
         await self._phone_change(self.phone.disable)
 
+    # ---- unlock the PC with the user's password (session_unlock.py) ----
+
+    # Wrong passwords: after UNLOCK_MAX_FAILS in a row, wait (doubling up
+    # to 15 min) before the next try is even checked.
+    UNLOCK_MAX_FAILS = 3
+    UNLOCK_WAIT_S = 60
+
+    async def h_session_status(self, msg):
+        """{supported, locked}: is the PC's screen locked right now."""
+        if platform.system() != "Linux":
+            return {"supported": False, "locked": False}
+        import session_unlock
+        try:
+            locked = await asyncio.to_thread(session_unlock.is_locked)
+        except Exception:
+            return {"supported": False, "locked": False}
+        return {"supported": True, "locked": locked}
+
+    async def h_session_unlock(self, msg):
+        """session.unlock {password}: unlocks the PC's lock screen when the
+        password is the PC user's (PAM). TLS connections only; the password
+        is never logged or kept."""
+        if platform.system() != "Linux":
+            raise ValueError("Unlocking from the phone works on Linux PCs "
+                             "for now")
+        password = msg.pop("password", None)
+        if not isinstance(password, str) or not password:
+            raise ValueError("no password")
+        if not self.embedded or msg.get("from") not in self.embedded.tls_clients:
+            raise ValueError("Unlocking needs a secure connection: reconnect "
+                             "to the PC once so the app switches to it")
+        import session_unlock
+        now = time.monotonic()
+        if now < self._unlock_blocked_until:
+            wait = int(self._unlock_blocked_until - now) + 1
+            raise ValueError(f"Too many wrong passwords: try again in {wait} s")
+        async with self._unlock_lock:
+            ok = await asyncio.to_thread(session_unlock.check_password,
+                                         password)
+            del password
+            if not ok:
+                self._unlock_fails += 1
+                print(f"[agent] unlock: wrong password "
+                      f"({self._unlock_fails} in a row)")
+                if self._unlock_fails >= self.UNLOCK_MAX_FAILS:
+                    wait = min(900, self.UNLOCK_WAIT_S * 2 ** (
+                        self._unlock_fails - self.UNLOCK_MAX_FAILS))
+                    self._unlock_blocked_until = time.monotonic() + wait
+                raise ValueError("Wrong password")
+            self._unlock_fails = 0
+            self._unlock_blocked_until = 0.0
+            await asyncio.to_thread(session_unlock.unlock)
+        print("[agent] unlock: the PC was unlocked from a phone")
+        return {"locked": False}
+
     # ---- window lock (kdeapps.py _LOCK) ----
 
     WINDOW_LOCK_KEY = "window_lock"
@@ -3953,6 +4016,8 @@ class Agent:
         "audio.start": h_audio_start,
         "audio.stop": h_audio_stop,
         "audio.status": h_audio_status,
+        "session.status": h_session_status,
+        "session.unlock": h_session_unlock,
         "window.lock": h_window_lock,
         "window.lock.status": h_window_lock_status,
         "audio.alive": h_audio_alive,

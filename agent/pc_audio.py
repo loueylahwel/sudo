@@ -55,17 +55,46 @@ MAX_BITRATE = 256000
 SINK_WAIT_S = 3.0        # pw-cli normally has the sink up in ~20 ms
 FIRST_FRAME_WAIT_S = 3.0  # parec delivers (silence) within ~50 ms
 
+# Timing of the capture. The sink's graph runs at the smallest quantum any
+# of its nodes asks for. Music players ask none (Spotify: 0; the graph
+# default is 1024 = 21 ms) and parec's 20 ms brought it to 512 (10.7 ms):
+# frames came out of parec on 10.7 ms cycles, up to a cycle late. Now the
+# sink asks for 256 (5.3 ms cycles) itself and parec for 5 ms fragments
+# (pipewire-pulse floors capture streams at 256 frames anyway), so each
+# 20 ms frame is in within ~5 ms of its last sample. Measured 2026-10-16
+# with a side agent, a beep played into the sink and a local client
+# decoding the packets: their lateness against a steady 20 ms clock went
+# from p95 9.5 to 4.3 ms (less for the phone's cushion to absorb) and,
+# with the encoder change below, beep handed to the player -> packet
+# received from median 43 to 38 ms (median of 5+ runs; the rest is the
+# player's own buffer and the 20 ms frame itself, encoding and the hop to
+# the socket take < 1 ms). Cost: parec 0.3 -> 1% of a core. Only our own
+# sink is recorded this way: the default output's monitor (mute_pc off)
+# keeps asking 20 ms, so the phone never pushes the PC's real sound card to
+# small quanta.
+SINK_QUANTUM = 256
+SINK_PAREC_LATENCY_MS = 5
+MONITOR_PAREC_LATENCY_MS = 20
+
 _CREATE_SINK = (
     "create-node adapter { factory.name=support.null-audio-sink "
     f'node.name={SINK} node.description="Phone (Sudo)" '
     "media.class=Audio/Sink object.linger=false "
+    f"node.latency={SINK_QUANTUM}/{RATE} "
     f"audio.position=[FL FR] audio.rate={RATE} }}\n")
 
 # Debian/Ubuntu package of each piece, for the error the phone shows.
 _PACKAGES = {"pw-cli": "pipewire-bin", "pactl": "pulseaudio-utils",
              "parec": "pulseaudio-utils", "libopus": "libopus0"}
 
-_OPUS_APPLICATION_AUDIO = 2049
+# RESTRICTED_LOWDELAY, not AUDIO: AUDIO delays the sound by 6.5 ms (312
+# samples of lookahead, 4 ms of it only there so the encoder can switch to
+# SILK for speech at low bitrates), LOWDELAY by 2.5 ms (120). At the 128
+# kbit/s stereo sent here AUDIO codes music and speech with CELT anyway, so
+# nothing else changes; the phone's decoder is told 120 (OpusPlayer
+# PRE_SKIP). Measured on the decoded sound: a beep comes out 6.52 -> 2.52 ms
+# after it went in.
+_OPUS_APPLICATION_RESTRICTED_LOWDELAY = 2051
 _OPUS_SET_BITRATE_REQUEST = 4002
 
 
@@ -117,7 +146,8 @@ class _Encoder:
         self._lib = _opus()
         err = ctypes.c_int(0)
         self._enc = self._lib.opus_encoder_create(
-            RATE, CHANNELS, _OPUS_APPLICATION_AUDIO, ctypes.byref(err))
+            RATE, CHANNELS, _OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+            ctypes.byref(err))
         if not self._enc or err.value != 0:
             raise RuntimeError(f"couldn't create the Opus encoder "
                                f"(error {err.value})")
@@ -540,8 +570,10 @@ class PcAudio:
                                   else "no sound data") + self._last_log())
 
     def _read(self, source, ready, failure, session):
+        latency = SINK_PAREC_LATENCY_MS if source == SINK + ".monitor" \
+            else MONITOR_PAREC_LATENCY_MS   # see SINK_QUANTUM
         cmd = ["parec", "-d", source, "--format=s16le", f"--rate={RATE}",
-               f"--channels={CHANNELS}", "--raw", "--latency-msec=20",
+               f"--channels={CHANNELS}", "--raw", f"--latency-msec={latency}",
                "--client-name=Sudo", "--stream-name=PC sound for the phone"]
         try:
             proc = subprocess.Popen(

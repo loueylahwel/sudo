@@ -38,7 +38,22 @@ import websockets
 NTFY_SERVER = "https://ntfy.sh"
 HEALTH_PATH = "/sudo-health"
 HEALTH_BODY = "sudo tunnel ok\n"
-_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+_URL_RE = re.compile(r"https://([a-z0-9-]+)\.trycloudflare\.com(/?)")
+# trycloudflare.com hosts that are Cloudflare's own, never a tunnel: with
+# DNS down, cloudflared logs 'failed to request quick Tunnel: Post
+# "https://api.trycloudflare.com/tunnel": dial tcp: lookup ...', and that
+# address once got published as the tunnel.
+_SERVICE_HOSTS = {"api", "www"}
+
+
+def tunnel_url(line):
+    """The quick tunnel's own address in a cloudflared log line, or None.
+    cloudflared prints it bare (in a box); a URL with a path is an API call
+    in an error message, whatever its host."""
+    for m in _URL_RE.finditer(line):
+        if m.group(1) not in _SERVICE_HOSTS and not m.group(2):
+            return f"https://{m.group(1)}.trycloudflare.com"
+    return None
 
 
 def new_topic():
@@ -313,9 +328,9 @@ class QuickTunnel:
         def read(stream):
             for line in stream:
                 self._log.append(line.strip())
-                m = _URL_RE.search(line)
-                if m and not found.is_set():
-                    holder["url"] = m.group(0)
+                url = tunnel_url(line)
+                if url and not found.is_set():
+                    holder["url"] = url
                     found.set()
 
         threading.Thread(target=read, args=(self._proc.stderr,),

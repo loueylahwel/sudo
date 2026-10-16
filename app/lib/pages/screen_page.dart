@@ -65,6 +65,14 @@ class _ScreenPageState extends State<ScreenPage>
   // client when HomePage's auto-reconnect replaces it, so the page keeps
   // working instead of staying bound to a dead client.
   late RelayClient _client = widget.client;
+
+  // Window lock (window.lock): the PC's current window stays on top and
+  // new windows open underneath it. null until the agent answered (false:
+  // an agent or desktop without it, the button is hidden).
+  bool? _lockSupported;
+  bool _locked = false;
+  String _lockTitle = '';
+  bool _lockBusy = false;
   StreamSubscription<RelayClient>? _registrySub;
   StreamSubscription<RelayEvent>? _eventSub;
   StreamSubscription<ScreenFrame>? _frameSub;
@@ -246,6 +254,7 @@ class _ScreenPageState extends State<ScreenPage>
     _client = client;
     _eventSub = client.events.listen(_onEvent);
     _frameSub = client.screenFrames.listen(_onFrame);
+    unawaited(_refreshLock(client));
     _connSub = client.connectionState.listen(_onConnectionState);
   }
 
@@ -339,8 +348,67 @@ class _ScreenPageState extends State<ScreenPage>
     }
   }
 
+  Future<void> _refreshLock(RelayClient client) async {
+    try {
+      final r = await client.request('window.lock.status');
+      if (!mounted || !identical(client, _client)) return;
+      setState(() {
+        _lockSupported = true;
+        _applyLock(r);
+      });
+    } catch (e) {
+      if (!mounted || !identical(client, _client)) return;
+      if ('$e'.startsWith('unknown cmd')) {
+        setState(() => _lockSupported = false);
+      }
+    }
+  }
+
+  void _applyLock(Map<String, dynamic> r) {
+    _locked = r['locked'] == true;
+    _lockTitle = '${r['title'] ?? ''}';
+  }
+
+  Future<void> _toggleLock() async {
+    if (_lockBusy) return;
+    final on = !_locked;
+    setState(() => _lockBusy = true);
+    try {
+      final r = await _client.request('window.lock', {'on': on});
+      if (!mounted) return;
+      setState(() => _applyLock(r));
+      showMessage(
+          context,
+          _locked
+              ? 'Locked on top: '
+                  '${_lockTitle.isEmpty ? 'this window' : _lockTitle}'
+              : 'Window lock off');
+    } catch (e) {
+      if (!mounted) return;
+      showError(
+          context,
+          '$e'.startsWith('unknown cmd')
+              ? 'Update the Sudo agent on the PC for the window lock'
+              : e);
+    } finally {
+      if (mounted) setState(() => _lockBusy = false);
+    }
+  }
+
+  Widget _lockIcon() => Icon(
+        _locked ? Icons.lock : Icons.lock_open,
+        color: _locked ? Colors.amberAccent : null,
+      );
+
   void _onEvent(RelayEvent event) {
     if (!mounted) return;
+    if (event.name == 'window.lock') {
+      setState(() {
+        _lockSupported = true;
+        _applyLock(event.data);
+      });
+      return;
+    }
     if (event.name == 'cursor') {
       _onCursor(event.data);
       return;
@@ -893,6 +961,15 @@ class _ScreenPageState extends State<ScreenPage>
                       ),
                     ),
                   ),
+                  if (_lockSupported == true)
+                    IconButton(
+                      tooltip: _locked
+                          ? 'Unlock: windows may open on top again'
+                          : 'Lock this window on top: new windows open '
+                              'underneath',
+                      icon: _lockIcon(),
+                      onPressed: _lockBusy ? null : _toggleLock,
+                    ),
                   IconButton(
                     tooltip: 'Full screen',
                     icon: const Icon(Icons.fullscreen),
@@ -978,6 +1055,23 @@ class _ScreenPageState extends State<ScreenPage>
                               ],
                             ),
                           ),
+                        ),
+                      ),
+                    ),
+                  // Full screen has no app bar: the lock gets a small
+                  // button of its own in the corner.
+                  if (fullscreen && _lockSupported == true)
+                    Positioned(
+                      top: 8 + MediaQuery.paddingOf(context).top,
+                      right: 8,
+                      child: Material(
+                        color: Colors.black45,
+                        shape: const CircleBorder(),
+                        child: IconButton(
+                          tooltip: _locked ? 'Unlock window' : 'Lock window',
+                          color: Colors.white70,
+                          icon: _lockIcon(),
+                          onPressed: _lockBusy ? null : _toggleLock,
                         ),
                       ),
                     ),

@@ -97,11 +97,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Timer? _sleepTick;
   DateTime? _sleepEnd;
 
-  // Now Playing: the dashboard polls `media.info` every 3s while connected.
-  // Between polls the position is interpolated forward from the last sample
-  // (while playing), refreshed once a second by _mediaTick. While the seek
+  // Now Playing: a Linux agent pushes `media.changed` the moment the PC's
+  // player or volume changes, and answers a button with the new state; the
+  // card also applies a button's effect at once (optimistic). Agents that
+  // push get a slow safety poll (15 s), others the old 3 s `media.info`
+  // poll. Between updates the position is interpolated forward from the
+  // last sample (while playing), redrawn by _mediaTick. While the seek
   // slider is being dragged the interpolation freezes and the slider shows
-  // _dragValue instead, so poll updates never fight the user's thumb.
+  // _dragValue instead, so updates never fight the user's thumb.
   Timer? _mediaPollTimer;
   Timer? _mediaTick;
   String _mediaTitle = '';
@@ -109,7 +112,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   double _mediaPosition = 0;
   double _mediaDuration = 0;
   bool _mediaPlaying = false;
+  String _mediaArt = '';
+  int? _mediaVolume; // PC output volume %, null when the agent doesn't say
+  bool _mediaMuted = false;
   DateTime? _mediaInfoAt;
+  // The agent pushes media.changed (then the poll slows down).
+  bool _mediaPushes = false;
+  // Bumped by every button press: a media.info answer to a request sent
+  // before the press is stale and must not undo the optimistic state.
+  int _mediaGen = 0;
   bool _seekDragging = false;
   double? _dragValue;
 
@@ -848,6 +859,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         unawaited(_refreshPowerStatus());
       case 'agent.offline':
         setState(() => _agentOnline = false);
+      case 'media.changed':
+        _mediaPushes = true;
+        _mediaGen++; // newer than any poll in flight
+        _applyMediaInfo(event.data);
       case 'clipboard.changed':
         // Never surface PC clipboard popups — clipboard sync stays manual.
         return;
@@ -1068,11 +1083,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// once the dashboard is connected; idempotent.
   void _startMediaPoll() {
     _stopMediaPoll();
-    _mediaPollTimer = Timer.periodic(
-      const Duration(seconds: 3),
-      (_) => unawaited(_pollMediaInfo()),
-    );
-    _mediaTick = Timer.periodic(const Duration(seconds: 1), (_) {
+    _mediaPollTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      final at = _mediaInfoAt;
+      if (_mediaPushes &&
+          at != null &&
+          DateTime.now().difference(at) < const Duration(seconds: 15)) {
+        return;
+      }
+      unawaited(_pollMediaInfo());
+    });
+    _mediaTick = Timer.periodic(const Duration(milliseconds: 500), (_) {
       if (!mounted || !_mediaPlaying || _seekDragging) return;
       setState(() {}); // advance the interpolated position
     });
@@ -1088,7 +1108,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _mediaTick = null;
     _mediaTitle = '';
     _mediaArtist = '';
+    _mediaArt = '';
+    _mediaVolume = null;
+    _mediaMuted = false;
     _mediaPlaying = false;
+    _mediaPushes = false;
     _seekDragging = false;
     _dragValue = null;
   }
@@ -1100,22 +1124,86 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // while another page (Screen, Files...) covers the dashboard, so skip
     // it then and leave that CPU to the screen stream.
     if (!(ModalRoute.isCurrentOf(context) ?? true)) return;
+    final gen = _mediaGen;
     try {
       final info = await client.request('media.info');
-      if (!mounted) return;
-      setState(() {
-        _mediaTitle = '${info['title'] ?? ''}';
-        _mediaArtist = '${info['artist'] ?? ''}';
-        _mediaDuration = ((info['duration_s'] as num?) ?? 0).toDouble();
-        _mediaPosition = ((info['position_s'] as num?) ?? 0).toDouble();
-        _mediaPlaying = info['playing'] == true;
-        _mediaInfoAt = DateTime.now();
-        if (!_seekDragging) _dragValue = null;
-      });
+      if (!mounted || gen != _mediaGen) return;
+      _applyMediaInfo(info);
     } catch (_) {
       // Poll failures are transient (socket blip, player gone); the next
       // tick retries — never surface an error popup for these.
     }
+  }
+
+  void _applyMediaInfo(Map<String, dynamic> info) {
+    if (!mounted) return;
+    setState(() {
+      _mediaTitle = '${info['title'] ?? ''}';
+      _mediaArtist = '${info['artist'] ?? ''}';
+      _mediaArt = '${info['art_url'] ?? ''}';
+      _mediaDuration = ((info['duration_s'] as num?) ?? 0).toDouble();
+      _mediaPosition = ((info['position_s'] as num?) ?? 0).toDouble();
+      _mediaPlaying = info['playing'] == true;
+      _mediaVolume = (info['volume'] as num?)?.toInt();
+      _mediaMuted = info['muted'] == true;
+      _mediaInfoAt = DateTime.now();
+      if (!_seekDragging) _dragValue = null;
+    });
+    // The PC-sound notification shows the same track.
+    PcAudio.instance.setNowPlaying(info);
+  }
+
+  /// A media button: shows its effect at once, then takes the PC's answer
+  /// (a Linux agent replies with the new state; others get a quick poll).
+  Future<void> _mediaAction(String action) async {
+    final client = _client;
+    if (client == null) return;
+    final gen = ++_mediaGen;
+    setState(() {
+      // Re-anchor the interpolation where the bar is now.
+      _mediaPosition = _displayPosition;
+      _mediaInfoAt = DateTime.now();
+      switch (action) {
+        case 'media_play_pause':
+          _mediaPlaying = !_mediaPlaying;
+        case 'media_volume_mute':
+          _mediaMuted = !_mediaMuted;
+        case 'media_volume_up':
+          if (_mediaVolume != null) {
+            _mediaVolume = (_mediaVolume! + 5).clamp(0, 100);
+            _mediaMuted = false;
+          }
+        case 'media_volume_down':
+          if (_mediaVolume != null) {
+            _mediaVolume = (_mediaVolume! - 5).clamp(0, 100);
+          }
+        case 'media_next' || 'media_previous':
+          _mediaPosition = 0;
+      }
+    });
+    try {
+      final reply = await client.request('media', {'action': action});
+      final info = reply['info'];
+      if (gen != _mediaGen) return;
+      if (info is Map) {
+        _applyMediaInfo(info.cast<String, dynamic>());
+      } else {
+        // Older or Windows agent: a synthetic key, no answer. Look soon.
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+        if (gen == _mediaGen) unawaited(_pollMediaInfo());
+      }
+    } catch (e) {
+      if (mounted) showError(context, e);
+      if (gen == _mediaGen) unawaited(_pollMediaInfo());
+    }
+  }
+
+  static String _clock(double seconds) {
+    final s = seconds.isFinite ? seconds.round() : 0;
+    final h = s ~/ 3600;
+    final m = (s % 3600) ~/ 60;
+    final ss = (s % 60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:${m.toString().padLeft(2, '0')}:$ss' : '$m:$ss';
   }
 
   /// Position to show on the seek slider: the drag value while dragging,
@@ -1136,6 +1224,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   /// Slider release: jump locally (no waiting for the next poll) and send
   /// the seek, fire-and-forget.
   void _seekTo(double seconds) {
+    _mediaGen++; // a poll from before the seek would jump the bar back
     setState(() {
       _seekDragging = false;
       _dragValue = null;
@@ -1729,6 +1818,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  /// The track's cover (web art only), or a note icon.
+  Widget _mediaArtwork(ThemeData theme) {
+    const size = 56.0;
+    final placeholder = Container(
+      width: size,
+      height: size,
+      color: theme.colorScheme.surfaceContainerHighest,
+      child: Icon(Icons.music_note, color: theme.hintColor),
+    );
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: _mediaArt.isEmpty
+          ? placeholder
+          : Image.network(
+              _mediaArt,
+              key: ValueKey(_mediaArt),
+              width: size,
+              height: size,
+              fit: BoxFit.cover,
+              gaplessPlayback: true,
+              errorBuilder: (_, _, _) => placeholder,
+            ),
+    );
+  }
+
   Widget _buildMediaCard(ThemeData theme) {
     final hasTrack = _mediaTitle.isNotEmpty;
     // Seeking only makes sense when the track reports a real duration.
@@ -1743,6 +1857,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               children: [
                 Text('Media', style: theme.textTheme.titleSmall),
                 const Spacer(),
+                if (_mediaVolume != null)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          _mediaMuted ? Icons.volume_off : Icons.volume_up,
+                          size: 16,
+                          color: theme.hintColor,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          _mediaMuted ? 'Muted' : '$_mediaVolume%',
+                          style: theme.textTheme.bodySmall
+                              ?.copyWith(color: theme.hintColor),
+                        ),
+                      ],
+                    ),
+                  ),
                 if (_sleepEnd != null)
                   Padding(
                     padding: const EdgeInsets.only(right: 4),
@@ -1762,25 +1896,38 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               ],
             ),
             if (hasTrack) ...[
-              const SizedBox(height: 4),
-              Text(
-                _mediaTitle,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodyLarge,
-              ),
-              if (_mediaArtist.isNotEmpty)
-                Text(
-                  _mediaArtist,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.hintColor,
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  _mediaArtwork(theme),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _mediaTitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodyLarge,
+                        ),
+                        if (_mediaArtist.isNotEmpty)
+                          Text(
+                            _mediaArtist,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.hintColor,
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
-                ),
-              // Seek bar: shows the polled position interpolated forward
-              // between polls; dragging freezes interpolation and the
-              // release sends media.seek.
+                ],
+              ),
+              // Seek bar: shows the last known position interpolated
+              // forward; dragging freezes interpolation and the release
+              // sends media.seek.
               Slider(
                 value: seekable ? _displayPosition : 0,
                 max: seekable ? _mediaDuration : 1,
@@ -1792,42 +1939,51 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     : null,
                 onChangeEnd: seekable ? _seekTo : null,
               ),
+              if (seekable)
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Row(
+                    children: [
+                      Text(_clock(_displayPosition),
+                          style: theme.textTheme.bodySmall
+                              ?.copyWith(color: theme.hintColor)),
+                      const Spacer(),
+                      Text(_clock(_mediaDuration),
+                          style: theme.textTheme.bodySmall
+                              ?.copyWith(color: theme.hintColor)),
+                    ],
+                  ),
+                ),
               _oneLineRow([
                 _quickAction(
                   tooltip: 'Previous',
                   icon: Icons.skip_previous,
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_previous'}),
+                  onPressed: () => _mediaAction('media_previous'),
                 ),
                 _quickAction(
                   tooltip: 'Play / pause',
                   icon: _mediaPlaying ? Icons.pause : Icons.play_arrow,
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_play_pause'}),
+                  onPressed: () => _mediaAction('media_play_pause'),
                 ),
                 _quickAction(
                   tooltip: 'Next',
                   icon: Icons.skip_next,
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_next'}),
+                  onPressed: () => _mediaAction('media_next'),
                 ),
                 _quickAction(
                   tooltip: 'Volume down',
                   icon: Icons.volume_down,
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_volume_down'}),
+                  onPressed: () => _mediaAction('media_volume_down'),
                 ),
                 _quickAction(
                   tooltip: 'Volume up',
                   icon: Icons.volume_up,
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_volume_up'}),
+                  onPressed: () => _mediaAction('media_volume_up'),
                 ),
                 _quickAction(
-                  tooltip: 'Mute',
-                  icon: Icons.volume_off,
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_volume_mute'}),
+                  tooltip: _mediaMuted ? 'Unmute' : 'Mute',
+                  icon: _mediaMuted ? Icons.volume_off : Icons.volume_mute,
+                  onPressed: () => _mediaAction('media_volume_mute'),
                 ),
               ]),
             ] else ...[
@@ -1842,20 +1998,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 _quickAction(
                   tooltip: 'Volume down',
                   icon: Icons.volume_down,
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_volume_down'}),
+                  onPressed: () => _mediaAction('media_volume_down'),
                 ),
                 _quickAction(
                   tooltip: 'Volume up',
                   icon: Icons.volume_up,
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_volume_up'}),
+                  onPressed: () => _mediaAction('media_volume_up'),
                 ),
                 _quickAction(
-                  tooltip: 'Mute',
-                  icon: Icons.volume_off,
-                  onPressed: () =>
-                      _runCommand('media', {'action': 'media_volume_mute'}),
+                  tooltip: _mediaMuted ? 'Unmute' : 'Mute',
+                  icon: _mediaMuted ? Icons.volume_off : Icons.volume_mute,
+                  onPressed: () => _mediaAction('media_volume_mute'),
                 ),
               ]),
             ],

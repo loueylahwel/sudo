@@ -189,7 +189,48 @@ class PcAudio extends ChangeNotifier {
         .then((_) {}, onError: (_) {}));
   }
 
+  // What the PC plays (media.info / media.changed), shown in the sound's
+  // notification while it plays here.
+  Map<String, dynamic>? _nowPlaying;
+
+  /// The PC's player state, from the dashboard's media.info or the agent's
+  /// media.changed push; the notification follows while the sound is on.
+  void setNowPlaying(Map<String, dynamic> info) {
+    _nowPlaying = info;
+    if (_nativeOn) {
+      unawaited(_native
+          .invokeMethod<void>('nowPlaying', info)
+          .then((_) {}, onError: (_) {}));
+    }
+  }
+
+  /// A button in the notification / lock screen / headset: to the PC's
+  /// player, and its answer back to the notification.
+  Future<void> _mediaFromPhone(Map args) async {
+    final client = _client;
+    if (client == null || !client.isConnected) return;
+    final action = '${args['action'] ?? ''}';
+    try {
+      final reply = action == 'seek'
+          ? await client.request('media.seek',
+              {'seconds': ((args['seconds'] as num?) ?? 0).round()})
+          : await client.request('media', {'action': action});
+      final info = action == 'seek' ? reply : reply['info'];
+      if (info is Map && info.isNotEmpty) {
+        setNowPlaying(info.cast<String, dynamic>());
+      } else {
+        setNowPlaying(await client.request('media.info'));
+      }
+    } catch (_) {
+      // The link dropped; the next media.changed puts it right.
+    }
+  }
+
   void _onEvent(RelayEvent event) {
+    if (event.name == 'media.changed') {
+      setNowPlaying(event.data);
+      return;
+    }
     if (event.name != 'audio.stopped') return;
     // Another phone took the sound over (or the PC ended it). This phone
     // is no longer the listener, so no audio.stop: it would cut the sound
@@ -205,6 +246,11 @@ class PcAudio extends ChangeNotifier {
   }
 
   Future<dynamic> _onNativeCall(MethodCall call) async {
+    if (call.method == 'media') {
+      final args = call.arguments;
+      if (args is Map) unawaited(_mediaFromPhone(args));
+      return null;
+    }
     if (call.method != 'stopped') return null;
     // The phone ended it (notification's Stop, another app took the audio
     // focus, decoder failure): give the sound back to the PC.
@@ -236,6 +282,14 @@ class PcAudio extends ChangeNotifier {
         // start, or the newer start owns the player now.
         if (gen != _gen) return;
         _nativeOn = true;
+        final known = _nowPlaying;
+        if (known != null) {
+          setNowPlaying(known);
+        } else {
+          unawaited(client.request('media.info').then(
+              (info) => setNowPlaying(info),
+              onError: (_) {}));
+        }
       }
       final reply = await client.request('audio.start', {'mute_pc': true});
       if (gen != _gen || !_enabled) return;

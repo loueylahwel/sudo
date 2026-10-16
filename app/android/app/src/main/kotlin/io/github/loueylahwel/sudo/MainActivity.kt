@@ -194,6 +194,9 @@ class MainActivity : FlutterActivity() {
             endPcAudio()
             channel.invokeMethod("stopped", reason)
         }
+        PcAudioService.mediaListener = { action, seconds ->
+            channel.invokeMethod("media", mapOf("action" to action, "seconds" to seconds))
+        }
         PcAudioService.stopListener = { reason ->
             if (player.isRunning) {
                 endPcAudio()
@@ -228,6 +231,22 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "stats" -> result.success(player.stats())
+                "nowPlaying" -> {
+                    val a = call.arguments as? Map<*, *> ?: emptyMap<String, Any>()
+                    PcAudioService.setNowPlaying(
+                        NowPlaying(
+                            title = a["title"] as? String ?: "",
+                            artist = a["artist"] as? String ?: "",
+                            artUrl = a["art_url"] as? String ?: "",
+                            playing = a["playing"] == true,
+                            positionMs = ((a["position_s"] as? Number)?.toDouble() ?: 0.0)
+                                .times(1000).toLong(),
+                            durationMs = ((a["duration_s"] as? Number)?.toDouble() ?: 0.0)
+                                .times(1000).toLong(),
+                        ),
+                    )
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         }
@@ -299,6 +318,7 @@ class MainActivity : FlutterActivity() {
         // The engine (and the Dart side with its socket) dies with this
         // activity: nothing would feed the player any more.
         PcAudioService.stopListener = null
+        PcAudioService.mediaListener = null
         endPcAudio()
         opusPlayer = null
         super.onDestroy()

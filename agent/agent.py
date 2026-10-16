@@ -19,6 +19,7 @@ import math
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import socket
@@ -2225,10 +2226,13 @@ def _media_info():
     if platform.system() != "Windows":
         out = _playerctl("metadata", "--format",
                          "{{status}}\t{{title}}\t{{artist}}\t"
-                         "{{position}}\t{{mpris:length}}")
+                         "{{position}}\t{{mpris:length}}\t{{mpris:artUrl}}"
+                         "\t{{playerName}}")
+        volume = _linux_volume()
         if not out:
-            return {}
-        status, title, artist, pos, length = (out.split("\t") + [""] * 5)[:5]
+            return volume
+        status, title, artist, pos, length, art, player = \
+            (out.split("\t") + [""] * 7)[:7]
 
         def seconds(us):
             try:
@@ -2238,8 +2242,58 @@ def _media_info():
 
         return {"title": title, "artist": artist,
                 "playing": status == "Playing",
-                "position_s": seconds(pos), "duration_s": seconds(length)}
+                "position_s": seconds(pos), "duration_s": seconds(length),
+                # Only web art: the phone can't open the PC's file:// paths.
+                "art_url": art if art.startswith("https://") else "",
+                "player": player, **volume}
     return _run_media_ps1([])
+
+
+def _linux_volume():
+    """The default output's volume (0-150 %) and mute, through pactl:
+    {"volume": int, "muted": bool}, or {} when pactl can't answer."""
+    try:
+        vol = subprocess.run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+                             capture_output=True, text=True, timeout=2).stdout
+        mute = subprocess.run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"],
+                              capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    m = re.search(r"(\d+)%", vol)
+    if not m:
+        return {}
+    return {"volume": int(m.group(1)), "muted": "yes" in mute}
+
+
+# Media buttons on Linux: straight to the player (MPRIS) and the sound
+# server, instead of a synthetic key that the desktop may route anywhere
+# and that gives no answer. Volume steps match KDE's (5 %), capped at 100.
+_LINUX_MEDIA = {
+    "media_play_pause": ["playerctl", "play-pause"],
+    "media_next": ["playerctl", "next"],
+    "media_previous": ["playerctl", "previous"],
+    "media_volume_up": ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+5%"],
+    "media_volume_down": ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-5%"],
+    "media_volume_mute": ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
+}
+
+
+def _linux_media(action):
+    """Runs a media button on Linux; False when it has no direct command
+    (or the tool is missing), so the caller falls back to the key."""
+    cmd = _LINUX_MEDIA.get(action)
+    if cmd is None or not shutil.which(cmd[0]):
+        return False
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=3)
+        if action == "media_volume_up":
+            # pactl has no ceiling: keep +5% steps from going past 100 %.
+            if _linux_volume().get("volume", 0) > 100:
+                subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@",
+                                "100%"], capture_output=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return True
 
 
 def _media_seek(seconds):
@@ -2932,7 +2986,17 @@ class Agent:
             display_id=msg.get("display")))
 
     async def h_media(self, msg):
-        do_key(msg.get("action", "media_play_pause"))
+        """A media button. On Linux it answers with the state after it
+        (`info`), so the phone's card updates at once; the media watcher
+        tells the other phones."""
+        action = msg.get("action", "media_play_pause")
+        if platform.system() != "Windows" and \
+                await asyncio.to_thread(_linux_media, action):
+            # MPRIS applies a command asynchronously: give the player a
+            # beat so the answer already shows the new state.
+            await asyncio.sleep(0.15)
+            return {"info": await asyncio.to_thread(_media_info)}
+        do_key(action)
         return {}
 
     async def h_media_info(self, msg):
@@ -4018,6 +4082,75 @@ class Agent:
             transport.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
             await asyncio.sleep(1)  # fast rediscovery after network switches
 
+    async def media_watcher(self):
+        """Linux: pushes `media.changed` (the full media.info) to every
+        phone the moment the player changes track, plays, pauses or seeks,
+        or the volume changes, so the phones' Now Playing cards follow the
+        PC live instead of waiting for their next poll. Two followers:
+        `playerctl -F` (MPRIS) and `pactl subscribe` (sink changes), their
+        bursts coalesced into one push per 150 ms."""
+        if platform.system() == "Windows" or not shutil.which("playerctl"):
+            return
+        wake = asyncio.Event()
+
+        async def follow(cmd, wanted):
+            while True:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL)
+                    async for line in proc.stdout:
+                        if wanted(line):
+                            wake.set()
+                    await proc.wait()
+                except (OSError, ValueError):
+                    pass
+                await asyncio.sleep(2)   # player gone / sound server restart
+
+        fmt = ("{{playerName}}\t{{status}}\t{{title}}\t{{artist}}\t"
+               "{{mpris:length}}\t{{mpris:artUrl}}")
+        tasks = [asyncio.create_task(follow(
+            ["playerctl", "-F", "metadata", "--format", fmt],
+            lambda line: True))]
+        if shutil.which("pactl"):
+            tasks.append(asyncio.create_task(follow(
+                ["pactl", "subscribe"],
+                lambda line: b"on sink #" in line or b"on server" in line)))
+        # playerctl -F doesn't report a seek: catch it by comparing the
+        # position against where it should be, every few seconds.
+        last = None
+        last_at = 0.0
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(wake.wait(), 3)
+                except asyncio.TimeoutError:
+                    pass
+                woke = wake.is_set()
+                await asyncio.sleep(0.15)
+                wake.clear()
+                if not self.known_clients:
+                    last = None
+                    continue
+                info = await asyncio.to_thread(_media_info)
+                now = time.monotonic()
+                if not woke and last is not None:
+                    expected = last.get("position_s", 0) + (
+                        now - last_at if last.get("playing") else 0)
+                    same = {k: v for k, v in info.items()
+                            if k != "position_s"} == \
+                        {k: v for k, v in last.items() if k != "position_s"}
+                    if same and abs(info.get("position_s", 0) - expected) < 2:
+                        continue
+                last, last_at = info, now
+                try:
+                    await self.send({"event": "media.changed", "data": info})
+                except Exception:
+                    pass
+        finally:
+            for t in tasks:
+                t.cancel()
+
     async def cursor_watcher(self):
         """Poll the cursor position (~16x/s) and wake screen streamers when
         it moves — so physical mouse movement revives the stream just as
@@ -4138,6 +4271,7 @@ class Agent:
         self.loop = asyncio.get_running_loop()
         asyncio.create_task(self.discovery_beacon())
         asyncio.create_task(self.cursor_watcher())
+        asyncio.create_task(self.media_watcher())
         asyncio.create_task(self.restore_power_schedule())
         asyncio.create_task(self.restore_phone_audio())
         asyncio.create_task(self.restore_pc_audio())

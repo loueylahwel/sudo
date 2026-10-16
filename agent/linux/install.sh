@@ -20,8 +20,9 @@ sudo apt-get update -qq
 # python3-gi + gir1.2-gdkpixbuf-2.0: app icons on KDE (SVG -> PNG); the
 # GStreamer/PipeWire packages: screen frames through the Wayland portal;
 # pipewire-bin + pulseaudio-utils + libopus0: the PC's sound on the phone.
+# adb: the phone over a USB cable (usb_link.py).
 sudo apt-get install -y python3-venv python3-dev python3-tk build-essential \
-    xclip wl-clipboard playerctl pipewire-bin pulseaudio-utils libopus0 \
+    xclip wl-clipboard playerctl pipewire-bin pulseaudio-utils libopus0 adb \
     python3-gi gir1.2-gdkpixbuf-2.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
     gstreamer1.0-pipewire gstreamer1.0-plugins-base
 

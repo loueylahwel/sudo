@@ -155,6 +155,41 @@ def _run(*args, timeout=5):
     return r.stdout
 
 
+# ------------------------------------------------------------ MPRIS players
+
+def pause_players():
+    """Pause every media player (MPRIS, through playerctl) that is playing
+    right now. Returns the ones it paused, to resume_players() them later.
+    Used when the phone playing the PC's sound drops: the music must not
+    carry on unheard, nor come back out of the PC's speakers by itself."""
+    try:
+        out = _run("playerctl", "-a", "-f",
+                   "{{playerInstance}}\t{{status}}", "status")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return []   # playerctl missing, or no player at all
+    paused = []
+    for line in out.splitlines():
+        name, _, status = line.partition("\t")
+        if name and status.strip() == "Playing":
+            try:
+                _run("playerctl", "-p", name, "pause")
+                paused.append(name)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                pass
+    return paused
+
+
+def resume_players(names):
+    """Play again the players pause_players() paused (those still there and
+    still paused: one the user started or stopped meanwhile is left alone)."""
+    for name in names:
+        try:
+            if _run("playerctl", "-p", name, "status").strip() == "Paused":
+                _run("playerctl", "-p", name, "play")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            pass
+
+
 def _sinks():
     """{sink name: pactl index} of every output."""
     sinks = {}

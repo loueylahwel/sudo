@@ -2298,6 +2298,12 @@ class EmbeddedRelay:
                                    ssl=self.remote_ssl,
                                    max_size=1024 * 1024):
                 print(f"[agent] remote access (TLS) on :{self.remote_port}")
+                if self.agent.cfg.get("usb_link", True):
+                    # Phones plugged in over USB reach the TLS port through
+                    # the cable too (usb_link.py).
+                    import usb_link
+                    self._usb_task = asyncio.create_task(
+                        usb_link.keep_reversed(self.remote_port))
                 await self.agent.start_tunnel(self)
                 await asyncio.Future()  # serve forever
 
@@ -2565,6 +2571,11 @@ class Agent:
         self._pc_audio_heartbeat = set()
         self._pc_audio_watch = None
         self._pc_audio_stats_at = 0.0
+        # Media players paused because the listening phone dropped (see
+        # _pc_audio_pause): played again if it comes back within the grace
+        # period, left paused otherwise. The task is the pause in flight.
+        self._pc_audio_paused = []
+        self._pc_audio_pausing = None
         # Remote access from outside the LAN (remote_access.RemoteAccess),
         # set up in run() for the embedded relay.
         self.remote = None
@@ -3429,6 +3440,7 @@ class Agent:
             # backed-up socket, and a send to it would block for minutes.
             asyncio.ensure_future(self._pc_audio_tell_stopped(
                 before, "another phone took over"))
+        await self._pc_audio_resume()
         return {"enabled": True, "codec": "opus", "rate": pc_audio.RATE,
                 "channels": pc_audio.CHANNELS, "frame_ms": pc_audio.FRAME_MS,
                 "mute_pc": mute_pc, "bitrate": bitrate}
@@ -3481,11 +3493,51 @@ class Agent:
         grace, self._pc_audio_grace = self._pc_audio_grace, None
         if grace is not None:
             grace.cancel()
+        if reason not in self.PC_AUDIO_USER_STOPS and self.pc_audio is not None \
+                and self.pc_audio.running:
+            # The phone stopped by itself (its headphones went, another app
+            # took its audio, a start failed): the sound is about to come
+            # back out of the PC's speakers, which nobody asked for.
+            await self._pc_audio_pause(
+                f"the phone stopped ({reason or 'no reason'})")
+        self._pc_audio_paused = []
         async with self._pc_audio_lock:
             self._pc_audio_client = None
             if self.pc_audio is not None and self.pc_audio.running:
                 await asyncio.to_thread(self.pc_audio.stop)
         return {"enabled": False}
+
+    # audio.stop reasons that are the user's own choice: the sound simply
+    # goes back to the PC. Any other stop pauses the PC's players first.
+    PC_AUDIO_USER_STOPS = ("switched off", "left the dashboard")
+
+    async def _pc_audio_pause(self, why):
+        """Pause the PC's media players (MPRIS) because the phone playing
+        its sound is gone: unheard, or about to come out of the speakers.
+        The ones paused are kept in _pc_audio_paused for _pc_audio_resume."""
+        import pc_audio
+        paused = await asyncio.to_thread(pc_audio.pause_players)
+        for name in paused:
+            if name not in self._pc_audio_paused:
+                self._pc_audio_paused.append(name)
+        if paused:
+            print(f"[agent] PC sound: {why} — paused {', '.join(paused)}")
+
+    async def _pc_audio_resume(self):
+        """The listener is back (within the grace period): play again what
+        _pc_audio_pause paused."""
+        import pc_audio
+        pausing, self._pc_audio_pausing = self._pc_audio_pausing, None
+        if pausing is not None:
+            try:
+                await pausing   # a pause still in flight lands first
+            except Exception:
+                pass
+        names, self._pc_audio_paused = self._pc_audio_paused, []
+        if names:
+            await asyncio.to_thread(pc_audio.resume_players, names)
+            print(f"[agent] PC sound: the phone is back — playing "
+                  f"{', '.join(names)} again")
 
     # A listener that sends heartbeats (audio.alive, every 5 s) and then
     # says nothing for this long is gone, even if its socket looks open: a
@@ -3572,6 +3624,9 @@ class Agent:
         client, self._pc_audio_client = self._pc_audio_client, None
         if client is not None:
             asyncio.ensure_future(self._pc_audio_tell_stopped(client, reason))
+        # The speakers have the sound again: don't let it blare by itself.
+        self._pc_audio_paused = []
+        asyncio.ensure_future(self._pc_audio_pause("the capture stopped"))
 
     def _pc_audio_left(self):
         """The listening phone's socket is gone: no more packets, but the
@@ -3579,6 +3634,13 @@ class Agent:
         reconnects and sends audio.start again carries on without the PC's
         speakers blaring in between."""
         self._pc_audio_client = None
+        if self.pc_audio is not None and self.pc_audio.running and (
+                self._pc_audio_pausing is None
+                or self._pc_audio_pausing.done()):
+            # Pause at once: nobody hears the PC any more. Played again if
+            # the phone is back within the grace period.
+            self._pc_audio_pausing = asyncio.create_task(
+                self._pc_audio_pause("lost the phone"))
         if self._pc_audio_grace is None or self._pc_audio_grace.done():
             self._pc_audio_grace = asyncio.create_task(
                 self._pc_audio_grace_off())
@@ -3590,6 +3652,8 @@ class Agent:
                     and self.pc_audio.running:
                 print("[agent] the phone playing the PC's sound didn't come "
                       "back — sound back on the PC")
+                # The players it paused stay paused.
+                self._pc_audio_paused = []
                 await asyncio.to_thread(self.pc_audio.stop)
 
     def _pc_audio_persist(self, prev):

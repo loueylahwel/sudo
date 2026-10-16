@@ -19,8 +19,10 @@ import 'screen_page.dart';
 import 'window_switcher.dart';
 
 /// How a connect attempt reaches the PC: its LAN address, the router's
-/// forward of its TLS port (direct), or its Cloudflare tunnel.
-enum _Route { lan, direct, tunnel }
+/// forward of its TLS port (direct), its Cloudflare tunnel, or the USB
+/// cable (the agent keeps `adb reverse` of its TLS port on a phone plugged
+/// in with USB debugging on, see agent/usb_link.py).
+enum _Route { lan, direct, tunnel, usb }
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -399,6 +401,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         url = switch (route) {
           _Route.lan => _lanUrl(d),
           _Route.direct => d.remoteUrl,
+          _Route.usb => 'wss://127.0.0.1:${d.tlsPort}',
           _Route.tunnel =>
             await TunnelProxy.instance.localUrl(tunnelUrl ?? d.tunnelUrl),
         };
@@ -515,7 +518,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       var failures = 0;
       final c1 = RelayClient();
       final c2 = RelayClient();
-      final routes = current.hasInternet ? 3 : 2;
+      // Over the cable: only for a PC whose certificate is pinned (the
+      // TLS port), refused at once without a cable.
+      final usb = current.hasPin;
+      final routes = (current.hasInternet ? 3 : 2) + (usb ? 1 : 0);
       void win(RelayClient c, PairResult r, {bool remote = false}) {
         if (race.isCompleted) {
           // Another route won meanwhile: don't leave this session open.
@@ -554,6 +560,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             lose();
           }
         }());
+      }
+
+      if (usb) {
+        final c3 = RelayClient();
+        unawaited(attempt(c3, current, route: _Route.usb).then((r) {
+          if (r != null) {
+            win(c3, r);
+          } else {
+            lose();
+          }
+        }));
       }
 
       unawaited(
@@ -699,7 +716,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       _reconnecting = false;
       _reconnectAttempts = 0;
       _socketUp = true;
-      _viaText = viaRemote ? 'via internet' : 'via $usedHost';
+      _viaText = viaRemote
+          ? 'via internet'
+          : usedHost == '127.0.0.1'
+              ? 'via USB'
+              : 'via $usedHost';
     });
     _syncWidget(connected: true);
     // Best effort: mirror PC clipboard changes onto the phone.

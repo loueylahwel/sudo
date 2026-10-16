@@ -89,6 +89,8 @@ class OpusPlayer(context: Context) {
     @Volatile private var statDecoded = 0L
     @Volatile private var statWrittenMs = 0L
     @Volatile private var statPlaying = false
+    @Volatile private var statFlowing = false
+    @Volatile private var statStalls = 0
     @Volatile private var statCushionMs = 0L
     @Volatile private var statTargetMs = 0L
     @Volatile private var statUnderruns = 0
@@ -146,6 +148,8 @@ class OpusPlayer(context: Context) {
         statDecoded = 0
         statWrittenMs = 0
         statPlaying = false
+        statFlowing = false
+        statStalls = 0
         statUnderruns = 0
         statCodecErrors = 0
         statLastError = null
@@ -177,6 +181,8 @@ class OpusPlayer(context: Context) {
         "decoded" to statDecoded,
         "written_ms" to statWrittenMs,
         "playing" to statPlaying,
+        "flowing" to statFlowing,
+        "stalls" to statStalls,
         "cushion_ms" to statCushionMs,
         "target_ms" to statTargetMs,
         "underruns" to statUnderruns,
@@ -265,6 +271,20 @@ class OpusPlayer(context: Context) {
             track.release()
             throw IllegalStateException("The phone's audio output didn't open")
         }
+        // By default the mixer starts a track only once its WHOLE buffer is
+        // full (1 s here), and disables it after ~1 s of waiting. The
+        // cushion rules below never fill it that far, so the track stayed
+        // silent for good while everything else looked fine. This player
+        // decides itself when there is enough (play() at `target`): let the
+        // mixer go as soon as there is anything. Older Android: see
+        // Session.flowing.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                track.setStartThresholdInFrames(START_THRESHOLD_FRAMES)
+            } catch (e: Exception) {
+                statLastError = "start threshold: ${e.message}"
+            }
+        }
         return track
     }
 
@@ -317,6 +337,12 @@ class OpusPlayer(context: Context) {
         private var framesWritten = 0L
         // The track is playing; false while (re)buffering.
         private var playing = false
+        // The playback head moved since play(): the mixer really consumes
+        // the track. Until then nothing is dropped (an Android without a
+        // start threshold only starts a full track) and nothing trimmed.
+        private var flowing = false
+        private var headAtPlay = 0L
+        private var playAt = 0L
         private var targetMs = START_TARGET_MS
         private var targetChangedAt = SystemClock.elapsedRealtime()
         // Throwing decoded sound away until the cushion is back near target.
@@ -432,7 +458,7 @@ class OpusPlayer(context: Context) {
             if (dropping) {
                 if (cushion > targetMs + RESUME_ABOVE_TARGET_MS) return
                 dropping = false
-            } else if (playing && cushion > targetMs + MAX_ABOVE_TARGET_MS) {
+            } else if (playing && flowing && cushion > targetMs + MAX_ABOVE_TARGET_MS) {
                 dropping = true
                 return
             }
@@ -444,11 +470,19 @@ class OpusPlayer(context: Context) {
             statWrittenMs = framesWritten * 1000 / SAMPLE_RATE
             // Buffered enough (or the track is full): go.
             if (!playing && (cushionMs() >= targetMs || written < size)) {
-                track.play()
-                playing = true
-                statPlaying = true
-                restartWindow(SystemClock.elapsedRealtime())
+                startTrack()
             }
+        }
+
+        private fun startTrack() {
+            track.play()
+            playing = true
+            statPlaying = true
+            flowing = false
+            statFlowing = false
+            headAtPlay = head()
+            playAt = SystemClock.elapsedRealtime()
+            restartWindow(playAt)
         }
 
         /** Underrun -> pause and rebuffer with a bigger target; a calm link
@@ -459,6 +493,22 @@ class OpusPlayer(context: Context) {
             val cushion = cushionMs()
             statCushionMs = cushion
             statTargetMs = targetMs
+            if (!flowing) {
+                if (head() != headAtPlay) {
+                    flowing = true
+                    statFlowing = true
+                    restartWindow(now)
+                } else if (now - playAt >= STALL_MS) {
+                    // Still not consumed: the mixer gave up on the track
+                    // (disabled after waiting). Kick it again; the writes
+                    // that keep coming fill it meanwhile.
+                    statStalls++
+                    statLastError = "track stalled, restarting it"
+                    track.pause()
+                    startTrack()
+                }
+                return
+            }
             if (cushion < UNDERRUN_MS && packets.isEmpty()) {
                 track.pause()
                 playing = false
@@ -485,11 +535,12 @@ class OpusPlayer(context: Context) {
             windowMinMs = Long.MAX_VALUE
         }
 
+        // The head is an unsigned 32-bit frame count (wraps after ~25 h).
+        private fun head(): Long = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+
         /** Milliseconds of sound the track holds that haven't played yet. */
         private fun cushionMs(): Long {
-            // The head is an unsigned 32-bit frame count (wraps after ~25 h).
-            val head = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
-            val frames = (framesWritten - head) and 0xFFFFFFFFL
+            val frames = (framesWritten - head()) and 0xFFFFFFFFL
             // The head never passes what was written; anything else is a
             // stale read, count it as empty.
             if (frames > Int.MAX_VALUE) return 0
@@ -529,6 +580,10 @@ class OpusPlayer(context: Context) {
         const val TRIM_WINDOW_MS = 3_000L
         const val TRIM_ABOVE_TARGET_MS = 60L
         const val UNDERRUN_MS = 5L
+        // 20 ms: the mixer may start the track as soon as it holds this.
+        const val START_THRESHOLD_FRAMES = SAMPLE_RATE / 50
+        // A played track whose head hasn't moved after this is stuck.
+        const val STALL_MS = 1_500L
 
         const val LOOP_WAIT_MS = 10L
         const val INPUT_WAIT_US = 10_000L

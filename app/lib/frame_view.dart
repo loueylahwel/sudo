@@ -18,18 +18,26 @@ class FrameDecoder {
   /// the image) — pages relayout only when it changed.
   void Function(int w, int h)? onDecoded;
 
+  /// The [add] tag of the picture in [image], set together with it (e.g.
+  /// the part of the screen a zoomed-in frame shows): what's drawn and
+  /// where it goes can never be from two different frames.
+  Object? tag;
+
   Uint8List? _pending;
   int _pendingW = 0;
   int _pendingH = 0;
+  Object? _pendingTag;
   bool _decoding = false;
   bool _disposed = false;
 
-  /// Queues a JPEG; [w]/[h] are the header's size (0 = unknown).
-  void add(Uint8List jpeg, int w, int h) {
+  /// Queues a JPEG; [w]/[h] are the header's size (0 = unknown), [tag]
+  /// comes back as [tag] once this frame is the one shown.
+  void add(Uint8List jpeg, int w, int h, {Object? tag}) {
     if (_disposed) return;
     _pending = jpeg;
     _pendingW = w;
     _pendingH = h;
+    _pendingTag = tag;
     if (!_decoding) unawaited(_decodeLoop());
   }
 
@@ -40,6 +48,7 @@ class FrameDecoder {
         final jpeg = _pending!;
         final w = _pendingW;
         final h = _pendingH;
+        final frameTag = _pendingTag;
         _pending = null;
         ui.Image frame;
         try {
@@ -58,6 +67,7 @@ class FrameDecoder {
         }
         onDecoded?.call(w > 0 ? w : frame.width, h > 0 ? h : frame.height);
         final old = image.value;
+        tag = frameTag;
         image.value = frame;
         // RawImage paints its own clone, so ours can go now.
         old?.dispose();
@@ -70,6 +80,7 @@ class FrameDecoder {
   /// Drops the picture (the stream stopped for good).
   void clear() {
     _pending = null;
+    tag = null;
     final old = image.value;
     image.value = null;
     old?.dispose();

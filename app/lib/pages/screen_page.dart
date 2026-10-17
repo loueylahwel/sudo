@@ -157,7 +157,6 @@ class _ScreenPageState extends State<ScreenPage>
   // frame, so zoomed text is sharp instead of an enlarged small frame.
   bool _agentViews = false; // screen.start answered `views: true`
   List<double>? _sentView; // [x, y, w, h] asked for; null = whole screen
-  List<double>? _shownView; // the part _viewDecoder's frame shows
   Timer? _viewTimer;
   Size _viewport = Size.zero;
   late final FrameDecoder _viewDecoder = FrameDecoder();
@@ -377,14 +376,15 @@ class _ScreenPageState extends State<ScreenPage>
     if (_acks) _client.send('screen.ack');
     final v = frame.header['view'];
     if (v is List && v.length == 4) {
-      // A zoomed-in part: its own layer, never the page's frame size.
-      final view = [for (final e in v) (e as num).toDouble()];
+      // A zoomed-in part: its own layer (placed by the part it carries,
+      // see build), never the page's frame size.
       if (_sentView == null) return; // zoomed out meanwhile: stale
-      _viewDecoder.add(frame.jpegBytes, frame.w, frame.h);
-      if (!_sameView(view, _shownView)) setState(() => _shownView = view);
+      _viewDecoder.add(frame.jpegBytes, frame.w, frame.h,
+          tag: [for (final e in v) (e as num).toDouble()]);
       return;
     }
-    if (_shownView != null) setState(() => _shownView = null);
+    // A whole frame (also ones still on the way when zooming in): the
+    // picture under the zoomed layer.
     _decoder.add(frame.jpegBytes, frame.w, frame.h);
   }
 
@@ -421,8 +421,9 @@ class _ScreenPageState extends State<ScreenPage>
     if (_sameView(view, _sentView)) return;
     _sentView = view;
     if (view == null) {
+      // The zoomed layer stays until a fresh whole frame is decoded under
+      // it (_onDecoded): dropping it now would flash the old picture.
       _client.send('screen.view');
-      if (_shownView != null) setState(() => _shownView = null);
     } else {
       _client.send('screen.view',
           {'x': view[0], 'y': view[1], 'w': view[2], 'h': view[3]});
@@ -434,6 +435,11 @@ class _ScreenPageState extends State<ScreenPage>
   /// frame just repaints the picture.
   void _onDecoded(int w, int h) {
     if (!mounted) return;
+    // Zoomed out and a fresh whole frame is going up in this same step:
+    // the zoomed layer can go now without flashing an old picture.
+    if (_sentView == null && _viewDecoder.image.value != null) {
+      _viewDecoder.clear();
+    }
     if (w != _frameW || h != _frameH || _connectionLost) {
       setState(() {
         _frameW = w;
@@ -1105,7 +1111,6 @@ class _ScreenPageState extends State<ScreenPage>
               _viewport = Size(constraints.maxWidth, constraints.maxHeight);
               final boxW = _imageRect.width * _zoomScale;
               final boxH = _imageRect.height * _zoomScale;
-              final shown = _shownView;
               return Stack(
                 children: [
                   Positioned(
@@ -1119,14 +1124,24 @@ class _ScreenPageState extends State<ScreenPage>
                         FrameImage(_decoder),
                         // The zoomed-in part at the PC's own resolution,
                         // over the (older, coarser) whole frame.
-                        if (shown != null)
-                          Positioned(
-                            left: shown[0] * boxW,
-                            top: shown[1] * boxH,
-                            width: shown[2] * boxW,
-                            height: shown[3] * boxH,
-                            child: FrameImage(_viewDecoder),
-                          ),
+                        // Rebuilt per decoded zoomed frame, placed by the
+                        // part that very frame shows.
+                        ValueListenableBuilder<ui.Image?>(
+                          valueListenable: _viewDecoder.image,
+                          builder: (context, image, _) {
+                            final part = _viewDecoder.tag;
+                            if (image == null || part is! List<double>) {
+                              return const SizedBox.shrink();
+                            }
+                            return Positioned(
+                              left: part[0] * boxW,
+                              top: part[1] * boxH,
+                              width: part[2] * boxW,
+                              height: part[3] * boxH,
+                              child: FrameImage(_viewDecoder),
+                            );
+                          },
+                        ),
                         // Repaints on its own when the pointer moves:
                         // never a rebuild of the page or the picture.
                         if (_localCursor)

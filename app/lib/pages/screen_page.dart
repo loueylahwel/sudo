@@ -60,7 +60,28 @@ class ScreenPage extends StatefulWidget {
 }
 
 class _ScreenPageState extends State<ScreenPage>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  // Wi-Fi without power-save naps while this page is open and in front
+  // (native WifiBoost): otherwise phones like the owner's nap their Wi-Fi
+  // even with the screen on, frames arrive at 2 fps and the touchpad's moves
+  // reach the PC in bursts.
+  static const MethodChannel _wifi = MethodChannel('sudo/wifi');
+
+  void _holdWifi(bool on) {
+    unawaited(_wifi
+        .invokeMethod<void>('hold', {'tag': 'screen', 'on': on})
+        .then((_) {}, onError: (_) {}));
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _holdWifi(true);
+    } else if (state == AppLifecycleState.paused) {
+      _holdWifi(false);
+    }
+  }
+
   // The client frames/inputs currently flow over. Swapped for the registry's
   // client when HomePage's auto-reconnect replaces it, so the page keeps
   // working instead of staying bound to a dead client.
@@ -200,6 +221,8 @@ class _ScreenPageState extends State<ScreenPage>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _holdWifi(true);
     final cached = _cachedImage;
     if (cached != null) {
       _decoder.image.value = cached.clone();
@@ -220,6 +243,8 @@ class _ScreenPageState extends State<ScreenPage>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _holdWifi(false);
     _lpTimer?.cancel();
     _moveFlushTimer?.cancel();
     _gestureHintTimer?.cancel();

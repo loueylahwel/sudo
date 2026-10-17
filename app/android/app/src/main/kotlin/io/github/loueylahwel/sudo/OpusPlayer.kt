@@ -238,6 +238,8 @@ class OpusPlayer(context: Context) {
         "track_underruns" to statTrackUnderruns,
         "trims" to statTrims,
         "perf_mode" to statPerfMode,
+        "keepawake" to WifiKeepAwake.active,
+        "keepawake_sent" to WifiKeepAwake.sent,
         "codec_errors" to statCodecErrors,
         "last_error" to statLastError,
         "muted" to muted,

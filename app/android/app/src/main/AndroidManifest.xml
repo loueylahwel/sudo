@@ -1,5 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- WifiKeepAwake: is the active network Wi-Fi, and where is its router -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Voice dictation on the screen page (speech_to_text). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission

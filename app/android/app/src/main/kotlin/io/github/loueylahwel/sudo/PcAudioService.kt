@@ -15,7 +15,6 @@ import android.graphics.drawable.Icon
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -44,11 +43,7 @@ import java.net.URL
  */
 class PcAudioService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
-    // Android 10-13: LOW_LATENCY only works with the screen on and the app
-    // in front, so with the screen off (what this service is for) only
-    // HIGH_PERF keeps Wi-Fi power saving from batching the packets.
-    private var highPerfLock: WifiManager.WifiLock? = null
+    // Wi-Fi without power-save naps while the sound plays: see WifiBoost.
 
     private var session: MediaSession? = null
 
@@ -209,41 +204,13 @@ class PcAudioService : Service() {
                 acquire()
             }
         }
-        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        if (wifiLock == null) {
-            // Low latency keeps Wi-Fi power saving from batching packets
-            // into late clumps; before Android 10 high-perf is the closest.
-            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
-                @Suppress("DEPRECATION")
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
-            }
-            wifiLock = wifi.createWifiLock(mode, "sudo:pc-sound").apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        }
-        if (highPerfLock == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE
-        ) {
-            @Suppress("DEPRECATION")
-            highPerfLock = wifi.createWifiLock(
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF, "sudo:pc-sound-hp",
-            ).apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        }
+        WifiBoost.hold(this, BOOST_TAG, true)
     }
 
     private fun releaseLocks() {
+        WifiBoost.hold(this, BOOST_TAG, false)
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
-        wifiLock?.let { if (it.isHeld) it.release() }
-        wifiLock = null
-        highPerfLock?.let { if (it.isHeld) it.release() }
-        highPerfLock = null
     }
 
     private fun buildNotification(): Notification {
@@ -315,6 +282,7 @@ class PcAudioService : Service() {
     }
 
     companion object {
+        private const val BOOST_TAG = "pc-sound"
         private const val TAG = "SudoPcAudio"
         private const val CHANNEL_ID = "pc_audio"
         private const val NOTIFICATION_ID = 4107

@@ -189,6 +189,18 @@ class MainActivity : FlutterActivity() {
     private fun configurePcAudio(flutterEngine: FlutterEngine) {
         val player = OpusPlayer(this)
         opusPlayer = player
+        // "sudo/wifi": hold(tag, on). The Screen page holds Wi-Fi without
+        // power-save naps while it is open (see WifiBoost).
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "sudo/wifi")
+            .setMethodCallHandler { call, result ->
+                if (call.method == "hold") {
+                    val tag = call.argument<String>("tag") ?: "dart"
+                    WifiBoost.hold(this, tag, call.argument<Boolean>("on") == true)
+                    result.success(null)
+                } else {
+                    result.notImplemented()
+                }
+            }
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "sudo/pcaudio")
         player.onStopped = { reason ->
             endPcAudio()

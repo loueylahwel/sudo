@@ -3210,56 +3210,77 @@ class Agent:
 
         asyncio.ensure_future(run())
 
+    # Touchpad diagnostics: a pause this long starts the numbers afresh, so
+    # a line never mixes a session of use with one from hours before.
+    MOVE_STATS_RESET = 30.0
+
     def _move_timing(self, arrived, applied, sent=None):
         """Touchpad diagnostics (journalctl): how evenly the phone's
         move_rel messages arrive (the app sends one every ~16 ms while a
         finger moves) and how long applying one takes. Bursts after long
         gaps point at the network or the phone; slow applies at the PC.
-        One line per ~5 s of movement."""
+        One line per ~5 s of movement, short swipes added up (a pause over
+        MOVE_STATS_RESET drops what was gathered before it)."""
         st = self.__dict__.setdefault("_mt", {"last": 0.0, "gaps": [],
-                                              "apply": [], "since": 0.0,
+                                              "apply": [], "moving": 0.0,
                                               "sent": None, "sgaps": [],
-                                              "transit": []})
-        if arrived - st["last"] < 1.0:     # same gesture: count the gap
-            st["gaps"].append((arrived - st["last"]) * 1000)
+                                              "transit": [], "swipe": []})
+        gap = arrived - st["last"]
+        if gap < 1.0:     # same swipe: count the gap
+            st["gaps"].append(gap * 1000)
+            st["moving"] += gap
             if isinstance(sent, (int, float)) and st["sent"] is not None:
                 st["sgaps"].append(sent - st["sent"])
         else:
-            st["since"] = arrived
+            self._move_swipe_end(st)
+            if gap >= self.MOVE_STATS_RESET:
+                st["gaps"], st["apply"], st["moving"] = [], [], 0.0
+                st["sgaps"], st["transit"] = [], []
         st["last"] = arrived
         if isinstance(sent, (int, float)):
             # Newer apps stamp each move with their own clock (ms): the
             # spread of arrival - sent is the network's added delay.
             st["sent"] = sent
-            st["transit"].append(arrived * 1000 - sent)
+            st["swipe"].append(arrived * 1000 - sent)
         st["apply"].append((applied - arrived) * 1000)
-        if arrived - st["since"] >= 5.0 and len(st["gaps"]) >= 10:
+        if st["moving"] >= 5.0 and len(st["gaps"]) >= 10:
+            self._move_swipe_end(st)
             g = sorted(st["gaps"])
             a = sorted(st["apply"])
             n = len(g)
-            print(f"[agent] touchpad: {n + 1} moves in "
-                  f"{arrived - st['since']:.1f}s, gap median {g[n // 2]:.0f} "
-                  f"p95 {g[int(n * .95)]:.0f} max {g[-1]:.0f} ms, "
-                  f"{sum(1 for x in g if x < 3)} back-to-back, apply median "
-                  f"{a[len(a) // 2]:.1f} p95 {a[int(len(a) * .95)]:.1f} max "
-                  f"{a[-1]:.1f} ms" + self._move_timing_phone(st))
-            st["gaps"], st["apply"], st["since"] = [], [], arrived
+            print(f"[agent] touchpad: {len(a)} moves in "
+                  f"{st['moving']:.1f}s of movement, gap median "
+                  f"{g[n // 2]:.0f} p95 {g[int(n * .95)]:.0f} max "
+                  f"{g[-1]:.0f} ms, {sum(1 for x in g if x < 3)} "
+                  f"back-to-back, apply median {a[len(a) // 2]:.1f} p95 "
+                  f"{a[int(len(a) * .95)]:.1f} max {a[-1]:.1f} ms"
+                  + self._move_timing_phone(st))
+            st["gaps"], st["apply"], st["moving"] = [], [], 0.0
             st["sgaps"], st["transit"] = [], []
+
+    @staticmethod
+    def _move_swipe_end(st):
+        """A swipe's arrival - sent values, made relative to its quickest
+        move. Per swipe: the app's clock starts at 0 with each app process,
+        so values from two runs of the app are hours apart."""
+        if st["swipe"]:
+            base = min(st["swipe"])
+            st["transit"].extend(x - base for x in st["swipe"])
+            st["swipe"] = []
 
     @staticmethod
     def _move_timing_phone(st):
         """The phone's side, when its moves carry `t`: gaps between sends
-        (the phone late) and how much later than the quickest one each move
-        arrived (the network late)."""
+        (the phone late) and how much later than the quickest move of its
+        swipe each move arrived (the network late)."""
         if len(st["sgaps"]) < 10 or not st["transit"]:
             return ""
         sg = sorted(st["sgaps"])
-        base = min(st["transit"])
-        tr = sorted(x - base for x in st["transit"])
+        tr = sorted(st["transit"])
         n, m = len(sg), len(tr)
         return (f"; phone send gap median {sg[n // 2]:.0f} p95 "
                 f"{sg[int(n * .95)]:.0f} max {sg[-1]:.0f} ms, network "
-                f"delay above best median {tr[m // 2]:.0f} p95 "
+                f"delay above the swipe's best median {tr[m // 2]:.0f} p95 "
                 f"{tr[int(m * .95)]:.0f} max {tr[-1]:.0f} ms")
 
     async def h_input(self, msg):

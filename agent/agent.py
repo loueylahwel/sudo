@@ -343,21 +343,48 @@ class DuplicatedShot:
         self.size = (img.shape[1], img.shape[0])
 
 
-def encode_frame(shot, mon, pos, width, quality, subsampling):
+def view_box(view, w0, h0):
+    """A view (x, y, w, h as fractions of the monitor, see
+    ScreenStreamer.set_view) as pixel bounds (x0, y0, x1, y1) of a w0 x h0
+    grab; the whole grab for None."""
+    if view is None:
+        return 0, 0, w0, h0
+    x, y, w, h = view
+    x0, y0 = int(x * w0), int(y * h0)
+    x1 = max(x0 + 1, min(w0, int(round((x + w) * w0))))
+    y1 = max(y0 + 1, min(h0, int(round((y + h) * h0))))
+    return x0, y0, x1, y1
+
+
+def encode_frame(shot, mon, pos, width, quality, subsampling, view=None):
     """Resize a grabbed frame to width (never up), draw the cursor and
     JPEG-encode it with subsampling "420"/"422"/"444". Returns (jpeg,
     w, h). Runs on a streamer's encode thread, concurrently with the next
-    grab on the capture thread."""
-    w0, h0 = shot.size
+    grab on the capture thread. With a view only that part of the grab is
+    sent, never wider than it is on the PC: a zoomed-in phone gets the
+    PC's own pixels instead of an enlarged small frame."""
+    fw, fh = shot.size
+    x0, y0, x1, y1 = view_box(view, fw, fh)
+    w0, h0 = x1 - x0, y1 - y0
+    if view is not None:
+        # The cursor's monitor rect, narrowed to the part being sent.
+        sx, sy = mon["width"] / fw, mon["height"] / fh
+        mon = {"left": mon["left"] + x0 * sx, "top": mon["top"] + y0 * sy,
+               "width": w0 * sx, "height": h0 * sy}
     width = max(1, min(int(width), w0))
     height = max(1, round(h0 * width / w0))
     cv2, np = _cv()
     if cv2 is not None:
         # shot.raw is a private bytearray copy (mss copies the DIB out), so
         # the cursor may be painted straight into it at native width.
-        img = np.frombuffer(shot.raw, np.uint8).reshape(h0, w0, 4)
-        if width == w0 and getattr(shot, "shared", False):
-            img = img.copy()  # never paint the cursor into a reused buffer
+        img = np.frombuffer(shot.raw, np.uint8).reshape(fh, fw, 4)
+        if view is not None:
+            img = img[y0:y1, x0:x1]
+        if width == w0 and (getattr(shot, "shared", False)
+                            or view is not None):
+            # never paint the cursor into a reused buffer (a crop is still
+            # the grab's memory); the copy is contiguous for the encoder
+            img = img.copy()
         if width != w0:
             # INTER_AREA (box average) from 2x down: alias-free and the
             # cheapest. Under 2x it softens text, where INTER_CUBIC is
@@ -376,7 +403,9 @@ def encode_frame(shot, mon, pos, width, quality, subsampling):
         if not ok:
             raise RuntimeError("JPEG encode failed")
         return buf.tobytes(), width, height
-    img = Image.frombuffer("RGB", (w0, h0), shot.raw, "raw", "BGRX", 0, 1)
+    img = Image.frombuffer("RGB", (fw, fh), shot.raw, "raw", "BGRX", 0, 1)
+    if view is not None:
+        img = img.crop((x0, y0, x1, y1))
     if w0 // width >= 2:
         img = img.reduce(w0 // width)  # cheap box pre-pass, like AREA
     if img.size != (width, height):
@@ -600,6 +629,9 @@ class ScreenStreamer:
         # movement (see wake).
         self._refresh_at = 0.0
         self._refresh_crc = None      # checksum of the last refresh passed on
+        # The part of the monitor the phone shows (screen.view, while zoomed
+        # in): (x, y, w, h) as fractions, None = all of it.
+        self.view = None
         self._hot_until = 0.0         # stay at full rate briefly after change
         self._grab_pool = ThreadPoolExecutor(1, "sudo-screen-grab")
         self._enc_pool = ThreadPoolExecutor(1, "sudo-screen-encode")
@@ -631,6 +663,16 @@ class ScreenStreamer:
     def wake(self):
         if self.client_cursor and not self._refresh_at:
             self._refresh_at = time.monotonic() + self.REFRESH_AFTER
+        self._wake.set()
+
+    def set_view(self, view):
+        """screen.view: send only this part of the monitor (zoomed in on the
+        phone), at up to its own resolution; None = the whole monitor. The
+        next frame is sent at once, changed or not."""
+        if view == self.view:
+            return
+        self.view = view
+        self._force = True
         self._wake.set()
 
     def unacked_sent(self):
@@ -1316,17 +1358,20 @@ class ScreenStreamer:
         shot, pos, rect = grabbed
         level = self._level
         width, quality = self._current()
+        view = self.view  # as this frame is encoded (header says the same)
         sent = None
         try:
             jpeg, w, h = await asyncio.get_running_loop().run_in_executor(
                 self._enc_pool, encode_frame, shot, rect, pos, width,
-                quality, self.subsampling)
+                quality, self.subsampling, view)
             if self.binary:
                 header = json.dumps({
                     "w": w, "h": h, "src": "screen",
                     # effective settings, for the app's stats overlay
                     # (older apps ignore unknown keys)
                     "q": quality, "preset": self.preset,
+                    # the part of the monitor this frame shows (zoom)
+                    **({"view": list(view)} if view is not None else {}),
                 }).encode()
                 packet = b"PJF1" + len(header).to_bytes(4, "little") \
                     + header + jpeg
@@ -2303,12 +2348,19 @@ def _target(msg, key):
     return value
 
 
+psutil.cpu_percent(interval=None)  # prime: sys_info reads since this
+
+
 def sys_info():
     w, h = screen_size()
     return {
         "name": platform.node(),
         "platform": f"{platform.system()} {platform.release()}",
-        "cpu_percent": psutil.cpu_percent(interval=0.2),
+        # interval=None: usage since the previous call (primed at import),
+        # instead of sampling 200 ms here. sys.info is the first request a
+        # phone sends and runs in its lane: the dashboard's other requests
+        # (media, brightness, power...) used to wait those 200 ms behind it.
+        "cpu_percent": psutil.cpu_percent(interval=None),
         "mem_total": psutil.virtual_memory().total,
         "mem_used": psutil.virtual_memory().used,
         "uptime": int(time.time() - psutil.boot_time()),
@@ -3142,6 +3194,58 @@ class Agent:
 
         asyncio.ensure_future(run())
 
+    def _move_timing(self, arrived, applied, sent=None):
+        """Touchpad diagnostics (journalctl): how evenly the phone's
+        move_rel messages arrive (the app sends one every ~16 ms while a
+        finger moves) and how long applying one takes. Bursts after long
+        gaps point at the network or the phone; slow applies at the PC.
+        One line per ~5 s of movement."""
+        st = self.__dict__.setdefault("_mt", {"last": 0.0, "gaps": [],
+                                              "apply": [], "since": 0.0,
+                                              "sent": None, "sgaps": [],
+                                              "transit": []})
+        if arrived - st["last"] < 1.0:     # same gesture: count the gap
+            st["gaps"].append((arrived - st["last"]) * 1000)
+            if isinstance(sent, (int, float)) and st["sent"] is not None:
+                st["sgaps"].append(sent - st["sent"])
+        else:
+            st["since"] = arrived
+        st["last"] = arrived
+        if isinstance(sent, (int, float)):
+            # Newer apps stamp each move with their own clock (ms): the
+            # spread of arrival - sent is the network's added delay.
+            st["sent"] = sent
+            st["transit"].append(arrived * 1000 - sent)
+        st["apply"].append((applied - arrived) * 1000)
+        if arrived - st["since"] >= 5.0 and len(st["gaps"]) >= 10:
+            g = sorted(st["gaps"])
+            a = sorted(st["apply"])
+            n = len(g)
+            print(f"[agent] touchpad: {n + 1} moves in "
+                  f"{arrived - st['since']:.1f}s, gap median {g[n // 2]:.0f} "
+                  f"p95 {g[int(n * .95)]:.0f} max {g[-1]:.0f} ms, "
+                  f"{sum(1 for x in g if x < 3)} back-to-back, apply median "
+                  f"{a[len(a) // 2]:.1f} p95 {a[int(len(a) * .95)]:.1f} max "
+                  f"{a[-1]:.1f} ms" + self._move_timing_phone(st))
+            st["gaps"], st["apply"], st["since"] = [], [], arrived
+            st["sgaps"], st["transit"] = [], []
+
+    @staticmethod
+    def _move_timing_phone(st):
+        """The phone's side, when its moves carry `t`: gaps between sends
+        (the phone late) and how much later than the quickest one each move
+        arrived (the network late)."""
+        if len(st["sgaps"]) < 10 or not st["transit"]:
+            return ""
+        sg = sorted(st["sgaps"])
+        base = min(st["transit"])
+        tr = sorted(x - base for x in st["transit"])
+        n, m = len(sg), len(tr)
+        return (f"; phone send gap median {sg[n // 2]:.0f} p95 "
+                f"{sg[int(n * .95)]:.0f} max {sg[-1]:.0f} ms, network "
+                f"delay above best median {tr[m // 2]:.0f} p95 "
+                f"{tr[int(m * .95)]:.0f} max {tr[-1]:.0f} ms")
+
     async def h_input(self, msg):
         action = msg.get("action")
         # Pointer coordinates are relative to the monitor this client is
@@ -3151,7 +3255,9 @@ class Agent:
         if action == "move":
             do_move(msg.get("x", 0), msg.get("y", 0), rect)
         elif action == "move_rel":
+            t0 = time.monotonic()
             do_move_rel(msg.get("dx", 0), msg.get("dy", 0), rect)
+            self._move_timing(t0, time.monotonic(), msg.get("t"))
         elif action == "click":
             do_click(msg.get("button", "left"), "click",
                      msg.get("x"), msg.get("y"), msg.get("count", 1), rect)
@@ -3374,6 +3480,8 @@ class Agent:
                 "adaptive": streamer.adaptive, "w": w, "h": h,
                 "ack": streamer.acks, "monitor": rect,
                 "cursor": "client" if streamer.client_cursor else "frame",
+                # screen.view (send only the zoomed-in part) is understood
+                "views": True,
                 # The phone's first pointer position, in the reply so it
                 # can't arrive before the phone knows to draw it; `cursor`
                 # events follow every change.
@@ -3462,6 +3570,28 @@ class Agent:
             threading.Thread(target=remote_access.remove_mapping,
                              args=(port, lan_ip()), daemon=True).start()
         return port, ctx
+
+    async def h_screen_view(self, msg):
+        """screen.view {x, y, w, h} (fractions of the streamed monitor): the
+        phone is zoomed in on that part, so only it is sent, at up to the
+        PC's own resolution; no (or a full-size) view = the whole monitor.
+        Frames say which part they show (`view` in the PJF1 header)."""
+        streamer = self.streamers.get(msg.get("from"))
+        if streamer is None:
+            return {"view": None}
+        try:
+            x, y = float(msg["x"]), float(msg["y"])
+            w, h = float(msg["w"]), float(msg["h"])
+        except (KeyError, TypeError, ValueError):
+            view = None
+        else:
+            # At least 5% of the monitor each way, inside it.
+            w, h = min(1.0, max(0.05, w)), min(1.0, max(0.05, h))
+            x, y = min(max(0.0, x), 1.0 - w), min(max(0.0, y), 1.0 - h)
+            view = None if w >= 0.98 and h >= 0.98 else \
+                (round(x, 4), round(y, 4), round(w, 4), round(h, 4))
+        streamer.set_view(view)
+        return {"view": list(view) if view else None}
 
     async def h_screen_ack(self, msg):
         streamer = self.streamers.get(msg.get("from"))
@@ -4274,6 +4404,7 @@ class Agent:
         "screen.start": h_screen_start,
         "screen.stop": h_screen_stop,
         "screen.ack": h_screen_ack,
+        "screen.view": h_screen_view,
         "remote.info": h_remote_info,
         "camera.start": h_camera_start,
         "camera.stop": h_camera_stop,
@@ -4837,6 +4968,7 @@ class Agent:
             if msg.get("id"):
                 await self.reply(msg, ok=False, error=f"unknown cmd: {cmd}")
             return
+        msg["_arrived"] = time.monotonic()
         if cmd in self.FAST_CMDS:
             await self._dispatch(handler, msg)
             return
@@ -4858,6 +4990,7 @@ class Agent:
                            # opening the Screen page must not wait behind a
                            # slow request, and acks pace the stream
                            "screen.start", "screen.stop", "screen.ack",
+                           "screen.view",
                            # never queued behind a slow request
                            "audio.alive"})
 
@@ -4866,10 +4999,27 @@ class Agent:
             handler, msg = await queue.get()
             await self._dispatch(handler, msg)
 
+    # A request slower than this (waiting in its lane + running) is logged:
+    # what makes buttons feel late, e.g. right after the app connects.
+    SLOW_REQUEST_S = 0.15
+
+    def _note_slow(self, msg, started):
+        arrived = msg.get("_arrived")
+        if arrived is None or msg.get("cmd") in ("screen.ack", "input"):
+            return
+        done = time.monotonic()
+        if done - arrived >= self.SLOW_REQUEST_S:
+            print(f"[agent] slow request: {msg.get('cmd')} "
+                  f"{(done - arrived) * 1000:.0f} ms (waited "
+                  f"{(started - arrived) * 1000:.0f} ms in line, ran "
+                  f"{(done - started) * 1000:.0f} ms)")
+
     async def _dispatch(self, handler, msg):
+        started = time.monotonic()
         try:
             try:
                 data = await handler(self, msg)
+                self._note_slow(msg, started)
                 if msg.get("id"):
                     await self.reply(msg, ok=True, data=data)
             except Exception as e:

@@ -322,6 +322,21 @@ class MainActivity : FlutterActivity() {
         return super.dispatchKeyEvent(event)
     }
 
+    // Sudo on screen = someone driving the PC: Wi-Fi without power-save naps
+    // the whole time, not only on the Screen page. Napping, the owner's
+    // phone answered the PC only every ~0.5 s: dashboard buttons (media)
+    // replied late, and the connection was still slow when the Screen page
+    // opened, so the first seconds of touchpad moves stalled. See WifiBoost.
+    override fun onResume() {
+        super.onResume()
+        WifiBoost.hold(this, "app", true)
+    }
+
+    override fun onPause() {
+        WifiBoost.hold(this, "app", false)
+        super.onPause()
+    }
+
     override fun onDestroy() {
         videoDecoder?.release()
         videoDecoder = null

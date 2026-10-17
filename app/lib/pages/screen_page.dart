@@ -151,6 +151,20 @@ class _ScreenPageState extends State<ScreenPage>
   // the last seq applied, and the moves up to it are dropped.
   bool _localCursor = false;
   int _moveSeq = 0;
+
+  // Zoomed in: the PC sends only the visible part, at up to its own
+  // resolution (screen.view), shown as a second layer over the last whole
+  // frame, so zoomed text is sharp instead of an enlarged small frame.
+  bool _agentViews = false; // screen.start answered `views: true`
+  List<double>? _sentView; // [x, y, w, h] asked for; null = whole screen
+  List<double>? _shownView; // the part _viewDecoder's frame shows
+  Timer? _viewTimer;
+  Size _viewport = Size.zero;
+  late final FrameDecoder _viewDecoder = FrameDecoder();
+  // Send time of each move (`t`, ms on this clock): the agent's touchpad
+  // log tells the phone sending late (gaps in `t`) from the network
+  // delivering late (even `t`, uneven arrival).
+  static final Stopwatch _clock = Stopwatch()..start();
   Offset? _cursorBase; // PC-reported position, fraction of the monitor
   final List<(int, double, double)> _unappliedMoves = [];
   final ValueNotifier<Offset?> _cursorPos = ValueNotifier(null);
@@ -257,6 +271,8 @@ class _ScreenPageState extends State<ScreenPage>
     _frameSub?.cancel();
     _connSub?.cancel();
     // Keep the last frame for the next Screen page (see _cachedImage).
+    _viewTimer?.cancel();
+    _viewDecoder.dispose()?.dispose();
     final last = _decoder.dispose();
     if (last != null) {
       _cachedImage?.dispose();
@@ -316,7 +332,10 @@ class _ScreenPageState extends State<ScreenPage>
         _binaryMode = resp['binary'] == true;
         _acks = resp['ack'] == true;
         _localCursor = resp['cursor'] == 'client';
+        _agentViews = resp['views'] == true;
       });
+      _sentView = null;
+      _scheduleViewUpdate();
       // A new stream: moves sent before it were applied or lost with the
       // old connection; the reply's pointer is the fresh starting point.
       _unappliedMoves.clear();
@@ -356,7 +375,58 @@ class _ScreenPageState extends State<ScreenPage>
     // here, so at most two are ever on the way. Decoding is newest-wins
     // (FrameDecoder), so a slow decode can't build a queue either.
     if (_acks) _client.send('screen.ack');
+    final v = frame.header['view'];
+    if (v is List && v.length == 4) {
+      // A zoomed-in part: its own layer, never the page's frame size.
+      final view = [for (final e in v) (e as num).toDouble()];
+      if (_sentView == null) return; // zoomed out meanwhile: stale
+      _viewDecoder.add(frame.jpegBytes, frame.w, frame.h);
+      if (!_sameView(view, _shownView)) setState(() => _shownView = view);
+      return;
+    }
+    if (_shownView != null) setState(() => _shownView = null);
     _decoder.add(frame.jpegBytes, frame.w, frame.h);
+  }
+
+  static bool _sameView(List<double>? a, List<double>? b) {
+    if (a == null || b == null) return a == b;
+    for (var i = 0; i < 4; i++) {
+      if ((a[i] - b[i]).abs() > 0.002) return false;
+    }
+    return true;
+  }
+
+  /// Zoom or pinch changed: tell the PC which part is visible, at most
+  /// every 150 ms (pinching moves it continuously).
+  void _scheduleViewUpdate() {
+    if (!_agentViews) return;
+    _viewTimer ??= Timer(const Duration(milliseconds: 150), () {
+      _viewTimer = null;
+      _sendView();
+    });
+  }
+
+  void _sendView() {
+    if (!mounted || !_agentViews) return;
+    List<double>? view;
+    if (_zoomScale > 1.05 && !_imageRect.isEmpty && !_viewport.isEmpty) {
+      final bw = _imageRect.width * _zoomScale;
+      final bh = _imageRect.height * _zoomScale;
+      final x0 = (-_zoomOrigin.dx / bw).clamp(0.0, 1.0);
+      final x1 = ((_viewport.width - _zoomOrigin.dx) / bw).clamp(0.0, 1.0);
+      final y0 = (-_zoomOrigin.dy / bh).clamp(0.0, 1.0);
+      final y1 = ((_viewport.height - _zoomOrigin.dy) / bh).clamp(0.0, 1.0);
+      if (x1 > x0 && y1 > y0) view = [x0, y0, x1 - x0, y1 - y0];
+    }
+    if (_sameView(view, _sentView)) return;
+    _sentView = view;
+    if (view == null) {
+      _client.send('screen.view');
+      if (_shownView != null) setState(() => _shownView = null);
+    } else {
+      _client.send('screen.view',
+          {'x': view[0], 'y': view[1], 'w': view[2], 'h': view[3]});
+    }
   }
 
   /// A frame was decoded: relayout only when its size changed (the auto
@@ -529,6 +599,7 @@ class _ScreenPageState extends State<ScreenPage>
       'dx': dx,
       'dy': dy,
       'seq': seq,
+      't': _clock.elapsedMilliseconds,
     });
     if (_localCursor) _unappliedMoves.add((seq, dx, dy));
   }
@@ -578,6 +649,7 @@ class _ScreenPageState extends State<ScreenPage>
     final mid = (_lastPos + _secondPos) / 2;
     final dist = (_secondPos - _lastPos).distance;
     final scale = (_pinchStartScale * dist / _pinchStartDist).clamp(1.0, 5.0);
+    _scheduleViewUpdate();
     setState(() {
       _zoomScale = scale.toDouble();
       _zoomOrigin =
@@ -1030,6 +1102,10 @@ class _ScreenPageState extends State<ScreenPage>
                 w,
                 h,
               );
+              _viewport = Size(constraints.maxWidth, constraints.maxHeight);
+              final boxW = _imageRect.width * _zoomScale;
+              final boxH = _imageRect.height * _zoomScale;
+              final shown = _shownView;
               return Stack(
                 children: [
                   Positioned(
@@ -1041,6 +1117,16 @@ class _ScreenPageState extends State<ScreenPage>
                       fit: StackFit.expand,
                       children: [
                         FrameImage(_decoder),
+                        // The zoomed-in part at the PC's own resolution,
+                        // over the (older, coarser) whole frame.
+                        if (shown != null)
+                          Positioned(
+                            left: shown[0] * boxW,
+                            top: shown[1] * boxH,
+                            width: shown[2] * boxW,
+                            height: shown[3] * boxH,
+                            child: FrameImage(_viewDecoder),
+                          ),
                         // Repaints on its own when the pointer moves:
                         // never a rebuild of the page or the picture.
                         if (_localCursor)
@@ -1110,7 +1196,10 @@ class _ScreenPageState extends State<ScreenPage>
                           : 72 + MediaQuery.paddingOf(context).bottom,
                       child: ActionChip(
                         label: Text('${(_zoomScale * 100).round()}% — reset'),
-                        onPressed: () => setState(() => _zoomScale = 1.0),
+                        onPressed: () {
+                          setState(() => _zoomScale = 1.0);
+                          _scheduleViewUpdate();
+                        },
                       ),
                     ),
                   // Dictation overlay: red pulsing mic + live partial text.

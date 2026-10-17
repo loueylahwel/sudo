@@ -665,6 +665,9 @@ class ScreenStreamer:
             self._refresh_at = time.monotonic() + self.REFRESH_AFTER
         self._wake.set()
 
+    # JPEG quality of zoomed-in parts (see _encode_and_send).
+    VIEW_QUALITY = 85
+
     def set_view(self, view):
         """screen.view: send only this part of the monitor (zoomed in on the
         phone), at up to its own resolution; None = the whole monitor. The
@@ -1358,12 +1361,24 @@ class ScreenStreamer:
         shot, pos, rect = grabbed
         level = self._level
         width, quality = self._current()
-        view = self.view  # as this frame is encoded (header says the same)
+        asked = view = self.view  # as this frame is encoded (and headed)
+        subsampling = self.subsampling
+        if view is not None:
+            # A zoomed-in part is shown magnified 2-5x: at the stream's
+            # quality (down to q45, 4:2:0 on a busy link) JPEG's ringing and
+            # colour bleed around letters become outlines and fringes. It
+            # is small, so it gets near-lossless quality and full colour.
+            quality, subsampling = max(quality, self.VIEW_QUALITY), "444"
+            # Its exact pixels, not the fractions asked for: the phone
+            # places it by these, so it lines up with the frame below.
+            fw, fh = shot.size
+            x0, y0, x1, y1 = view_box(view, fw, fh)
+            view = (x0 / fw, y0 / fh, (x1 - x0) / fw, (y1 - y0) / fh)
         sent = None
         try:
             jpeg, w, h = await asyncio.get_running_loop().run_in_executor(
                 self._enc_pool, encode_frame, shot, rect, pos, width,
-                quality, self.subsampling, view)
+                quality, subsampling, asked)
             if self.binary:
                 header = json.dumps({
                     "w": w, "h": h, "src": "screen",
@@ -1371,7 +1386,8 @@ class ScreenStreamer:
                     # (older apps ignore unknown keys)
                     "q": quality, "preset": self.preset,
                     # the part of the monitor this frame shows (zoom)
-                    **({"view": list(view)} if view is not None else {}),
+                    **({"view": [round(v, 6) for v in view]}
+                       if view is not None else {}),
                 }).encode()
                 packet = b"PJF1" + len(header).to_bytes(4, "little") \
                     + header + jpeg

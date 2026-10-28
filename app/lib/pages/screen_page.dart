@@ -131,6 +131,18 @@ class _ScreenPageState extends State<ScreenPage>
   // _startStream runs again once the current one finishes.
   bool _restartPending = false;
 
+  // Which PC screen is streamed (screen.start's `monitor` index; null = the
+  // main one). Static like _cachedImage: the next Screen page opens on the
+  // screen the last one showed.
+  static int? _monitor;
+  // The screens the PC offers (screen.start's `monitors`: index, label,
+  // ...) and which of them is showing. Fewer than two: no switch button.
+  List<Map<String, dynamic>> _monitors = const [];
+  int? _monitorIndex;
+  // The next screen.start asks the PC to put its pointer on the screen
+  // shown (set by _switchScreen, so the touchpad moves a visible pointer).
+  bool _bringPointer = false;
+
   double _scrollAccum = 0;
   double _scrollAccumX = 0;
   static const double _scrollThreshold = 24;
@@ -315,10 +327,18 @@ class _ScreenPageState extends State<ScreenPage>
       return;
     }
     _starting = true;
+    final switching = _bringPointer;
+    _bringPointer = false;
     try {
       final resp = await _client.request(
         'screen.start',
-        _legacyAgent ? _legacyStreamParams : _streamParams,
+        _legacyAgent
+            ? _legacyStreamParams
+            : {
+                ..._streamParams,
+                if (_monitor != null) 'monitor': _monitor,
+                if (switching) 'bring_pointer': true,
+              },
       );
       if (!mounted) return;
       if (resp['preset'] == null && !_legacyAgent) {
@@ -332,7 +352,19 @@ class _ScreenPageState extends State<ScreenPage>
         _acks = resp['ack'] == true;
         _localCursor = resp['cursor'] == 'client';
         _agentViews = resp['views'] == true;
+        final monitors = resp['monitors'];
+        _monitors = monitors is List
+            ? [for (final m in monitors) (m as Map).cast<String, dynamic>()]
+            : const [];
+        _monitorIndex = (resp['monitor_index'] as num?)?.toInt();
       });
+      if (switching) {
+        final pos = _monitors.indexWhere((m) => m['index'] == _monitorIndex);
+        if (pos >= 0) {
+          showMessage(context,
+              '${_monitors[pos]['label']} (screen ${pos + 1} of ${_monitors.length})');
+        }
+      }
       _sentView = null;
       _scheduleViewUpdate();
       // A new stream: moves sent before it were applied or lost with the
@@ -343,7 +375,14 @@ class _ScreenPageState extends State<ScreenPage>
       if (pointer is Map) _onCursor(pointer.cast<String, dynamic>());
       _updateLocalCursor();
     } catch (e) {
-      if (mounted) showError(context, e);
+      if (_monitor != null && '$e'.startsWith('no monitor')) {
+        // The chosen screen was unplugged: back to the main one.
+        _monitor = null;
+        _restartPending = true;
+        if (mounted) showMessage(context, 'That screen is gone: showing the main one');
+      } else if (mounted) {
+        showError(context, e);
+      }
     } finally {
       _starting = false;
       if (_restartPending && mounted) {
@@ -500,6 +539,45 @@ class _ScreenPageState extends State<ScreenPage>
         _locked ? Icons.lock : Icons.lock_open,
         color: _locked ? Colors.amberAccent : null,
       );
+
+  /// Shows the PC's next screen (the other one, with two). The zoom is
+  /// reset — it framed a part of the old screen — and the PC pointer
+  /// moves over, so the touchpad drives what is on the phone.
+  void _switchScreen() {
+    if (_monitors.length < 2) return;
+    final pos = _monitors.indexWhere((m) => m['index'] == _monitorIndex);
+    _monitor = (_monitors[(pos + 1) % _monitors.length]['index'] as num).toInt();
+    _bringPointer = true;
+    setState(() => _zoomScale = 1.0);
+    unawaited(_startStream());
+  }
+
+  /// A round button over the picture (full screen has no app bar).
+  Widget _cornerButton({
+    required String tooltip,
+    required Widget icon,
+    required VoidCallback? onPressed,
+  }) =>
+      Material(
+        color: Colors.black45,
+        shape: const CircleBorder(),
+        child: IconButton(
+          tooltip: tooltip,
+          color: Colors.white70,
+          icon: icon,
+          onPressed: onPressed,
+        ),
+      );
+
+  /// The switch-screen icon, numbered with the screen showing.
+  Widget _screenIcon() {
+    final pos = _monitors.indexWhere((m) => m['index'] == _monitorIndex);
+    return Badge(
+      isLabelVisible: pos >= 0,
+      label: Text('${pos + 1}'),
+      child: const Icon(Icons.desktop_windows_outlined),
+    );
+  }
 
   void _onEvent(RelayEvent event) {
     if (!mounted) return;
@@ -1074,6 +1152,12 @@ class _ScreenPageState extends State<ScreenPage>
                       icon: _lockIcon(),
                       onPressed: _lockBusy ? null : _toggleLock,
                     ),
+                  if (_monitors.length > 1)
+                    IconButton(
+                      tooltip: 'Switch screen',
+                      icon: _screenIcon(),
+                      onPressed: _switchScreen,
+                    ),
                   IconButton(
                     tooltip: 'Full screen',
                     icon: const Icon(Icons.fullscreen),
@@ -1185,21 +1269,31 @@ class _ScreenPageState extends State<ScreenPage>
                         ),
                       ),
                     ),
-                  // Full screen has no app bar: the lock gets a small
-                  // button of its own in the corner.
-                  if (fullscreen && _lockSupported == true)
+                  // Full screen has no app bar: the screen switch and the
+                  // lock get small buttons of their own in the corner.
+                  if (fullscreen &&
+                      (_monitors.length > 1 || _lockSupported == true))
                     Positioned(
                       top: 8 + MediaQuery.paddingOf(context).top,
                       right: 8,
-                      child: Material(
-                        color: Colors.black45,
-                        shape: const CircleBorder(),
-                        child: IconButton(
-                          tooltip: _locked ? 'Unlock window' : 'Lock window',
-                          color: Colors.white70,
-                          icon: _lockIcon(),
-                          onPressed: _lockBusy ? null : _toggleLock,
-                        ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        spacing: 8,
+                        children: [
+                          if (_monitors.length > 1)
+                            _cornerButton(
+                              tooltip: 'Switch screen',
+                              icon: _screenIcon(),
+                              onPressed: _switchScreen,
+                            ),
+                          if (_lockSupported == true)
+                            _cornerButton(
+                              tooltip:
+                                  _locked ? 'Unlock window' : 'Lock window',
+                              icon: _lockIcon(),
+                              onPressed: _lockBusy ? null : _toggleLock,
+                            ),
+                        ],
                       ),
                     ),
                   if (_zoomScale > 1.01)

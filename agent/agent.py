@@ -237,6 +237,26 @@ def monitor_rect(mon):
     return {k: int(mon[k]) for k in ("left", "top", "width", "height")}
 
 
+def monitor_choices(monitors):
+    """The screens a phone can switch between (screen.start's `monitors`):
+    {index, label, primary, left, top, width, height} per monitor, in the
+    same order and with the same index as screen.start's `monitor`. The
+    label is the display's own name (mss reads its EDID on Linux), else
+    "Laptop screen" for a built-in panel, else the output or "Screen n"."""
+    primary = primary_monitor(monitors)
+    out = []
+    for i, mon in enumerate(monitors[1:], 1):
+        output = str(mon.get("output") or "")
+        label = str(mon.get("name") or "").strip()
+        if not label:
+            label = ("Laptop screen"
+                     if output.upper().startswith(("EDP", "LVDS", "DSI"))
+                     else output or f"Screen {i}")
+        out.append({"index": i, "label": label, "primary": mon is primary,
+                    **monitor_rect(mon)})
+    return out
+
+
 def screen_size():
     """Primary monitor size in pixels (cached briefly, see list_monitors)."""
     mon = primary_monitor(list_monitors())
@@ -2131,6 +2151,23 @@ def do_move(x, y, rect=None):
                       rect["top"] + min(h - 1, int(max(0.0, min(1.0, y)) * h)))
 
 
+def bring_pointer(rect):
+    """Put the pointer in the middle of `rect` unless it is already on it
+    (screen.start's `bring_pointer`). Not on Wayland: the portal only
+    moves it within the one screen it streams."""
+    if PORTAL is not None:
+        return
+    try:
+        x, y = mouse.position
+    except Exception:
+        x = y = None  # Windows: another desktop has the input
+    if x is not None and (rect["left"] <= x < rect["left"] + rect["width"]
+                          and rect["top"] <= y < rect["top"] + rect["height"]):
+        return
+    mouse.position = (rect["left"] + rect["width"] // 2,
+                      rect["top"] + rect["height"] // 2)
+
+
 # Sub-pixel remainders from do_move_rel: truncating every delta to whole
 # pixels on its own rounds small drags down to 0 and swallows them, which
 # made the cursor feel like it "sometimes doesn't move". The carry makes
@@ -3072,6 +3109,17 @@ class Agent:
                              f"{len(monitors) - 1})")
         raise ValueError(f"unknown monitor: {spec!r}")
 
+    def _screen_choices(self, rect):
+        """screen.start's `monitors` (see monitor_choices) and
+        `monitor_index`, the entry whose rect is `rect`. Wayland streams
+        the portal's one screen only: no choices there."""
+        if wayland_session():
+            return {"monitors": [], "monitor_index": None}
+        choices = monitor_choices(list_monitors())
+        index = next((c["index"] for c in choices
+                      if monitor_rect(c) == rect), None)
+        return {"monitors": choices, "monitor_index": index}
+
     def input_rect(self, client_id):
         """The monitor a client's absolute/relative pointer input maps
         into: the one it is streaming, else None (= primary)."""
@@ -3508,6 +3556,10 @@ class Agent:
             streamer._stale_until = time.monotonic() + 3.0
         streamer.start()
         self.streamers[client] = streamer
+        if msg.get("bring_pointer"):
+            # The phone just switched screens: its touchpad moves the PC
+            # pointer, so put the pointer on the screen it now shows.
+            bring_pointer(rect)
         w, h = streamer.frame_size()
         return {"streaming": True, "codec": "jpeg", "fps": streamer.fps,
                 "binary": streamer.binary, "preset": streamer.preset,
@@ -3519,6 +3571,9 @@ class Agent:
                 "cursor": "client" if streamer.client_cursor else "frame",
                 # screen.view (send only the zoomed-in part) is understood
                 "views": True,
+                # The screens the phone can switch between, and which one
+                # this is (null: none of them, e.g. all monitors at once).
+                **self._screen_choices(rect),
                 # The phone's first pointer position, in the reply so it
                 # can't arrive before the phone knows to draw it; `cursor`
                 # events follow every change.

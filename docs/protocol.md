@@ -143,6 +143,7 @@ Events are pushed without an `id`:
 | `subsampling` | `"420"` \| `"422"` \| `"444"` (chroma; JPEG only) | from the preset |
 | `bitrate` | H.264 bits/s, 0.5-20 M | 6 000 000 |
 | `monitor` | `"primary"` or an index into the agent's monitor list (`0` = all monitors, `1..n` = each one) | `"primary"` |
+| `bring_pointer` | `true`: if the PC pointer is on another monitor, move it to the middle of this one (the client just switched screens, so its touchpad drives a visible pointer). Ignored on Wayland | `false` |
 | `binary` | PJF1 binary frames instead of base64 events | `false` |
 | `ack` | flow control (JPEG): the client sends `{"cmd": "screen.ack"}` (no `id`) for every frame it receives, in order. The agent keeps 2-8 frames out unacked: enough to cover the link's round trip at the target fps (the ack round trips' 10 s minimum), one fewer per round trip while acks come back clearly late (frames queueing). Frames can't queue up on a slow link, and a long route (the internet tunnel) still gets full fps. Answered as `ack: true` by agents that support it; older agents ignore it (then send no acks) | `false` |
 | `cursor` | `"client"`: the client draws the pointer itself. Frames carry no pointer, pointer-only movement sends no frame, and the agent sends `cursor` events (below). Answered as `cursor: "client"` (plus `pointer`, the first position) when supported, else `"frame"` (pointer painted into frames: Wayland portal, older agents answer nothing) | pointer in frames |
@@ -188,6 +189,14 @@ indices follow the PC's current layout; an unknown index fails the request
 without touching a running stream. The response's `monitor` is the
 captured rect `{left, top, width, height}` in desktop pixels, and `w`/`h`
 the size of the frames being sent.
+
+JPEG replies also carry `monitors`, the screens a client can switch between:
+`[{index, label, primary, left, top, width, height}]` (`index` is the value
+for `monitor`; `label` is the display's own name, "Laptop screen" for a
+built-in panel, else its output), and `monitor_index`, the one streaming
+(`null` for all monitors at once). Empty on Wayland, where only the main
+screen can be streamed. The app shows a switch-screen button when there are
+two or more.
 
 ### Client-drawn pointer (`cursor: "client"`)
 

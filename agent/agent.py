@@ -132,6 +132,9 @@ kb = KbController()
 # Wayland: input goes through the agent's portal session instead of
 # pynput, which only reaches Xwayland windows there (set by Agent).
 PORTAL = None
+# Linux X11: characters are typed in the PC's current layout
+# (x11_keyboard.py); pynput keeps the layout it saw first and misses AltGr.
+X11_KEYS = None
 
 # ---------------------------------------------------------------- config
 
@@ -195,6 +198,14 @@ def wayland_session():
         return False
     return (os.environ.get("XDG_SESSION_TYPE") == "wayland"
             or bool(os.environ.get("WAYLAND_DISPLAY")))
+
+
+if platform.system() == "Linux" and not wayland_session():
+    try:
+        import x11_keyboard
+        X11_KEYS = x11_keyboard.Typist()
+    except Exception as e:
+        print(f"[agent] typing falls back to pynput: {e}")
 
 
 def new_mss():
@@ -2224,6 +2235,9 @@ def do_key(name):
         return
     key = SPECIAL_KEYS.get(name.lower())
     if key is None:
+        if len(name) == 1 and X11_KEYS is not None:
+            X11_KEYS.type(name)
+            return
         if len(name) == 1:
             kb.press(name)
             kb.release(name)
@@ -2236,6 +2250,9 @@ def do_key(name):
 def do_text(text):
     if PORTAL is not None:
         PORTAL.text(text)
+        return
+    if X11_KEYS is not None:
+        X11_KEYS.type(text)
         return
     kb.type(text)
 

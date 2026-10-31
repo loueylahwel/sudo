@@ -33,7 +33,7 @@ import mss
 import psutil
 import pyperclip
 import websockets
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from pynput.keyboard import Controller as KbController, Key
 from pynput.mouse import Button, Controller as MouseController
 
@@ -133,12 +133,18 @@ def save_config(cfg):
 _screen_size_cache = None
 
 
+def new_mss():
+    """mss >= 10.2 renamed the factory to mss.MSS (mss.mss() is deprecated
+    and warns); 9.x only has mss.mss()."""
+    return (getattr(mss, "MSS", None) or mss.mss)()
+
+
 def screen_size():
     # Resolved once and cached: creating a fresh mss instance for every
     # input event caused intermittent failures under rapid touchpad input.
     global _screen_size_cache
     if _screen_size_cache is None:
-        with mss.mss() as sct:
+        with new_mss() as sct:
             mon = sct.monitors[1]  # primary monitor
             _screen_size_cache = (mon["width"], mon["height"])
     return _screen_size_cache
@@ -161,14 +167,97 @@ def draw_cursor(img, mon):
     return int(cx // 2), int(cy // 2)
 
 
+# Some systems hand the agent an all-black screen instead of the desktop
+# (a Wayland session through X11, macOS without the Screen Recording
+# permission, a locked Windows PC), and the phone just showed black. Until
+# the capture has shown any picture at all, a black frame is replaced by
+# one that says why and how to fix it. Once a frame had something visible
+# the capture works, and black is real content (a film's fade).
+BLACK_LEVEL = 16
+_capture_seen_picture = False
+_black_notice_printed = False
+
+
+def black_screen_reason():
+    """(what happens, how to fix it) for this PC's system."""
+    system = platform.system()
+    if system == "Linux" and (os.environ.get("XDG_SESSION_TYPE") == "wayland"
+                              or os.environ.get("WAYLAND_DISPLAY")):
+        return ("This PC runs a Wayland desktop, and this version of Sudo "
+                "only gets a black picture there.",
+                "Fix: log out, pick the X11 / Xorg session on the login "
+                "screen (for example \"Ubuntu on Xorg\" or \"Plasma (X11)\"), "
+                "log in and start Sudo again.")
+    if system == "Darwin":
+        return ("macOS is hiding the screen from Sudo.",
+                "Fix: System Settings > Privacy & Security > Screen "
+                "Recording: turn on the app that runs Sudo (Terminal, iTerm "
+                "or Python), then quit it and start Sudo again. The mouse "
+                "and keyboard need Accessibility on the same page.")
+    if system == "Windows":
+        return ("Windows gives Sudo a black picture.",
+                "Fix: unlock the PC (Sudo can't see the lock or sign-in "
+                "screen). If it stays black, start Sudo from your own "
+                "signed-in account, not as a service or a task that runs "
+                "while nobody is signed in.")
+    return ("The PC gives Sudo a black picture.",
+            "Fix: start Sudo from the signed-in desktop session "
+            f"(DISPLAY is {os.environ.get('DISPLAY') or 'not set'}).")
+
+
+def _font(size):
+    try:
+        return ImageFont.load_default(size=size)
+    except (TypeError, OSError, ImportError):
+        # Pillow < 10.1 (or no FreeType): the small built-in bitmap font.
+        return ImageFont.load_default()
+
+
+def black_screen_notice(size):
+    """A frame of `size` explaining black_screen_reason() on dark grey."""
+    img = Image.new("RGB", size, (24, 24, 24))
+    draw = ImageDraw.Draw(img)
+    w, h = size
+    margin = w // 14
+    y = h // 6
+    what, fix = black_screen_reason()
+    for text, px, color in (("Sudo can't see this PC's screen", w // 22,
+                             (255, 255, 255)),
+                            (what, w // 34, (220, 220, 220)),
+                            (fix, w // 34, (130, 220, 200))):
+        font = _font(max(12, px))
+        line = ""
+        for word in text.split():
+            trial = f"{line} {word}".strip()
+            if line and draw.textlength(trial, font=font) > w - 2 * margin:
+                draw.text((margin, y), line, font=font, fill=color)
+                y += round(px * 1.35)
+                line = word
+            else:
+                line = trial
+        draw.text((margin, y), line, font=font, fill=color)
+        y += round(px * 2.2)
+    return img
+
+
 def capture_jpeg(max_width=960, quality=50, last_thumb=None):
-    with mss.mss() as sct:
+    global _capture_seen_picture, _black_notice_printed
+    with new_mss() as sct:
         mon = sct.monitors[1]
         shot = sct.grab(mon)
     img = Image.frombytes("RGB", shot.size, shot.rgb)
     if img.width > max_width:
         h = round(img.height * max_width / img.width)
         img = img.resize((max_width, h), Image.BILINEAR)
+    if not _capture_seen_picture:
+        if max(hi for _, hi in img.getextrema()) > BLACK_LEVEL:
+            _capture_seen_picture = True
+        else:
+            if not _black_notice_printed:
+                _black_notice_printed = True
+                print("[agent] the screen capture is all black: "
+                      + " ".join(black_screen_reason()))
+            img = black_screen_notice(img.size)
     qpos = draw_cursor(img, mon)
     # tiny grayscale thumb + cursor position used to skip unchanged frames
     thumb = img.resize((32, 18), Image.NEAREST).convert("L").tobytes()

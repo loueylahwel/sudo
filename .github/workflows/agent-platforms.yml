@@ -1,0 +1,96 @@
+# The PC agent on every system it supports: the screen capture on real
+# Windows and macOS machines, the Linux installer + capture on the big
+# distributions, and the Wayland portal on a real wlroots desktop.
+name: Agent on every platform
+
+on:
+  push:
+    branches: [main, feat/60fps-live-typing-remote-access]
+    paths:
+      - agent/**
+      - scripts/test_capture.py
+      - scripts/test_portal_live.py
+      - scripts/test_wayland_portal.py
+      - scripts/ci_wlroots.sh
+      - .github/workflows/agent-platforms.yml
+  workflow_dispatch:
+
+jobs:
+  desktop:
+    name: Capture on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r agent/requirements.txt
+      - run: python -I scripts/test_capture.py out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: capture-${{ matrix.os }}
+          path: out
+
+  linux-distro:
+    name: Install + capture on ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu:24.04, ubuntu:26.04, debian:13, fedora:latest,
+                archlinux:latest, opensuse/tumbleweed]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    env:
+      SUDO_AGENT_NO_SERVICE: "1"
+      CI: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the agent (agent/linux/install.sh)
+        run: bash agent/linux/install.sh
+      - name: Test display (Xvfb)
+        run: |
+          if command -v apt-get >/dev/null; then apt-get install -y xvfb x11-xserver-utils
+          elif command -v dnf >/dev/null; then dnf install -y xorg-x11-server-Xvfb xsetroot
+          elif command -v zypper >/dev/null; then zypper --non-interactive install xorg-x11-server-Xvfb xsetroot
+          else pacman -S --needed --noconfirm xorg-server-xvfb xorg-xsetroot; fi
+      - name: Capture on X11 (black screen -> notice, then the picture)
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+          sleep 2
+          DISPLAY=:99 ~/.local/share/sudo-agent/venv/bin/python -I scripts/test_capture.py out --black-first
+      - name: Portal tests (PyGObject, GStreamer, dbus-fast, uinput bytes)
+        run: ~/.local/share/sudo-agent/venv/bin/python -I scripts/test_wayland_portal.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: capture-${{ strategy.job-index }}
+          path: out
+
+  wlroots-wayland:
+    name: Wayland portal on Sway (no RemoteDesktop)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the agent (agent/linux/install.sh)
+        run: SUDO_AGENT_NO_SERVICE=1 bash agent/linux/install.sh
+      - name: Sway, PipeWire, portals; uinput for the runner
+        run: |
+          sudo apt-get install -y sway swaybg xdg-desktop-portal xdg-desktop-portal-wlr \
+              pipewire wireplumber dbus
+          sudo modprobe uinput
+          sudo chmod 666 /dev/uinput
+      - name: Portal session, PipeWire frame, virtual input
+        run: PY=~/.local/share/sudo-agent/venv/bin/python dbus-run-session -- bash scripts/ci_wlroots.sh out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wlroots-wayland
+          path: out

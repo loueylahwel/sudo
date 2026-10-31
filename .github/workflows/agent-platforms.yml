@@ -91,6 +91,9 @@ jobs:
         run: |
           pacman -Syu --needed --noconfirm sway swaybg xdg-desktop-portal \
               xdg-desktop-portal-wlr pipewire wireplumber dbus sudo
+          # Arch's sway carries a file capability (cap_sys_nice), which a
+          # container may not exec; a plain copy has none.
+          cp "$(command -v sway)" /usr/local/bin/sway
           useradd -m tester
           echo "tester ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tester
           chown -R tester "$GITHUB_WORKSPACE"

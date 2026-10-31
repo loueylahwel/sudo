@@ -76,21 +76,66 @@ jobs:
 
   wlroots-wayland:
     name: Wayland portal on Sway (no RemoteDesktop)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    # Arch: a current wlroots / xdg-desktop-portal-wlr. Sway runs as a
+    # normal user (it won't run as root).
+    container: archlinux:latest
+    env:
+      CI: "1"
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-      - name: Install the agent (agent/linux/install.sh)
-        run: SUDO_AGENT_NO_SERVICE=1 bash agent/linux/install.sh
-      - name: Sway, PipeWire, portals; uinput for the runner
+      - name: Sway, PipeWire, portals, a normal user
         run: |
-          sudo apt-get install -y sway swaybg xdg-desktop-portal xdg-desktop-portal-wlr \
-              pipewire wireplumber dbus
-          sudo modprobe uinput
-          sudo chmod 666 /dev/uinput
-      - name: Portal session, PipeWire frame, virtual input
-        run: PY=~/.local/share/sudo-agent/venv/bin/python dbus-run-session -- bash scripts/ci_wlroots.sh out
+          pacman -Syu --needed --noconfirm sway swaybg xdg-desktop-portal \
+              xdg-desktop-portal-wlr pipewire wireplumber dbus sudo
+          useradd -m tester
+          echo "tester ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/tester
+          chown -R tester "$GITHUB_WORKSPACE"
+      - name: Install the agent as that user (agent/linux/install.sh)
+        run: runuser -u tester -- env SUDO_AGENT_NO_SERVICE=1 CI=1 bash agent/linux/install.sh
+      - name: Portal session (ScreenCast only) and a PipeWire frame
+        run: |
+          runuser -u tester -- env HOME=/home/tester \
+              PY=/home/tester/.local/share/sudo-agent/venv/bin/python \
+              dbus-run-session -- bash scripts/ci_wlroots.sh out
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wlroots-wayland
           path: out
+
+  virtual-input:
+    name: Virtual mouse and keyboard (uinput)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: /dev/uinput for the runner
+        run: |
+          sudo modprobe uinput
+          sudo chmod 666 /dev/uinput
+      - name: The device appears and takes events
+        run: |
+          python -I - <<'EOF'
+          import sys, time
+          sys.path.insert(0, "agent")
+          import uinput_input as ui
+          dev = ui.VirtualInput()
+          dev._wtype = None
+          dev.move_rel(10, 5)
+          dev.button("left", True)
+          dev.button("left", False)
+          dev.scroll(0, 1)
+          dev.key("enter")
+          dev.text("Hi!")
+          listed = "Sudo remote input" in open("/proc/bus/input/devices").read()
+          print("listed by the kernel:", listed)
+          dev.close()
+          assert listed
+          print("PASS")
+          EOF

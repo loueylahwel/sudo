@@ -29,9 +29,11 @@ mkdir -p "$HOME/.config/xdg-desktop-portal-wlr" "$HOME/.config/xdg-desktop-porta
 printf '[screencast]\nchooser_type=none\noutput_name=HEADLESS-1\n' \
     > "$HOME/.config/xdg-desktop-portal-wlr/config"
 printf '[preferred]\ndefault=wlr;gtk\n' > "$HOME/.config/xdg-desktop-portal/sway-portals.conf"
-/usr/libexec/xdg-desktop-portal-wlr -l DEBUG > "$OUT/xdpw.log" 2>&1 &
+# Debian/Ubuntu/Fedora keep them in /usr/libexec, Arch in /usr/lib.
+bin() { for d in /usr/libexec /usr/lib; do [ -x "$d/$1" ] && { echo "$d/$1"; return; }; done; }
+"$(bin xdg-desktop-portal-wlr)" -l DEBUG > "$OUT/xdpw.log" 2>&1 &
 sleep 1
-/usr/libexec/xdg-desktop-portal -v > "$OUT/xdp.log" 2>&1 &
+"$(bin xdg-desktop-portal)" -v > "$OUT/xdp.log" 2>&1 &
 sleep 2
 
-"$PY" -I scripts/test_portal_live.py "$OUT" --expect-no-remote-desktop --virtual-input
+"$PY" -I scripts/test_portal_live.py "$OUT" --expect-no-remote-desktop

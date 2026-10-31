@@ -48,7 +48,7 @@ import mss
 import psutil
 import pyperclip
 import websockets
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 try:
     from pynput.keyboard import Controller as KbController, Key
     from pynput.mouse import Button, Controller as MouseController
@@ -359,6 +359,114 @@ def frame_thumb(shot, pos):
     qx, qy = (int(pos[0]) // 2, int(pos[1]) // 2) if pos is not None else (0, 0)
     return (grid + qx.to_bytes(4, "little", signed=True)
             + qy.to_bytes(4, "little", signed=True))
+
+
+# Some systems hand mss an all-black screen instead of the desktop (macOS
+# without the Screen Recording permission, a locked Windows PC, a display
+# the agent can't really see), and the phone just showed black. Until the
+# capture has shown any picture at all, a black grab is replaced by a frame
+# that says why and how to fix it. Once a grab had something visible the
+# capture works, and black is real content (a film's fade).
+BLACK_LEVEL = 16
+_capture_seen_picture = False
+_black_notice_printed = False
+_notice_cache = {}
+
+
+def black_screen_reason():
+    """(what happens, how to fix it) for this PC's system."""
+    system = platform.system()
+    if system == "Linux" and wayland_session():
+        return ("This PC runs a Wayland desktop, and Sudo is reading the "
+                "screen through X11 there, which only gives black.",
+                "Fix: re-run agent/linux/install.sh (it sets up screen "
+                "sharing through the desktop portal) and start Sudo again.")
+    if system == "Darwin":
+        return ("macOS is hiding the screen from Sudo.",
+                "Fix: System Settings > Privacy & Security > Screen "
+                "Recording: turn on the app that runs Sudo (Terminal, iTerm "
+                "or Python), then quit it and start Sudo again. The mouse "
+                "and keyboard need Accessibility on the same page.")
+    if system == "Windows":
+        return ("Windows gives Sudo a black picture.",
+                "Fix: unlock the PC (Sudo can't see the lock or sign-in "
+                "screen). If it stays black, start Sudo from your own "
+                "signed-in account, not as a service or a task that runs "
+                "while nobody is signed in.")
+    return ("The PC gives Sudo a black picture.",
+            "Fix: start Sudo from the signed-in desktop session "
+            f"(DISPLAY is {os.environ.get('DISPLAY') or 'not set'}).")
+
+
+def _font(size):
+    try:
+        return ImageFont.load_default(size=size)
+    except (TypeError, OSError, ImportError):
+        # Pillow < 10.1 (or no FreeType): the small built-in bitmap font.
+        return ImageFont.load_default()
+
+
+def black_screen_notice(size):
+    """A PIL frame of `size` explaining black_screen_reason() on dark grey."""
+    img = Image.new("RGB", size, (24, 24, 24))
+    draw = ImageDraw.Draw(img)
+    w, h = size
+    margin = w // 14
+    y = h // 6
+    what, fix = black_screen_reason()
+    for text, px, color in (("Sudo can't see this PC's screen", w // 22,
+                             (255, 255, 255)),
+                            (what, w // 34, (220, 220, 220)),
+                            (fix, w // 34, (130, 220, 200))):
+        font = _font(max(12, px))
+        line = ""
+        for word in text.split():
+            trial = f"{line} {word}".strip()
+            if line and draw.textlength(trial, font=font) > w - 2 * margin:
+                draw.text((margin, y), line, font=font, fill=color)
+                y += round(px * 1.35)
+                line = word
+            else:
+                line = trial
+        draw.text((margin, y), line, font=font, fill=color)
+        y += round(px * 2.2)
+    return img
+
+
+class NoticeShot:
+    """black_screen_notice() dressed as an mss ScreenShot (.raw BGRA,
+    .size); its own copy, since encode_frame paints the cursor into it."""
+
+    def __init__(self, size):
+        key = (tuple(size), black_screen_reason())
+        if key not in _notice_cache:
+            _notice_cache.clear()
+            _notice_cache[key] = black_screen_notice(size).tobytes("raw", "BGRX")
+        self.raw = bytearray(_notice_cache[key])
+        self.size = tuple(size)
+
+
+def explain_black(shot):
+    """`shot`, or a NoticeShot in its place while the capture has never
+    shown a picture and this grab is black too."""
+    global _capture_seen_picture, _black_notice_printed
+    if _capture_seen_picture:
+        return shot
+    w, h = shot.size
+    _, np = _cv()
+    if np is not None:
+        top = int(np.frombuffer(shot.raw, np.uint8).reshape(h, w, 4)[:, :, :3].max())
+    else:
+        img = Image.frombuffer("RGB", (w, h), shot.raw, "raw", "BGRX", 0, 1)
+        top = max(hi for _, hi in img.getextrema())
+    if top > BLACK_LEVEL:
+        _capture_seen_picture = True
+        return shot
+    if not _black_notice_printed:
+        _black_notice_printed = True
+        print("[agent] the screen capture is all black: "
+              + " ".join(black_screen_reason()))
+    return NoticeShot(shot.size)
 
 
 class DuplicatedShot:
@@ -1089,7 +1197,7 @@ class ScreenStreamer:
         if self._sct is None:
             _cv()  # warm the lazy OpenCV import here, off the event loop
             self._sct = new_mss()
-        shot = self._sct.grab(rect)
+        shot = explain_black(self._sct.grab(rect))
         pos = None if self.client_cursor else mouse.position
         if not self._changed(shot, pos, force, refresh):
             return None

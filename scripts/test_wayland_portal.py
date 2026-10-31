@@ -140,9 +140,72 @@ def test_frames_from_test_source():
     print(f"frames from a test source: ok (GStreamer {Gst.version_string()})")
 
 
+class FakeDevice:
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        return lambda *args: self.calls.append((name, *args))
+
+
+def test_virtual_input_without_remote_desktop():
+    """wlroots / Hyprland: no RemoteDesktop, so input goes to the virtual
+    device (uinput_input.VirtualInput), nothing over D-Bus."""
+    p = started_portal()
+    p.remote_desktop = False
+    p._local = FakeDevice()
+    p.move_rel(0.01, -0.02)
+    p.click("right")
+    p.scroll(0, 1)
+    p.key("enter")
+    p.text("hé")
+    assert p._bus.sent == []
+    calls = p._local.calls
+    assert calls[0][0] == "move_rel" and [round(v, 6) for v in calls[0][1:]] == [19.2, -21.6]
+    assert calls[1:3] == [("button", "right", True), ("button", "right", False)]
+    assert calls[3] == ("scroll", 0, 1)            # the wheel's own direction
+    assert calls[4:] == [("key", "enter"), ("text", "hé")]  # text typed once
+    try:
+        p.move_abs(0.5, 0.5)
+    except wp.PortalError:
+        pass
+    else:
+        raise AssertionError("absolute pointing claimed without remote control")
+    print("virtual input without RemoteDesktop: ok")
+
+
+def test_uinput_events():
+    """The bytes VirtualInput writes, without a real /dev/uinput."""
+    import uinput_input as ui
+    dev = ui.VirtualInput()
+    dev._wtype = None
+    written = []
+    dev._open = lambda: 99
+    real_write = os.write
+    os.write = lambda fd, data: written.append(data) or len(data)
+    try:
+        dev.move_rel(3.4, -2.6)
+        dev.text("A!")
+    finally:
+        os.write = real_write
+    size = ui.EVENT.size
+
+    def events(data):
+        return [ui.EVENT.unpack(data[i:i + size])[2:] for i in range(0, len(data), size)]
+    assert events(written[0]) == [(ui.EV_REL, ui.REL_X, 3), (ui.EV_REL, ui.REL_Y, -3),
+                                  (ui.EV_SYN, ui.SYN_REPORT, 0)]
+    keys = [e for data in written[1:] for e in events(data) if e[0] == ui.EV_KEY]
+    # "A" = shift + a (30), "!" = shift + 1 (2), each pressed and released.
+    assert keys == [(1, 42, 1), (1, 30, 1), (1, 30, 0), (1, 42, 0),
+                    (1, 42, 1), (1, 2, 1), (1, 2, 0), (1, 42, 0)]
+    print("uinput events: ok")
+
+
 if __name__ == "__main__":
     test_input_messages()
     test_keysyms()
     test_queue_until_started()
+    test_virtual_input_without_remote_desktop()
+    test_uinput_events()
     test_frames_from_test_source()
     print("all wayland_portal tests passed")

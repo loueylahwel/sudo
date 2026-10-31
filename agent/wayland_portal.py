@@ -20,8 +20,14 @@ RemoteDesktop + ScreenCast interfaces instead (KDE Plasma 6.6, GNOME):
   up are queued and the session is started. Wayland's scroll axis points
   the other way from pynput's (positive = down).
 
-Needs python3-gi, gir1.2-gstreamer-1.0, gstreamer1.0-pipewire (apt) and
-dbus-fast (pip); the venv sees the system's gi (agent/linux/install.sh).
+Desktops whose portal shares the screen but has no RemoteDesktop (Sway and
+the other wlroots desktops through xdg-desktop-portal-wlr, Hyprland, niri)
+get a ScreenCast-only session, and input goes through a virtual device
+instead (uinput_input.py).
+
+Needs PyGObject with GStreamer and its PipeWire plugin (the distribution's
+packages) and dbus-fast (pip); the venv sees the system's gi
+(agent/linux/install.sh).
 """
 
 import asyncio
@@ -37,7 +43,7 @@ SC = "org.freedesktop.portal.ScreenCast"
 
 KEYBOARD, POINTER, TOUCHSCREEN = 1, 2, 4
 SOURCE_MONITOR = 1
-CURSOR_EMBEDDED = 2
+CURSOR_HIDDEN, CURSOR_EMBEDDED = 1, 2
 PERSIST_UNTIL_REVOKED = 2
 START_TIMEOUT = 120.0     # the owner may take a while to click Allow
 REQUEST_TIMEOUT = 30.0
@@ -120,6 +126,10 @@ class Portal:
         self._responses = {}      # request path -> future
         self._pending = []        # input sent before the session was up
         self._starting = None
+        # None until asked: does the desktop's portal offer RemoteDesktop?
+        # Without it input goes through the virtual device.
+        self.remote_desktop = None
+        self._local = None        # uinput_input.VirtualInput
 
     @property
     def active(self):
@@ -214,25 +224,49 @@ class Portal:
             raise PortalError(f"the desktop refused screen sharing ({member})")
         return {k: getattr(v, "value", v) for k, v in results.items()}
 
+    async def _property(self, iface, name):
+        """A portal interface's property, or None when the desktop's portal
+        doesn't have that interface."""
+        from dbus_fast import Message, MessageType
+        reply = await self._bus.call(Message(
+            destination=PORTAL, path=OBJ, interface="org.freedesktop.DBus.Properties",
+            member="Get", signature="ss", body=[iface, name]))
+        if reply.message_type == MessageType.ERROR:
+            return None
+        return getattr(reply.body[0], "value", reply.body[0])
+
     async def _start(self):
         from dbus_fast import Variant
         await self._connect()
-        r = await self._request(RD, "CreateSession", "a{sv}", [],
+        if self.remote_desktop is None:
+            self.remote_desktop = await self._property(RD, "AvailableDeviceTypes") is not None
+            if not self.remote_desktop:
+                print("[agent] this desktop's portal shares the screen but has no remote "
+                      "control: mouse and keyboard go through a virtual device")
+        # Embedded pointer when the desktop can draw it; else none at all.
+        modes = await self._property(SC, "AvailableCursorModes")
+        cursor = CURSOR_EMBEDDED if modes is None or modes & CURSOR_EMBEDDED else CURSOR_HIDDEN
+        main = RD if self.remote_desktop else SC
+        r = await self._request(main, "CreateSession", "a{sv}", [],
                                 {"session_handle_token": Variant("s", "sudo" + secrets.token_hex(4))})
         session = r["session_handle"]
         try:
-            devices = {"types": Variant("u", KEYBOARD | POINTER | TOUCHSCREEN),
-                       "persist_mode": Variant("u", PERSIST_UNTIL_REVOKED)}
+            sources = {"types": Variant("u", SOURCE_MONITOR),
+                       "multiple": Variant("b", False),
+                       "cursor_mode": Variant("u", cursor)}
+            restore = {"persist_mode": Variant("u", PERSIST_UNTIL_REVOKED)}
             token = self._load_token()
             if token:
-                devices["restore_token"] = Variant("s", token)
-            await self._request(RD, "SelectDevices", "oa{sv}", [session], devices)
-            await self._request(SC, "SelectSources", "oa{sv}", [session],
-                                {"types": Variant("u", SOURCE_MONITOR),
-                                 "multiple": Variant("b", False),
-                                 "cursor_mode": Variant("u", CURSOR_EMBEDDED)})
-            print("[agent] starting the portal session (the PC may ask to allow remote control)")
-            r = await self._request(RD, "Start", "osa{sv}", [session, ""], {}, timeout=START_TIMEOUT)
+                restore["restore_token"] = Variant("s", token)
+            if self.remote_desktop:
+                devices = {"types": Variant("u", KEYBOARD | POINTER | TOUCHSCREEN), **restore}
+                await self._request(RD, "SelectDevices", "oa{sv}", [session], devices)
+            else:
+                sources.update(restore)
+            await self._request(SC, "SelectSources", "oa{sv}", [session], sources)
+            print("[agent] starting the portal session (the PC may ask to allow screen sharing)")
+            r = await self._request(main, "Start", "osa{sv}", [session, ""], {},
+                                    timeout=START_TIMEOUT)
             if r.get("restore_token"):
                 self._save_token(r["restore_token"])
             streams = r.get("streams") or []
@@ -255,7 +289,10 @@ class Portal:
         print(f"[agent] portal session up: screen {w}x{h} at {x},{y}, devices {r.get('devices')}")
         pending, self._pending = self._pending, []
         for send in pending:
-            send()
+            try:
+                send()
+            except Exception as e:
+                print(f"[agent] input sent before the session started failed: {e}")
 
     async def _close_session(self, session):
         from dbus_fast import Message
@@ -291,11 +328,16 @@ class Portal:
 
     # --------------------------------------------------------------- input
 
-    def _notify(self, build):
-        """Sends one Notify* call built by build() -> (member, signature, args)
-        once the session is up; starts it if needed. Fire-and-forget."""
+    def _notify(self, build, local):
+        """Sends one input event once the session is up; starts it if
+        needed. Fire-and-forget. build() -> (member, signature, args) of the
+        RemoteDesktop Notify* call; local(device) does the same on the
+        virtual mouse/keyboard, for desktops without RemoteDesktop."""
         def send():
             if self._session is None:
+                return
+            if self.remote_desktop is False:
+                local(self._virtual())
                 return
             from dbus_fast import Message, MessageFlag
             member, signature, args = build()
@@ -314,20 +356,32 @@ class Portal:
             self._starting = asyncio.ensure_future(self.ensure())
             self._starting.add_done_callback(_log_start_failure)
 
+    def _virtual(self):
+        if self._local is None:
+            import uinput_input
+            self._local = uinput_input.VirtualInput()
+        return self._local
+
     def move_rel(self, dx, dy):
         """dx/dy: normalized to the shared monitor (the agent's convention)."""
-        self._notify(lambda: ("NotifyPointerMotion", "dd",
-                              [float(dx) * self.rect["width"], float(dy) * self.rect["height"]]))
+        def px():
+            return float(dx) * self.rect["width"], float(dy) * self.rect["height"]
+        self._notify(lambda: ("NotifyPointerMotion", "dd", list(px())),
+                     lambda dev: dev.move_rel(*px()))
 
     def move_abs(self, fx, fy):
         fx, fy = min(max(float(fx), 0.0), 1.0), min(max(float(fy), 0.0), 1.0)
+
+        def local(dev):
+            raise uinput_error("pointing at a spot")
         self._notify(lambda: ("NotifyPointerMotionAbsolute", "udd",
                               [self._node, fx * (self.rect["width"] - 1),
-                               fy * (self.rect["height"] - 1)]))
+                               fy * (self.rect["height"] - 1)]), local)
 
     def button(self, name, pressed):
         code = BUTTONS.get(name, BUTTONS["left"])
-        self._notify(lambda: ("NotifyPointerButton", "iu", [code, 1 if pressed else 0]))
+        self._notify(lambda: ("NotifyPointerButton", "iu", [code, 1 if pressed else 0]),
+                     lambda dev: dev.button(name, pressed))
 
     def click(self, name="left", count=1):
         for _ in range(max(1, int(count))):
@@ -337,26 +391,42 @@ class Portal:
     def scroll(self, dx, dy):
         """pynput convention in (dy > 0 = up, dx > 0 = right), Wayland out."""
         if dy:
-            self._notify(lambda: ("NotifyPointerAxisDiscrete", "ui", [0, -int(dy)]))
+            self._notify(lambda: ("NotifyPointerAxisDiscrete", "ui", [0, -int(dy)]),
+                         lambda dev: dev.scroll(0, dy))
         if dx:
-            self._notify(lambda: ("NotifyPointerAxisDiscrete", "ui", [1, int(dx)]))
+            self._notify(lambda: ("NotifyPointerAxisDiscrete", "ui", [1, int(dx)]),
+                         lambda dev: dev.scroll(dx, 0))
 
     def keysym(self, sym, pressed):
-        self._notify(lambda: ("NotifyKeyboardKeysym", "iu", [int(sym), 1 if pressed else 0]))
+        self._notify(lambda: ("NotifyKeyboardKeysym", "iu", [int(sym), 1 if pressed else 0]),
+                     lambda dev: None)
 
     def key(self, name):
         """An agent key name (KEYSYMS) or one character: press + release."""
         sym = KEYSYMS.get(name.lower()) if len(name) > 1 else char_keysym(name)
         if sym is None:
             raise ValueError(f"unknown key: {name}")
-        self.keysym(sym, True)
-        self.keysym(sym, False)
+        # The virtual device does press + release in one go.
+        self._notify(lambda: ("NotifyKeyboardKeysym", "iu", [sym, 1]),
+                     lambda dev: dev.key(name))
+        self._notify(lambda: ("NotifyKeyboardKeysym", "iu", [sym, 0]),
+                     lambda dev: None)
 
     def text(self, text):
+        # The virtual device types the whole text on the first event.
+        local = lambda dev: dev.text(text)  # noqa: E731
         for ch in text:
             sym = char_keysym(ch)
-            self.keysym(sym, True)
-            self.keysym(sym, False)
+            self._notify(lambda sym=sym: ("NotifyKeyboardKeysym", "iu", [sym, 1]), local)
+            self._notify(lambda sym=sym: ("NotifyKeyboardKeysym", "iu", [sym, 0]),
+                         lambda dev: None)
+            local = lambda dev: None  # noqa: E731
+
+
+def uinput_error(what):
+    return PortalError(f"This desktop can't do {what} without remote control "
+                       "through its portal; the touchpad, clicks, scrolling and "
+                       "typing work.")
 
 
 def _log_start_failure(task):

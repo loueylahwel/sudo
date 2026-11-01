@@ -61,32 +61,33 @@ app listens for. If the PC's IP changes, the app re-finds it by name.
 > agent also exposes full file and shell access by design — run it only on
 > machines you own.
 
-## Linux (Ubuntu / Kubuntu 26.04)
+## Linux (Debian, Ubuntu, Mint, Fedora, Arch, openSUSE…)
 
 ```bash
 git clone https://github.com/loueylahwel/sudo.git && cd sudo
 bash agent/linux/install.sh
 ```
 
-The installer adds a few system packages, puts the agent in
-`~/.local/share/sudo-agent` and starts it with your desktop session
-(a systemd user service). Re-run it after `git pull` to update. Logs:
+The installer adds a few system packages (apt, dnf, pacman or zypper),
+puts the agent in `~/.local/share/sudo-agent` and starts it with your
+desktop session (a systemd user service, or an autostart entry without
+systemd). Re-run it after `git pull` to update. Logs:
 `journalctl --user -u sudo-agent -f`.
 
 What works on Linux today:
+- the Screen view with mouse and keyboard control, on X11 and on Wayland:
+  GNOME and KDE Plasma through the desktop's screen sharing (the PC asks
+  once to allow it), Sway, Hyprland and other wlroots desktops through
+  screen sharing plus a virtual mouse/keyboard;
 - files, terminal (bash), processes, clipboard, power and the timer;
 - media keys, Now Playing and seek (through MPRIS, so any player);
 - camera, and remote access.
 
-The **Screen view and mouse/keyboard control need an X11 session for now**.
-On Kubuntu 26.04 (Wayland by default):
-
-```bash
-sudo apt install plasma-session-x11
-```
-
-Then log out and pick **Plasma (X11)** on the login screen. In a Wayland
-session the phone says so instead of showing a frozen screen.
+If the PC can't show its screen to Sudo, the phone shows why and how to
+fix it instead of a black picture. Checked on every change
+(`.github/workflows/agent-platforms.yml`): the installer and capture on
+Ubuntu 24.04 and 26.04, Debian 13, Fedora, Arch and openSUSE Tumbleweed,
+screen sharing on Sway, and capture on Windows and macOS.
 
 These are still Windows-only:
 - the app switcher and dock;

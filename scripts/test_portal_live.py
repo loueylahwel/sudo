@@ -28,10 +28,14 @@ async def main():
     for attempt in range(3):
         frames = await asyncio.to_thread(portal.open_frames)
         try:
+            # A real picture within 10 s (a fresh stream may first hand
+            # over an empty, black buffer; the phone just gets the next).
             for _ in range(20):
-                img = await asyncio.to_thread(frames.grab, 0.5)
-                if img is not None:
-                    break
+                got = await asyncio.to_thread(frames.grab, 0.5)
+                if got is not None:
+                    img = got
+                    if int(img[:, :, :3].max()) > 16:
+                        break
             break
         except wp.PortalError as e:
             # What the agent does (ScreenStreamer._grab_portal): a dead

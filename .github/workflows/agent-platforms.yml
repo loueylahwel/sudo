@@ -75,11 +75,15 @@ jobs:
           path: out
 
   wlroots-wayland:
-    name: Wayland portal on Sway (no RemoteDesktop)
+    name: Wayland portal on Sway (${{ matrix.image }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each ships its own wlroots / xdg-desktop-portal-wlr version.
+        image: [archlinux:latest, debian:13, fedora:latest]
     runs-on: ubuntu-latest
-    # Arch: a current wlroots / xdg-desktop-portal-wlr. Sway runs as a
-    # normal user (it won't run as root).
-    container: archlinux:latest
+    # Sway runs as a normal user (it won't run as root).
+    container: ${{ matrix.image }}
     env:
       CI: "1"
     defaults:
@@ -89,8 +93,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Sway, PipeWire, portals, a normal user
         run: |
-          pacman -Syu --needed --noconfirm sway swaybg xdg-desktop-portal \
-              xdg-desktop-portal-wlr pipewire wireplumber dbus sudo
+          if command -v pacman >/dev/null; then
+              pacman -Syu --needed --noconfirm sway swaybg xdg-desktop-portal \
+                  xdg-desktop-portal-wlr pipewire wireplumber dbus sudo
+          elif command -v apt-get >/dev/null; then
+              apt-get update -qq
+              apt-get install -y sway swaybg xdg-desktop-portal xdg-desktop-portal-wlr \
+                  pipewire wireplumber dbus sudo
+          else
+              dnf install -y sway swaybg xdg-desktop-portal xdg-desktop-portal-wlr \
+                  pipewire wireplumber dbus-daemon dbus-tools sudo util-linux
+          fi
           # Arch's sway carries a file capability (cap_sys_nice), which a
           # container may not exec; a plain copy has none.
           cp "$(command -v sway)" /usr/local/bin/sway
@@ -107,7 +120,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wlroots-wayland
+          name: wlroots-wayland-${{ strategy.job-index }}
           path: out
 
   virtual-input:

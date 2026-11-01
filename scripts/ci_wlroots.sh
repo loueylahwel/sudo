@@ -19,6 +19,9 @@ for _ in $(seq 50); do
     sleep 0.2
 done
 export WAYLAND_DISPLAY=wayland-1
+# A portal D-Bus restarts (after a crash) gets this session's environment.
+dbus-update-activation-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR \
+    XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
 
 pipewire > "$OUT/pipewire.log" 2>&1 &
 sleep 0.5

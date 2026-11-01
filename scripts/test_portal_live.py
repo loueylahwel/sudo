@@ -24,13 +24,23 @@ async def main():
     print(f"session up: rect {portal.rect}, remote desktop: {portal.remote_desktop}")
     if "--expect-no-remote-desktop" in sys.argv:
         assert portal.remote_desktop is False, "expected the ScreenCast-only fallback"
-    frames = await asyncio.to_thread(portal.open_frames)
+    img = None
+    for attempt in range(3):
+        frames = await asyncio.to_thread(portal.open_frames)
+        try:
+            for _ in range(20):
+                img = await asyncio.to_thread(frames.grab, 0.5)
+                if img is not None:
+                    break
+            break
+        except wp.PortalError as e:
+            # What the agent does (ScreenStreamer._grab_portal): a dead
+            # stream ends the session and the next grab starts a new one.
+            print(f"stream died ({e}): new session, as the agent does")
+            frames.close()
+            await portal.close()
+            await asyncio.wait_for(portal.ensure(), 60)
     try:
-        img = None
-        for _ in range(20):
-            img = await asyncio.to_thread(frames.grab, 0.5)
-            if img is not None:
-                break
         assert img is not None, "no frame from PipeWire"
         h, w, _ = img.shape
         top = int(img[:, :, :3].max())

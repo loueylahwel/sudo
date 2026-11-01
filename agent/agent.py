@@ -1337,8 +1337,19 @@ class ScreenStreamer:
             _cv()  # warm the lazy OpenCV import here, off the event loop
             self._pgen = portal.generation
             self._pframes = portal.open_frames()
-        img = self._pframes.grab(1.0 if self._base is None
-                                 else self.PORTAL_WAIT_S)
+        try:
+            img = self._pframes.grab(1.0 if self._base is None
+                                     else self.PORTAL_WAIT_S)
+        except wayland_portal.PortalError:
+            # The stream died (the desktop's portal crashed: Sway's
+            # xdg-desktop-portal-wlr 0.8 sometimes does on a protocol
+            # error). Reading it again would fail forever: drop the
+            # session, so the next grab starts a new one.
+            self._pframes.close()
+            self._pframes, self._base = None, None
+            asyncio.run_coroutine_threadsafe(portal.close(), self.agent.loop) \
+                .result(10)
+            raise
         if img is not None:
             self._base = DuplicatedShot(img)
             self._base_rect = rect

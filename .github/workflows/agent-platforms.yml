@@ -24,13 +24,13 @@ jobs:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - run: python -m pip install -r agent/requirements.txt
       - run: python -I scripts/test_capture.py out
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: capture-${{ matrix.os }}
@@ -52,7 +52,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the agent (agent/linux/install.sh)
         run: bash agent/linux/install.sh
       - name: Test display (Xvfb)
@@ -68,7 +68,7 @@ jobs:
           DISPLAY=:99 ~/.local/share/sudo-agent/venv/bin/python -I scripts/test_capture.py out --black-first
       - name: Portal tests (PyGObject, GStreamer, dbus-fast, uinput bytes)
         run: ~/.local/share/sudo-agent/venv/bin/python -I scripts/test_wayland_portal.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: capture-${{ strategy.job-index }}
@@ -79,14 +79,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each ships its own wlroots / xdg-desktop-portal-wlr version.
-        image: [archlinux:latest, debian:13, fedora:latest]
+        # Each ships its own wlroots / xdg-desktop-portal-wlr version. Not
+        # Debian 13 or Ubuntu 24.04: their xdg-desktop-portal-wlr 0.7 can't
+        # capture a GPU-less headless output ("unable to receive a valid
+        # format from wlr_screencopy"), so the job could never pass here; on
+        # a real PC that version shares the screen.
+        image: [archlinux:latest, fedora:latest]
     runs-on: ubuntu-latest
-    # Debian 13's xdg-desktop-portal-wlr 0.7 can't capture a GPU-less
-    # headless output ("unable to receive a valid format from
-    # wlr_screencopy"; Ubuntu 24.04's the same). On a real PC it shares the
-    # screen; here the run shows the result without failing the workflow.
-    continue-on-error: ${{ matrix.image == 'debian:13' }}
     # Sway runs as a normal user (it won't run as root).
     container: ${{ matrix.image }}
     env:
@@ -95,7 +94,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Sway, PipeWire, portals, a normal user
         run: |
           if command -v pacman >/dev/null; then
@@ -122,7 +121,7 @@ jobs:
           runuser -u tester -- env HOME=/home/tester \
               PY=/home/tester/.local/share/sudo-agent/venv/bin/python \
               dbus-run-session -- bash scripts/ci_wlroots.sh out
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: wlroots-wayland-${{ strategy.job-index }}
@@ -132,8 +131,8 @@ jobs:
     name: Virtual mouse and keyboard (uinput)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - name: /dev/uinput for the runner

@@ -39,4 +39,12 @@ sleep 1
 "$(bin xdg-desktop-portal)" -v > "$OUT/xdp.log" 2>&1 &
 sleep 2
 
+# The portal sends frames when the screen changes; a real desktop always
+# does, this flat one only when the pointer moves.
+( while sleep 0.3; do
+      swaymsg -q 'seat seat0 cursor move 4 0' || true
+      sleep 0.3
+      swaymsg -q 'seat seat0 cursor move -4 0' || true
+  done ) > /dev/null 2>&1 &
+
 "$PY" -I scripts/test_portal_live.py "$OUT" --expect-no-remote-desktop

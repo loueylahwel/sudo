@@ -40,11 +40,14 @@ sleep 1
 sleep 2
 
 # The portal sends frames when the screen changes; a real desktop always
-# does, this flat one only when the pointer moves.
-( while sleep 0.3; do
-      swaymsg -q 'seat seat0 cursor move 4 0' || true
-      sleep 0.3
-      swaymsg -q 'seat seat0 cursor move -4 0' || true
-  done ) > /dev/null 2>&1 &
+# does, this flat one only when told to: switch between two shades of blue.
+# swaymsg finds sway through SWAYSOCK, which only sway's children inherit.
+SWAYSOCK="$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock | head -1)"
+export SWAYSOCK
+( while sleep 0.4; do
+      swaymsg 'output HEADLESS-1 bg #3060a0 solid_color' || true
+      sleep 0.4
+      swaymsg 'output HEADLESS-1 bg #3366aa solid_color' || true
+  done ) > "$OUT/swaymsg.log" 2>&1 &
 
 "$PY" -I scripts/test_portal_live.py "$OUT" --expect-no-remote-desktop

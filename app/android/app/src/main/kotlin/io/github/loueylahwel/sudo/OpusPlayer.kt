@@ -29,7 +29,15 @@ import java.util.concurrent.TimeUnit
  * Packets arrive at the network's pace, not the speaker's: through the
  * tunnel on mobile data they come in clumps, with holes. So there is a
  * jitter buffer in front of the speaker, measured as what the AudioTrack
- * holds (frames written minus its playback head):
+ * holds (frames written minus its playback head) plus the decoded sound
+ * still waiting for room in it. The track's real room can be far smaller
+ * than the second asked for: on the owner's Infinix with Bluetooth earbuds
+ * (a normal track, not a low-latency one) each non-blocking write took
+ * only part of a 20 ms block. The rest was thrown away (over 3 s lost in
+ * 15) and a short write counted as "track full, start playing" on an
+ * almost empty buffer, which ran dry at once: a pause and restart ~10
+ * times a second, heard as constant stutter. Now what doesn't fit waits
+ * and is written first on the next turn:
  *  - the track only starts once `target` ms are buffered, and when it runs
  *    dry it pauses and rebuffers to `target` instead of stuttering along on
  *    whatever trickles in;
@@ -126,6 +134,14 @@ class OpusPlayer(context: Context) {
     @Volatile private var statTrackUnderruns = 0
     @Volatile private var statFloorMs = -1L
     @Volatile private var statTrims = 0
+    // The track's own room (what Android granted, ms), what it holds now,
+    // the decoded sound waiting for room, the writes it took only part of,
+    // and where it plays (AudioDeviceInfo type: 2 speaker, 8 Bluetooth).
+    @Volatile private var statBufferMs = -1L
+    @Volatile private var statTrackMs = 0L
+    @Volatile private var statBacklogMs = 0L
+    @Volatile private var statShortWrites = 0
+    @Volatile private var statDevice = -1
     // Packet arrivals ([write], main thread): the longest gap between two
     // in the current and the previous GAP_WINDOW_MS window. Read by the
     // player thread (the target after a rebuffer) and [stats].
@@ -238,6 +254,11 @@ class OpusPlayer(context: Context) {
         "track_underruns" to statTrackUnderruns,
         "trims" to statTrims,
         "perf_mode" to statPerfMode,
+        "buffer_ms" to statBufferMs,
+        "track_ms" to statTrackMs,
+        "backlog_ms" to statBacklogMs,
+        "short_writes" to statShortWrites,
+        "device" to statDevice,
         "keepawake" to WifiKeepAwake.active,
         "keepawake_sent" to WifiKeepAwake.sent,
         "codec_errors" to statCodecErrors,
@@ -265,6 +286,11 @@ class OpusPlayer(context: Context) {
         statTrackUnderruns = 0
         statFloorMs = -1
         statTrims = 0
+        statBufferMs = -1
+        statTrackMs = 0
+        statBacklogMs = 0
+        statShortWrites = 0
+        statDevice = -1
         lastPacketAt = 0
         gapWindowAt = 0
         gapMaxNow = 0
@@ -463,12 +489,20 @@ class OpusPlayer(context: Context) {
         private var measuredAt = 0L
         private var volume = 1f
         private var codecFailures = 0
+        // Decoded sound the track had no room for yet, oldest first: fed in
+        // before anything newer, every turn of the loop (see feed()).
+        private val backlog = ArrayDeque<ByteBuffer>()
+        private var backlogBytes = 0
 
         override fun run() {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+            statBufferMs = track.bufferSizeInFrames * 1000L / SAMPLE_RATE
             try {
                 while (session == id) {
-                    val packet = packets.poll(LOOP_WAIT_MS, TimeUnit.MILLISECONDS)
+                    // Sound waiting for room: come back soon, the track may
+                    // hold only a few blocks.
+                    val wait = if (backlogBytes > 0) BACKLOG_WAIT_MS else LOOP_WAIT_MS
+                    val packet = packets.poll(wait, TimeUnit.MILLISECONDS)
                     if (session != id) break
                     try {
                         val decoder = codec ?: newDecoder().also { codec = it }
@@ -493,6 +527,8 @@ class OpusPlayer(context: Context) {
                         }
                     }
                     try {
+                        feed()
+                        startIfBuffered()
                         watchCushion()
                         applyVolume()
                     } catch (e: Exception) {
@@ -562,8 +598,8 @@ class OpusPlayer(context: Context) {
             }
         }
 
-        /** Hands one decoded block to the track, unless the cushion is too
-         * deep (then the block is dropped to catch up). */
+        /** Hands one decoded block on to the track (through the backlog),
+         * unless the cushion is too deep (then it is dropped to catch up). */
         private fun play(pcm: ByteBuffer, offset: Int, size: Int) {
             val cushion = cushionMs()
             if (dropping) {
@@ -574,19 +610,51 @@ class OpusPlayer(context: Context) {
                 statTrims++
                 return
             }
+            // A copy: the decoder gets its output buffer back right after.
+            val block = ByteArray(size)
             pcm.position(offset)
-            pcm.limit(offset + size)
-            val written = track.write(pcm, size, AudioTrack.WRITE_NON_BLOCKING)
-            if (written > 0) framesWritten += written / BYTES_PER_FRAME
-            if (written < 0) statLastError = "AudioTrack.write error $written"
-            statWrittenMs = framesWritten * 1000 / SAMPLE_RATE
-            if (!playing) {
-                if (rebuffering) raiseForGap()
-                // Buffered enough (or the track is full): go.
-                if (cushionMs() >= targetMs || written < size) {
-                    rebuffering = false
-                    startTrack()
+            pcm.get(block, 0, size)
+            backlog.addLast(ByteBuffer.wrap(block))
+            backlogBytes += size
+            // A track that takes nothing at all (stuck until the stall rule
+            // kicks it) must not hoard memory: keep the newest 2 s.
+            while (backlogBytes > MAX_BACKLOG_BYTES && backlog.size > 1) {
+                backlogBytes -= backlog.removeFirst().remaining()
+            }
+            feed()
+            if (!playing && rebuffering) raiseForGap()
+            startIfBuffered()
+        }
+
+        /** Writes the backlog into the track, oldest first, as far as the
+         * track has room now; what doesn't fit waits for the next turn. */
+        private fun feed() {
+            while (backlog.isNotEmpty()) {
+                val block = backlog.first()
+                val want = block.remaining()
+                // Advances block's position by what it took.
+                val written = track.write(block, want, AudioTrack.WRITE_NON_BLOCKING)
+                if (written < 0) {
+                    statLastError = "AudioTrack.write error $written"
+                    break
                 }
+                framesWritten += written / BYTES_PER_FRAME
+                backlogBytes -= written
+                if (written < want) {
+                    statShortWrites++
+                    break
+                }
+                backlog.removeFirst()
+            }
+            statWrittenMs = framesWritten * 1000 / SAMPLE_RATE
+            statBacklogMs = backlogMs()
+        }
+
+        /** Buffered up to target (track + backlog): play. */
+        private fun startIfBuffered() {
+            if (!playing && cushionMs() >= targetMs) {
+                rebuffering = false
+                startTrack()
             }
         }
 
@@ -692,13 +760,17 @@ class OpusPlayer(context: Context) {
             if (now - measuredAt < MEASURE_EVERY_MS) return
             measuredAt = now
             statTrackUnderruns = track.underrunCount
+            statTrackMs = trackMs()
+            // Earbuds connecting mid-session move the track: both can change.
+            statBufferMs = track.bufferSizeInFrames * 1000L / SAMPLE_RATE
+            statDevice = track.routedDevice?.type ?: -1
             if (!track.getTimestamp(timestamp)) return
             // The frame at the speaker at nanoTime, moved on to now. Its low
             // 32 bits wrap like the head's.
             val ageNs = System.nanoTime() - timestamp.nanoTime
             val presented = timestamp.framePosition + ageNs * SAMPLE_RATE / 1_000_000_000L
             val frames = (framesWritten - presented) and 0xFFFFFFFFL
-            if (frames <= Int.MAX_VALUE) statOutMs = frames * 1000 / SAMPLE_RATE
+            if (frames <= Int.MAX_VALUE) statOutMs = frames * 1000 / SAMPLE_RATE + backlogMs()
         }
 
         private fun restartWindow(now: Long) {
@@ -709,14 +781,20 @@ class OpusPlayer(context: Context) {
         // The head is an unsigned 32-bit frame count (wraps after ~25 h).
         private fun head(): Long = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
 
+        /** Milliseconds of sound not played yet: in the track, and waiting
+         * for room in it. */
+        private fun cushionMs(): Long = trackMs() + backlogMs()
+
         /** Milliseconds of sound the track holds that haven't played yet. */
-        private fun cushionMs(): Long {
+        private fun trackMs(): Long {
             val frames = (framesWritten - head()) and 0xFFFFFFFFL
             // The head never passes what was written; anything else is a
             // stale read, count it as empty.
             if (frames > Int.MAX_VALUE) return 0
             return frames * 1000 / SAMPLE_RATE
         }
+
+        private fun backlogMs(): Long = backlogBytes / BYTES_PER_FRAME * 1000L / SAMPLE_RATE
 
         private fun applyVolume() {
             val wanted = if (muted) 0f else if (ducked) DUCK_VOLUME else 1f
@@ -772,6 +850,9 @@ class OpusPlayer(context: Context) {
         const val STALL_MS = 1_500L
 
         const val LOOP_WAIT_MS = 10L
+        // Loop period while decoded sound waits for room in the track.
+        const val BACKLOG_WAIT_MS = 4L
+        const val MAX_BACKLOG_BYTES = 2 * SAMPLE_RATE * BYTES_PER_FRAME
         const val INPUT_WAIT_US = 10_000L
         const val OUTPUT_WAIT_US = 2_000L
         const val MAX_CODEC_FAILURES = 5

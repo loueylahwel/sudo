@@ -3,7 +3,8 @@
 Starts the exe from its own folder with a config.json that skips the PC's
 Allow/Deny prompt and remote access, then acts like a phone: listens for the
 "I'm here" beacon, pairs on ws://127.0.0.1:8080, and checks ping, sys.info,
-fs.list and a few JPEG screen frames. The exe is killed at the end. Run by
+fs.list, pointer moves and a few JPEG screen frames. The exe is killed at the
+end. Run by
 .github/workflows/windows-exes.yml on every build.
 
 Usage: python -I scripts/test_windows_exe.py dist/Sudo-Service.exe
@@ -115,7 +116,16 @@ async def phone():
                               quality=40)
             check("screen.start", r.get("ok") and r["data"].get("streaming"),
                   "" if r.get("ok") else f"({r})")
-            await asyncio.sleep(4)
+            # Frames identical to the last one are skipped, and a CI desktop
+            # never changes: move the pointer (it counts as a change), which
+            # also checks input from the phone.
+            moved = 0
+            for i in range(8):
+                r = await request("input", action="move", x=0.2 + 0.08 * i,
+                                  y=0.5)
+                moved += bool(r.get("ok"))
+                await asyncio.sleep(0.5)
+            check("pointer moves", moved == 8, f"({moved}/8)")
             check("screen frames", len(frames) >= 3,
                   f"({len(frames)} frames, {frames[0]['w']}x{frames[0]['h']})"
                   if frames else "(none)")

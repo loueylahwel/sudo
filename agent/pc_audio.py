@@ -53,7 +53,6 @@ round.
 import ctypes
 import ctypes.util
 import json
-import os
 import platform
 import re
 import shutil

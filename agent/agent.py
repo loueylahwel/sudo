@@ -4383,7 +4383,7 @@ class Agent:
     PC_AUDIO_USER_STOPS = ("switched off", "left the dashboard")
 
     async def _pc_audio_pause(self, why):
-        """Pause the PC's media players (MPRIS) because the phone playing
+        """Pause the PC's media players (MPRIS, Windows media sessions): the phone playing
         its sound is gone: unheard, or about to come out of the speakers.
         The ones paused are kept in _pc_audio_paused for _pc_audio_resume."""
         import pc_audio

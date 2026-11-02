@@ -219,13 +219,37 @@ def _run(*args, timeout=5):
     return r.stdout
 
 
-# ------------------------------------------------------------ MPRIS players
+# ------------------------------------------------------------ media players
+
+def _media_sessions(*args):
+    """Windows: media_info.ps1 (Windows' media sessions, the ones its
+    volume flyout shows) with args; its JSON answer as a list of app ids,
+    [] when PowerShell fails."""
+    here = Path(__file__).resolve().parent
+    script = next((d / "media_info.ps1" for d in
+                   (Path(getattr(sys, "_MEIPASS", here)), here)
+                   if (d / "media_info.ps1").exists()), here / "media_info.ps1")
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", str(script), *args], capture_output=True, text=True,
+            timeout=15, errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        answer = json.loads(proc.stdout.strip() or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    ids = next(iter(answer.values()), []) if isinstance(answer, dict) else []
+    return [ids] if isinstance(ids, str) else list(ids or [])
+
 
 def pause_players():
-    """Pause every media player (MPRIS, through playerctl) that is playing
-    right now. Returns the ones it paused, to resume_players() them later.
-    Used when the phone playing the PC's sound drops: the music must not
-    carry on unheard, nor come back out of the PC's speakers by itself."""
+    """Pause every media player (MPRIS, through playerctl; Windows: its
+    media sessions) that is playing right now. Returns the ones it paused,
+    to resume_players() them later. Used when the phone playing the PC's
+    sound drops: the music must not carry on unheard, nor come back out of
+    the PC's speakers by itself."""
+    if WINDOWS:
+        return _media_sessions("-Pause")
     try:
         out = _run("playerctl", "-a", "-f",
                    "{{playerInstance}}\t{{status}}", "status")
@@ -246,6 +270,9 @@ def pause_players():
 def resume_players(names):
     """Play again the players pause_players() paused (those still there and
     still paused: one the user started or stopped meanwhile is left alone)."""
+    if WINDOWS:
+        _media_sessions("-Resume", "|".join(names))
+        return
     for name in names:
         try:
             if _run("playerctl", "-p", name, "status").strip() == "Paused":

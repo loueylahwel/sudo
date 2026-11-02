@@ -17,8 +17,8 @@ Its screen, files, terminal, music and sound. One tap to connect, no account, fr
 </div>
 
 <p align="center">
-  <img src="docs/demo.gif" alt="Recorded on an Android phone held sideways: the cursor of a KDE Plasma PC moves under the phone's touchpad, opens Documents and Pictures in the file manager, then System Settings from the taskbar" width="880"><br>
-  <sub>Recorded on the phone: its touchpad drives the PC. Drag to move, tap to click, two fingers to scroll.</sub>
+  <img src="docs/demo.gif" alt="Side by side: on the left the Sudo app on a real Android phone, a finger moving on its touchpad; on the right the PC, whose cursor follows it, opens Documents and Pictures in the file manager, then heads for the taskbar" width="880"><br>
+  <sub>A real phone driving a PC: drag on the phone's touchpad to move the cursor, tap to click, two fingers to scroll.</sub>
 </p>
 
 ## Why Sudo

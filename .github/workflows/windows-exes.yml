@@ -1,0 +1,50 @@
+# The Windows release files, built the way the v2.2.x ones were (PyInstaller
+# onefile, no console, Python 3.13, ffmpeg.exe + media_info.ps1 + the icon
+# inside), then each one started and checked as a phone would
+# (scripts/test_windows_exe.py). The exes are this run's artifact; a release
+# takes them from there (gh run download).
+name: Windows exes
+
+on:
+  push:
+    branches: [main, feat/60fps-live-typing-remote-access]
+    paths:
+      - agent/**
+      - tools/**
+      - scripts/test_windows_exe.py
+      - .github/workflows/windows-exes.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r agent/requirements.txt pyinstaller
+      - name: Build Sudo-Service.exe and Sudo-Agent.exe
+        shell: bash
+        run: |
+          for pair in "Sudo-Service agent/agent.py" "Sudo-Agent agent/agent_gui.py"; do
+            set -- $pair
+            pyinstaller --noconfirm --onefile --noconsole --name "$1" \
+              --icon agent/sudo.ico \
+              --add-data "tools/ffmpeg.exe;." \
+              --add-data "agent/media_info.ps1;." \
+              --add-data "agent/sudo.ico;." \
+              "$2"
+          done
+          ls -l dist
+      # One at a time: the agent allows a single instance per PC.
+      - name: Test Sudo-Service.exe
+        run: python -I scripts/test_windows_exe.py dist/Sudo-Service.exe
+      - name: Test Sudo-Agent.exe
+        run: python -I scripts/test_windows_exe.py dist/Sudo-Agent.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-exes
+          path: |
+            dist/Sudo-Service.exe
+            dist/Sudo-Agent.exe

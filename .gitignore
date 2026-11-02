@@ -19,3 +19,6 @@ app/android/build/
 
 # TLS key/cert for remote access (generated per PC; never commit)
 *.pem
+
+# built in CI (vcpkg) for PC sound on Windows; see windows-exes.yml
+tools/opus.dll

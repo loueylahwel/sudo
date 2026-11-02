@@ -3,8 +3,8 @@
 Starts the exe from its own folder with a config.json that skips the PC's
 Allow/Deny prompt and remote access, then acts like a phone: listens for the
 "I'm here" beacon, pairs on ws://127.0.0.1:8080, and checks ping, sys.info,
-fs.list, pointer moves and a few JPEG screen frames. The exe is killed at the
-end. Run by
+fs.list, pointer moves, a few JPEG screen frames and PC sound packets. The
+exe is killed at the end. Run by
 .github/workflows/windows-exes.yml on every build.
 
 Usage: python -I scripts/test_windows_exe.py dist/Sudo-Service.exe
@@ -74,6 +74,7 @@ async def phone():
     req_id = 0
     pending = {}
     frames = []
+    audio_packets = 0
     async with ws:
         await ws.send(json.dumps({"type": "pair", "name": "CI phone"}))
         hello = json.loads(await asyncio.wait_for(ws.recv(), 15))
@@ -91,8 +92,10 @@ async def phone():
             return await asyncio.wait_for(fut, timeout=20)
 
         async def receiver():
+            nonlocal audio_packets
             async for raw in ws:
                 if isinstance(raw, bytes):
+                    audio_packets += raw.startswith(b"OPS1")
                     continue
                 msg = json.loads(raw)
                 rid = msg.get("id")
@@ -131,6 +134,15 @@ async def phone():
                   if frames else "(none)")
             r = await request("screen.stop")
             check("screen.stop", r.get("ok"))
+            # PC sound on the phone: opus.dll and the loopback in the exe.
+            r = await request("audio.start", mute_pc=True)
+            check("audio.start", r.get("ok"),
+                  "" if r.get("ok") else f"({r.get('error')})")
+            await asyncio.sleep(2)
+            r = await request("audio.stop")
+            check("audio.stop", r.get("ok"))
+            check("audio packets", audio_packets >= 80,
+                  f"({audio_packets} in 2 s)")
         finally:
             rt.cancel()
 

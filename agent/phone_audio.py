@@ -174,6 +174,38 @@ _k32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 # ---------------------------------------------------------------- capture
 
+def activate_process_loopback(pid, exclude=False):
+    """An IAudioClient for Windows' per-process loopback (Windows 10 2004+):
+    the sound of pid's process tree or, with exclude, of every process BUT
+    that tree (pc_audio.py: the whole PC's sound, minus the agent). Call on
+    an MTA thread; the tap sits after each app's mixer volume and before the
+    output's own volume and mute."""
+    params = _ActivationParams(1, _LoopbackParams(pid, 1 if exclude else 0))
+    pv = _PropVariant()
+    pv.vt = 65  # VT_BLOB
+    pv.blob.cbSize = ctypes.sizeof(params)
+    pv.blob.pBlobData = ctypes.cast(ctypes.pointer(params), ctypes.c_void_p)
+    fn = ctypes.WinDLL("Mmdevapi").ActivateAudioInterfaceAsync
+    fn.restype = HRESULT
+    fn.argtypes = [
+        wintypes.LPCWSTR, ctypes.POINTER(GUID), ctypes.POINTER(_PropVariant),
+        ctypes.POINTER(IActivateAudioInterfaceCompletionHandler),
+        ctypes.POINTER(ctypes.POINTER(IActivateAudioInterfaceAsyncOperation))]
+    done = _Done()
+    op = ctypes.POINTER(IActivateAudioInterfaceAsyncOperation)()
+    fn("VAD\\Process_Loopback", ctypes.byref(IAudioClient._iid_),
+       ctypes.byref(pv),
+       done.QueryInterface(IActivateAudioInterfaceCompletionHandler),
+       ctypes.byref(op))
+    if not done.event.wait(5):
+        raise OSError("audio capture activation timed out")
+    hr, unk = op.GetActivateResult()
+    if hr != 0:
+        raise OSError(hr, "this PC can't capture app audio (needs "
+                          "Windows 10 2004 or newer)")
+    return unk.QueryInterface(IAudioClient)
+
+
 class _ProcessCapture:
     """Float32 stereo 48 kHz loopback of one process tree, on its own MTA
     thread, into a deque of float samples the mixer drains."""
@@ -199,37 +231,11 @@ class _ProcessCapture:
             del self.samples[:n]
             return out
 
-    def _activate(self):
-        params = _ActivationParams(1, _LoopbackParams(self.pid, 0))
-        pv = _PropVariant()
-        pv.vt = 65  # VT_BLOB
-        pv.blob.cbSize = ctypes.sizeof(params)
-        pv.blob.pBlobData = ctypes.cast(ctypes.pointer(params), ctypes.c_void_p)
-        fn = ctypes.WinDLL("Mmdevapi").ActivateAudioInterfaceAsync
-        fn.restype = HRESULT
-        fn.argtypes = [
-            wintypes.LPCWSTR, ctypes.POINTER(GUID), ctypes.POINTER(_PropVariant),
-            ctypes.POINTER(IActivateAudioInterfaceCompletionHandler),
-            ctypes.POINTER(ctypes.POINTER(IActivateAudioInterfaceAsyncOperation))]
-        done = _Done()
-        op = ctypes.POINTER(IActivateAudioInterfaceAsyncOperation)()
-        fn("VAD\\Process_Loopback", ctypes.byref(IAudioClient._iid_),
-           ctypes.byref(pv),
-           done.QueryInterface(IActivateAudioInterfaceCompletionHandler),
-           ctypes.byref(op))
-        if not done.event.wait(5):
-            raise OSError("audio capture activation timed out")
-        hr, unk = op.GetActivateResult()
-        if hr != 0:
-            raise OSError(hr, "this PC can't capture app audio (needs "
-                              "Windows 10 2004 or newer)")
-        return unk.QueryInterface(IAudioClient)
-
     def _run(self):
         comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
         event = None
         try:
-            client = self._activate()
+            client = activate_process_loopback(self.pid)
             fmt = WAVEFORMATEX(_WAVE_FORMAT_IEEE_FLOAT, CHANNELS, RATE,
                                RATE * CHANNELS * 4, CHANNELS * 4, 32, 0)
             event = _k32.CreateEventW(None, False, False, None)

@@ -27,21 +27,41 @@ Linux (PipeWire with pipewire-pulse):
 Everything here blocks (subprocesses, waits of up to a few seconds): the
 agent calls start() and stop() through asyncio.to_thread.
 
-Windows: not yet (a WASAPI loopback of the default device would do it).
-Nothing Windows can't import is imported at module level.
+Windows (10 2004 or newer):
+
+  * Windows' per-process loopback, told to EXCLUDE the agent's own process
+    (phone_audio.activate_process_loopback), records everything the PC
+    plays. Unlike a loopback of one output it doesn't care which output the
+    apps play on, so switching to headphones meanwhile changes nothing;
+  * mute_pc: every output that isn't muted yet is muted. The loopback taps
+    the apps' sound before an output's volume and mute, so the phone still
+    gets all of it (scripts/test_windows_pc_audio.py checks this on CI).
+    The muted outputs are persisted (callback) BEFORE they are muted:
+    Windows keeps a mute for good, so after a crash the next agent unmutes
+    them (restore_after_crash);
+  * float 48 kHz stereo comes in, 16-bit goes to libopus (opus.dll, inside
+    the release exes) as on Linux. Windows sends nothing while nothing
+    plays: silent frames then keep the phone's player at its pace.
+
+Nothing Linux can't import is imported at module level, and the other way
+round.
 """
 
 import ctypes
 import ctypes.util
 import json
+import os
 import platform
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
+WINDOWS = platform.system() == "Windows"
 SINK = "sudo_phone"
 RATE = 48000
 CHANNELS = 2
@@ -107,12 +127,24 @@ def clamp_bitrate(bitrate):
 _opus_lib = None
 
 
+def _opus_names():
+    """Where libopus may be. Windows has none of its own: opus.dll comes
+    inside the exe (sys._MEIPASS) or sits next to the agent or in tools/."""
+    if not WINDOWS:
+        return ["libopus.so.0", ctypes.util.find_library("opus")]
+    here = Path(__file__).resolve().parent
+    dirs = [Path(getattr(sys, "_MEIPASS", here)),
+            Path(sys.executable).resolve().parent, here, here.parent / "tools"]
+    return [str(d / "opus.dll") for d in dirs if (d / "opus.dll").exists()] \
+        + [ctypes.util.find_library("opus")]
+
+
 def _opus():
     """libopus through ctypes (loaded once), or None when it is missing."""
     global _opus_lib
     if _opus_lib is not None:
         return _opus_lib
-    for name in ("libopus.so.0", ctypes.util.find_library("opus")):
+    for name in _opus_names():
         if not name:
             continue
         try:
@@ -302,13 +334,88 @@ def restore_after_crash(prev):
     sink as the picked default (the PC then plays on whatever it falls back
     to). Put `prev` back, unless the user picked another output since, or
     the sink exists again (another running agent owns it). Returns what was
-    done, for the log; raises when pactl can't be reached (retry later)."""
+    done, for the log; raises when pactl can't be reached (retry later).
+    Windows: `prev` names the outputs that run muted; unmute them."""
+    if prev.startswith(_WIN_MUTED):
+        ids = json.loads(prev[len(_WIN_MUTED):])
+        changed = _win_set_mute(ids, False)
+        return f"unmuted {len(changed)} of the PC's outputs"
     if SINK in _sinks():
         return "left the default output alone: the phone's sink is in use"
     configured = _configured_default()
     if configured is not None and configured != SINK:
         return f"the default output is already {configured}"
     return f"default output back to {restore_default(prev)}"
+
+
+# ---------------------------------------------------------- Windows outputs
+
+# persist() value on Windows: this prefix + the JSON list of the output ids
+# this agent muted.
+_WIN_MUTED = "windows-muted:"
+_WIN_MIN_BUILD = 19041            # Windows 10 2004: per-process loopback
+_WIN_BEHIND_FRAMES = 4            # silence goes out once this far behind
+_WIN_MAX_BUFFERED = RATE * CHANNELS // 5   # 200 ms of floats, then drop
+
+
+def _with_com(fn, *args):
+    """fn(*args) with COM up on this thread (an asyncio.to_thread worker
+    has none). The COM pointers fn makes must all be gone by the time COM
+    goes down, or their release crashes: so an error comes out as a
+    RuntimeError, after its traceback (holding fn's locals) is dropped."""
+    import comtypes
+    try:
+        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        owned = True
+    except OSError:
+        owned = False   # already up on this thread, single-threaded
+    error = None
+    try:
+        return fn(*args)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+    finally:
+        if owned:
+            comtypes.CoUninitialize()
+    raise RuntimeError(f"Windows audio: {error}")
+
+
+def _win_outputs():
+    """(id, IAudioEndpointVolume) of every active output. COM must be up,
+    and the pointers dropped before it goes down (_with_com)."""
+    import comtypes
+    from pycaw.constants import CLSID_MMDeviceEnumerator
+    from pycaw.pycaw import IAudioEndpointVolume, IMMDeviceEnumerator
+    enum = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator,
+                                     IMMDeviceEnumerator,
+                                     comtypes.CLSCTX_INPROC_SERVER)
+    devices = enum.EnumAudioEndpoints(0, 1)   # eRender, DEVICE_STATE_ACTIVE
+    out = []
+    for i in range(devices.GetCount()):
+        dev = devices.Item(i)
+        vol = dev.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL,
+                           None).QueryInterface(IAudioEndpointVolume)
+        out.append((dev.GetId(), vol))
+    return out
+
+
+def _win_unmuted_outputs():
+    """Ids of the outputs that aren't muted right now."""
+    return _with_com(lambda: [dev_id for dev_id, vol in _win_outputs()
+                              if not vol.GetMute()])
+
+
+def _win_set_mute(ids, mute):
+    """Mute (or unmute) the outputs among ids that are still there and not
+    that way already; returns the ids it changed."""
+    def run():
+        changed = []
+        for dev_id, vol in _win_outputs():
+            if dev_id in ids and bool(vol.GetMute()) != mute:
+                vol.SetMute(int(mute), None)
+                changed.append(dev_id)
+        return changed
+    return _with_com(run)
 
 
 # ---------------------------------------------------------------- capture
@@ -367,6 +474,7 @@ class PcAudio:
         self._encoder = None
         self._prev = None                # default output before the switch
         self._switched = False           # the default may point at SINK
+        self._muted = []                 # Windows: outputs this agent muted
         self._stopping = threading.Event()
         self._log = deque(maxlen=12)     # pw-cli / parec output, for errors
 
@@ -404,8 +512,14 @@ class PcAudio:
     def _check(mute_pc):
         system = platform.system()
         if system == "Windows":
-            raise RuntimeError("Playing the PC's sound on the phone isn't "
-                               "available on Windows yet")
+            if sys.getwindowsversion().build < _WIN_MIN_BUILD:
+                raise RuntimeError("Playing the PC's sound on the phone "
+                                   "needs Windows 10 version 2004 or newer")
+            if _opus() is None:
+                raise RuntimeError("Playing the PC's sound on the phone "
+                                   "needs opus.dll next to the Sudo agent "
+                                   "(the release's Sudo-Service.exe has it)")
+            return
         if system != "Linux":
             raise RuntimeError("Playing the PC's sound on the phone isn't "
                                f"available on {system} yet")
@@ -428,6 +542,9 @@ class PcAudio:
         self._log.clear()
         self.mute_pc = mute_pc
         self.bitrate = bitrate
+        if WINDOWS:
+            self._start_windows(mute_pc, bitrate)
+            return
         if mute_pc:
             self._wait_sink(False, 1.0)  # ours, still going away?
             if SINK in _sinks():
@@ -454,8 +571,45 @@ class PcAudio:
         print(f"[agent] PC sound to the phone: on ({bitrate // 1000} kbit/s"
               f"{', PC muted' if mute_pc else ''})")
 
+    def _start_windows(self, mute_pc, bitrate):
+        """The capture first: if it can't run, nothing was muted."""
+        self._encoder = _Encoder(bitrate)
+        self._spawn_capture(None)
+        if mute_pc:
+            ids = _win_unmuted_outputs()
+            if ids and self.persist:
+                self.persist(_WIN_MUTED + json.dumps(ids))  # before muting
+            self._muted = ids   # stop() unmutes even a half-done mute
+            _win_set_mute(ids, True)
+        print(f"[agent] PC sound to the phone: on ({bitrate // 1000} kbit/s"
+              f"{', PC muted' if mute_pc else ''})")
+
+    def _stop_windows(self):
+        self._stopping.set()
+        reader, self._reader = self._reader, None
+        if reader is not None:
+            reader.join(3)
+        if self._encoder is not None and (reader is None
+                                          or not reader.is_alive()):
+            self._encoder.close()   # a stuck reader keeps it (no crash)
+        self._encoder = None
+        if self._muted:
+            try:
+                _win_set_mute(self._muted, False)
+                if self.persist:
+                    self.persist(None)
+            except RuntimeError as e:
+                # Kept persisted: the next agent start tries again.
+                print(f"[agent] PC sound: couldn't unmute the PC: {e}")
+        self._muted = []
+        self._running = False
+        print("[agent] PC sound to the phone: off")
+
     def _stop_locked(self):
         if not self._running:
+            return
+        if WINDOWS:
+            self._stop_windows()
             return
         self._stopping.set()
         # 1. the capture (and, once the reader is out, its encoder)
@@ -560,7 +714,8 @@ class PcAudio:
         failure = []
         session = self._session
         reader = threading.Thread(
-            target=self._read, args=(source, ready, failure, session),
+            target=self._read_windows if WINDOWS else self._read,
+            args=(source, ready, failure, session),
             name="sudo-pc-audio", daemon=True)
         self._reader = reader
         reader.start()
@@ -631,6 +786,107 @@ class PcAudio:
         if got_one and not self._stopping.is_set():
             # Nobody asked: put the PC's output back from a fresh thread
             # (stop() joins this one), then tell the agent.
+            reason = "the PC's sound capture stopped"
+            print(f"[agent] PC sound: {reason}{self._last_log()}")
+            threading.Thread(target=self._ended, args=(session, reason),
+                             daemon=True).start()
+
+    def _read_windows(self, source, ready, failure, session):
+        """Windows' per-process loopback of every process but the agent, as
+        float 48 kHz stereo (Windows converts); each 20 ms that fills is
+        encoded and passed on at once. Nothing comes while nothing plays:
+        once the stream is _WIN_BEHIND_FRAMES behind the clock, the frame
+        goes out padded with silence."""
+        import numpy as np
+        import phone_audio as pa   # first: it makes comtypes' import MTA
+        import comtypes
+        comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        event = client = cap = None
+        got_one = False
+        try:
+            try:
+                client = pa.activate_process_loopback(os.getpid(),
+                                                      exclude=True)
+                fmt = pa.WAVEFORMATEX(
+                    pa._WAVE_FORMAT_IEEE_FLOAT, CHANNELS, RATE,
+                    RATE * CHANNELS * 4, CHANNELS * 4, 32, 0)
+                event = pa._k32.CreateEventW(None, False, False, None)
+                client.Initialize(
+                    0, pa._LOOPBACK | pa._EVENTCALLBACK | pa._AUTOCONVERTPCM
+                    | pa._SRC_DEFAULT_QUALITY, 200000, 0, ctypes.byref(fmt),
+                    None)
+                client.SetEventHandle(event)
+                cap = client.GetService(ctypes.byref(
+                    pa.IAudioCaptureClient._iid_)).QueryInterface(
+                        pa.IAudioCaptureClient)
+                client.Start()
+            except Exception as e:
+                # Its message only: the traceback holds COM pointers.
+                failure.append(RuntimeError(str(e) or type(e).__name__))
+                return
+            encoder = self._encoder
+            bitrate = self.bitrate
+            frame = FRAME_SAMPLES * CHANNELS
+            buf = np.zeros(0, np.float32)
+            began = time.monotonic()
+            sent = 0
+            while not self._stopping.is_set():
+                pa._k32.WaitForSingleObject(event, 10)
+                parts = [buf]
+                while cap.GetNextPacketSize() > 0:
+                    data, n, flags, _, _ = cap.GetBuffer()
+                    if n:
+                        if flags & pa._BUFFERFLAGS_SILENT:
+                            parts.append(np.zeros(n * CHANNELS, np.float32))
+                        else:
+                            parts.append(np.frombuffer(ctypes.string_at(
+                                data, n * CHANNELS * 4), np.float32))
+                    cap.ReleaseBuffer(n)
+                buf = np.concatenate(parts)
+                if len(buf) > _WIN_MAX_BUFFERED:
+                    buf = buf[-_WIN_MAX_BUFFERED:]   # stalled: newest only
+                due = int((time.monotonic() - began) * 1000 // FRAME_MS)
+                if len(buf) < frame and due - sent > _WIN_BEHIND_FRAMES:
+                    if due - sent > 2 * _WIN_BEHIND_FRAMES:
+                        sent = due - _WIN_BEHIND_FRAMES  # after a stall
+                    buf = np.concatenate(
+                        [buf, np.zeros(frame - len(buf), np.float32)])
+                while len(buf) >= frame:
+                    pcm = (np.clip(buf[:frame], -1.0, 1.0) * 32767) \
+                        .astype("<i2").tobytes()
+                    buf = buf[frame:]
+                    sent += 1
+                    if not got_one:
+                        got_one = True
+                        ready.set()
+                    if self.bitrate != bitrate:
+                        bitrate = self.bitrate
+                        encoder.set_bitrate(bitrate)
+                    try:
+                        packet = encoder.encode(pcm)
+                    except RuntimeError as e:
+                        self._log.append(str(e))
+                        continue
+                    seq = self._seq
+                    self._seq += 1
+                    try:
+                        self.on_packet(seq, packet)
+                    except Exception as e:
+                        self._log.append(f"on_packet: {e}")
+            client.Stop()
+        except Exception as e:
+            self._log.append(f"capture: {e}")
+        finally:
+            client = cap = None   # released while COM is still up
+            if event:
+                pa._k32.CloseHandle(event)
+            comtypes.CoUninitialize()
+            if not got_one:
+                if not failure:
+                    failure.append(RuntimeError(
+                        "the capture stopped" + self._last_log()))
+                ready.set()
+        if got_one and not self._stopping.is_set():
             reason = "the PC's sound capture stopped"
             print(f"[agent] PC sound: {reason}{self._last_log()}")
             threading.Thread(target=self._ended, args=(session, reason),

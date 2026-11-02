@@ -29,9 +29,12 @@ agent calls start() and stop() through asyncio.to_thread.
 
 Windows (10 2004 or newer):
 
-  * Windows' per-process loopback, told to EXCLUDE the agent's own process
-    (phone_audio.activate_process_loopback), records everything the PC
-    plays. Unlike a loopback of one output it doesn't care which output the
+  * Windows' per-process loopback (phone_audio.activate_process_loopback)
+    in its "everything but this process tree" mode records everything the
+    PC plays. The process left out is an idle cmd.exe of its own: leaving
+    out the agent would leave out every app it started too (an exclusion
+    covers the children), the apps opened from the phone among them.
+    Unlike a loopback of one output it doesn't care which output the
     apps play on, so switching to headphones meanwhile changes nothing;
   * mute_pc: every output that isn't muted yet is muted. The loopback taps
     the apps' sound before an output's volume and mute, so the phone still
@@ -792,8 +795,10 @@ class PcAudio:
                              daemon=True).start()
 
     def _read_windows(self, source, ready, failure, session):
-        """Windows' per-process loopback of every process but the agent, as
-        float 48 kHz stereo (Windows converts); each 20 ms that fills is
+        """Windows' per-process loopback of every process but an idle
+        cmd.exe (see the module docstring; it ends with this thread, and on
+        its own when the agent dies: its stdin closes), as float 48 kHz
+        stereo (Windows converts); each 20 ms that fills is
         encoded and passed on at once. Nothing comes while nothing plays:
         once the stream is _WIN_BEHIND_FRAMES behind the clock, the frame
         goes out padded with silence."""
@@ -801,12 +806,15 @@ class PcAudio:
         import phone_audio as pa   # first: it makes comtypes' import MTA
         import comtypes
         comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
-        event = client = cap = None
+        event = client = cap = idle = None
         got_one = False
         try:
             try:
-                client = pa.activate_process_loopback(os.getpid(),
-                                                      exclude=True)
+                idle = subprocess.Popen(
+                    ["cmd.exe", "/q", "/k"], stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+                client = pa.activate_process_loopback(idle.pid, exclude=True)
                 fmt = pa.WAVEFORMATEX(
                     pa._WAVE_FORMAT_IEEE_FLOAT, CHANNELS, RATE,
                     RATE * CHANNELS * 4, CHANNELS * 4, 32, 0)
@@ -881,6 +889,7 @@ class PcAudio:
             if event:
                 pa._k32.CloseHandle(event)
             comtypes.CoUninitialize()
+            _end(idle)
             if not got_one:
                 if not failure:
                     failure.append(RuntimeError(

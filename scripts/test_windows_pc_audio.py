@@ -4,8 +4,8 @@ after, by stop() and by the crash restore.
 
 Needs a sound card (CI: a virtual one, LABSN/sound-ci-helpers) and opus.dll
 where pc_audio looks for it (CI: tools/opus.dll). A child process plays a
-1 kHz tone (the capture leaves out the agent's own process, here this
-one); the packets are decoded with libopus and must carry that tone.
+1 kHz tone, as an app started from the phone would be the agent's child;
+the packets are decoded with libopus and must carry that tone.
 
 Usage: python -I scripts/test_windows_pc_audio.py
 """

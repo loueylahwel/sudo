@@ -84,6 +84,26 @@ def level_and_pitch(pcm):
     return rms, float(np.argmax(spectrum[1:]) + 1) * 48000 / len(left)
 
 
+def output_peak():
+    """The loudest output's peak meter right now: is the tone playing?"""
+    def run():
+        import comtypes
+        from pycaw.constants import CLSID_MMDeviceEnumerator
+        from pycaw.pycaw import IAudioMeterInformation, IMMDeviceEnumerator
+        enum = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator,
+                                         IMMDeviceEnumerator,
+                                         comtypes.CLSCTX_INPROC_SERVER)
+        devices = enum.EnumAudioEndpoints(0, 1)
+        peak = 0.0
+        for i in range(devices.GetCount()):
+            meter = devices.Item(i).Activate(
+                IAudioMeterInformation._iid_, comtypes.CLSCTX_ALL,
+                None).QueryInterface(IAudioMeterInformation)
+            peak = max(peak, meter.GetPeakValue())
+        return peak
+    return pc_audio._with_com(run)
+
+
 def main():
     before = set(pc_audio._win_unmuted_outputs())
     check("an unmuted output", bool(before), f"({len(before)})")
@@ -94,32 +114,44 @@ def main():
         persist=persisted.append)
     wav = Path(tempfile.gettempdir()) / "sudo-tone.wav"
     write_tone(wav)
-    audio.start(mute_pc=True)
-    try:
-        time.sleep(1.0)
-        silent = len(packets)
-        check("frames while nothing plays", 40 <= silent <= 60,
-              f"({silent} in 1 s)")
-        still = set(pc_audio._win_unmuted_outputs()) & before
-        check("the PC's outputs are muted", not still,
-              f"({len(still)} still unmuted)")
-        player = subprocess.Popen([sys.executable, "-I", "-c", PLAYER,
-                                   str(wav)])
+    # Not muted first: if the tone doesn't come through even then, the
+    # capture (or the player) is at fault, not the mute.
+    for mute in (False, True):
+        label = "PC muted" if mute else "PC not muted"
+        packets.clear()
+        audio.start(mute_pc=mute)
         try:
-            time.sleep(1.5)   # the player starts
-            start = len(packets)
-            time.sleep(3.0)
-            tone = packets[start:]
+            time.sleep(1.0)
+            silent = len(packets)
+            check(f"frames while nothing plays ({label})",
+                  40 <= silent <= 60, f"({silent} in 1 s)")
+            if mute:
+                still = set(pc_audio._win_unmuted_outputs()) & before
+                check("the PC's outputs are muted", not still,
+                      f"({len(still)} still unmuted)")
+            player = subprocess.Popen(
+                [sys.executable, "-I", "-c", PLAYER, str(wav)],
+                stderr=subprocess.PIPE, text=True)
+            try:
+                time.sleep(1.5)   # the player starts
+                peak = output_peak()
+                start = len(packets)
+                time.sleep(3.0)
+                tone = packets[start:]
+                playing = player.poll() is None
+            finally:
+                player.kill()
+                err = player.communicate()[1].strip()
+            check(f"frames while the tone plays ({label})",
+                  135 <= len(tone) <= 165, f"({len(tone)} in 3 s)")
+            rms, pitch = level_and_pitch(decode(tone))
+            check(f"the tone reaches the phone ({label})", rms > 2000,
+                  f"(RMS {rms:.0f} of 32767; output meter {peak:.2f}; "
+                  f"player {'playing' if playing else 'exited: ' + err})")
+            check(f"at its pitch ({label})", abs(pitch - TONE_HZ) < 5,
+                  f"({pitch:.1f} Hz)")
         finally:
-            player.kill()
-        check("frames while the tone plays", 135 <= len(tone) <= 165,
-              f"({len(tone)} in 3 s)")
-        rms, pitch = level_and_pitch(decode(tone))
-        check("the tone reaches the phone, PC muted", rms > 2000,
-              f"(RMS {rms:.0f} of a full-scale 32767)")
-        check("at its pitch", abs(pitch - TONE_HZ) < 5, f"({pitch:.1f} Hz)")
-    finally:
-        audio.stop()
+            audio.stop()
     unmuted = set(pc_audio._win_unmuted_outputs())
     check("unmuted after stop", before <= unmuted,
           f"({len(before - unmuted)} left muted)")

@@ -27,7 +27,7 @@ nothing to configure.
 - **Media & volume** control, **clipboard** sync, **brightness** slider
 - **PC sound on your phone** — one switch and everything the PC plays
   comes out of the phone instead (the PC goes quiet), at home or away,
-  with the screen off too (Linux PCs for now)
+  with the screen off too (Linux PCs, and Windows 10 version 2004 or newer)
 - **Power**: lock, sleep, hibernate, restart, shutdown — now or on a
   **timer** (shut down in 30 min, at 1:00 AM, …) with a countdown you can
   cancel from the phone

@@ -2972,22 +2972,25 @@ class EmbeddedRelay:
                     token = str(msg.get("token") or "")
                     trusted = bool(token) and token in self.agent.cfg.get(
                         "approved_tokens", [])
-                    if not trusted and self.agent.cfg.get(
-                            "require_approval", True) \
-                            and self.agent.approval is not None:
-                        await ws.send(
-                            json.dumps({"type": "approval.pending"}))
-                        peer = str(msg.get("name") or "").strip()
-                        if not peer:
-                            peer = (ws.remote_address[0]
-                                    if ws.remote_address else "unknown")
-                        allowed = await self.agent.approval.ask(peer)
-                        if not allowed:
-                            await ws.send(json.dumps(
-                                {"type": "error",
-                                 "error": "denied on this PC"}))
-                            await ws.close()
-                            return
+                    if not trusted:
+                        if self.agent.cfg.get("require_approval", True) \
+                                and self.agent.approval is not None:
+                            await ws.send(
+                                json.dumps({"type": "approval.pending"}))
+                            peer = str(msg.get("name") or "").strip()
+                            if not peer:
+                                peer = (ws.remote_address[0]
+                                        if ws.remote_address else "unknown")
+                            allowed = await self.agent.approval.ask(peer)
+                            if not allowed:
+                                await ws.send(json.dumps(
+                                    {"type": "error",
+                                     "error": "denied on this PC"}))
+                                await ws.close()
+                                return
+                        # A token even without the prompt: the phone needs
+                        # one for the TLS port (and from outside), which it
+                        # moves to right after pairing.
                         token = uuid.uuid4().hex
                         self.agent.cfg.setdefault(
                             "approved_tokens", []).append(token)

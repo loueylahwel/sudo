@@ -1,0 +1,38 @@
+name: Bug report
+description: Something doesn't work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Sudo version
+      placeholder: v2.3.1
+    validations:
+      required: true
+  - type: input
+    id: phone
+    attributes:
+      label: Phone
+      placeholder: Galaxy A05s, Android 14
+    validations:
+      required: true
+  - type: input
+    id: pc
+    attributes:
+      label: PC
+      placeholder: Windows 11 23H2 / Ubuntu 24.04, KDE Plasma, Wayland
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Agent log (Linux, if you can)
+      description: "journalctl --user -u sudo-agent -n 200"
+      render: text

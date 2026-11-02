@@ -1,160 +1,189 @@
+<div align="center">
+
+<img src="app/assets/icon/icon.png" alt="" width="96" height="96">
+
 # Sudo
 
-![demo](docs/demo.gif)
+**`sudo give me my PC`**: your Windows or Linux PC, in your Android phone.<br>
+Its screen, files, terminal, music and sound. One tap to connect, no account, free.
 
-[![Latest release](https://img.shields.io/github/v/release/loueylahwel/sudo?label=release)](https://github.com/loueylahwel/sudo/releases/latest)
+[![Download](https://img.shields.io/github/v/release/loueylahwel/sudo?label=download&color=2ea44f)](https://github.com/loueylahwel/sudo/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/loueylahwel/sudo/total?color=blue)](https://github.com/loueylahwel/sudo/releases)
+[![Platforms](https://img.shields.io/badge/PC-Windows%20%E2%80%A2%20Linux-blue)](#what-works-where)
+[![Phone](https://img.shields.io/badge/phone-Android-3ddc84)](#download)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%E2%80%A2%20Android-blue)](#setup-2-minutes)
-[![No accounts](https://img.shields.io/badge/cloud-none-success)](#how-it-works)
+[![Agent CI](https://github.com/loueylahwel/sudo/actions/workflows/agent-platforms.yml/badge.svg)](https://github.com/loueylahwel/sudo/actions/workflows/agent-platforms.yml)
 
-`sudo give me my PC` — control your Windows PC from your Android phone over
-your local network. No accounts, no cloud, no QR codes, no pairing codes,
-nothing to configure.
+</div>
 
-- **Screen streaming** with a live touchpad cursor — drag to move, two
-  fingers to scroll (laptop-style), tap to click. Quality presets (Auto
-  adapts to your Wi-Fi, up to full-res Max with sharp text, plus a beta
-  H.264 "Smooth video" mode)
-- **Phone screen** — use your phone as a second monitor: put one PC app
-  (Discord, YouTube in a browser, …) on a virtual screen only the phone
-  sees, while the PC keeps showing what you're doing. Taps don't move your
-  PC cursor or steal its focus. Needs a one-time driver install (Parsec
-  Virtual Display, approved on the PC)
-- **App switcher** — Alt-Tab-style grid with live previews and icons,
-  search, a one-tap dock of running apps, and launching Start-menu apps
-- **PC webcam view** on your phone
-- **Files** — browse, download to your phone, upload to your PC
-- **Media & volume** control, **clipboard** sync, **brightness** slider
-- **PC sound on your phone** — one switch and everything the PC plays
-  comes out of the phone instead (the PC goes quiet), at home or away,
-  with the screen off too (Linux PCs, and Windows 10 version 2004 or newer)
-- **Power**: lock, sleep, hibernate, restart, shutdown — now or on a
-  **timer** (shut down in 30 min, at 1:00 AM, …) with a countdown you can
-  cancel from the phone
-- **Shell** commands and process list/kill
+<p align="center">
+  <img src="docs/screenshots/phone-screen-landscape.png" alt="A KDE Plasma desktop streamed full screen to an Android phone held sideways" width="880"><br>
+  <sub>Your PC's screen on your phone, with a laptop-style touchpad: drag to move, tap to click, two fingers to scroll.</sub>
+</p>
 
-## Setup (2 minutes)
+## Why Sudo
 
-**On your PC (Windows 10/11):**
+- **One tap to connect.** Open the app, tap **Find my PC**, tap your PC's
+  name. The first time, the PC asks you to allow the phone. No codes, no QR,
+  nothing to set up.
+- **No account, no subscription, no company in the middle.** At home the
+  phone talks straight to the PC over your Wi-Fi.
+- **More than remote desktop.** Files both ways, a terminal, what's playing
+  and the volume, the PC's sound through your phone or headphones, the
+  webcam, sleep and shutdown timers.
+- **Away from home too.** Pair once at home, then reach the PC from mobile
+  data or any Wi-Fi, without opening ports on your router. The connection
+  stays encrypted end to end.
+- **Free and open source** (MIT). The PC side is a small Python agent, the
+  phone app is Flutter.
 
-1. Download **`Sudo-Service.exe`** from the
-   [latest release](https://github.com/loueylahwel/sudo/releases/latest)
-2. Run it once. That's it — it's invisible, adds itself to startup, and
-   starts at every boot. (Windows may ask to allow it through the firewall —
-   say yes, it's how your phone finds the PC.)
+## Download
 
-**On your phone (Android 10+):**
+| | Download | Needs |
+|---|---|---|
+| **Android phone** | [sudo.apk](https://github.com/loueylahwel/sudo/releases/latest/download/sudo.apk) | Android 10 or newer |
+| **Windows PC** | [Sudo-Service.exe](https://github.com/loueylahwel/sudo/releases/latest/download/Sudo-Service.exe) | Windows 10 or 11 (PC sound: version 2004 or newer) |
+| **Linux PC** | [one command](#on-linux) | Ubuntu, Debian, Mint, Fedora, Arch, openSUSE and others; X11 or Wayland |
 
-1. Download **`sudo.apk`** from the same release and install it
-   (allow "install unknown apps" when Android asks)
-2. Make sure phone and PC are on the **same Wi-Fi**
-3. Open Sudo → **Find my PC** → your PC's name pops up → tap it
-4. Connected. From now on the app reconnects by itself — even across
-   network switches.
+### On Windows
 
-No code, no QR, ever: the PC broadcasts a tiny "I'm here" beacon that the
-app listens for. If the PC's IP changes, the app re-finds it by name.
+Run `Sudo-Service.exe` once. That's all: it runs invisibly, adds itself to
+startup and starts at every boot. If Windows asks whether to allow it
+through the firewall, say yes: that's how your phone finds the PC.
 
-> **Security note:** tap-to-connect with no code means *anyone on your
-> Wi-Fi with the app can connect to your PC*. That's the deliberate
-> trade-off for zero-friction pairing on a trusted home network. The PC
-> agent also exposes full file and shell access by design — run it only on
-> machines you own.
+Updating: end the running Sudo first (Task Manager → Sudo-Service → End
+task), put the new file in place of the old one and run it once.
 
-## Linux (Debian, Ubuntu, Mint, Fedora, Arch, openSUSE…)
+### On Linux
 
 ```bash
 git clone https://github.com/loueylahwel/sudo.git && cd sudo
 bash agent/linux/install.sh
 ```
 
-The installer adds a few system packages (apt, dnf, pacman or zypper),
-puts the agent in `~/.local/share/sudo-agent` and starts it with your
-desktop session (a systemd user service, or an autostart entry without
-systemd). Re-run it after `git pull` to update. Logs:
+The installer adds a few system packages (apt, dnf, pacman or zypper), puts
+the agent in `~/.local/share/sudo-agent` and starts it with your desktop
+session. Re-run it after `git pull` to update. Logs:
 `journalctl --user -u sudo-agent -f`.
 
-What works on Linux today:
-- the Screen view with mouse and keyboard control, on X11 and on Wayland:
-  GNOME and KDE Plasma through the desktop's screen sharing (the PC asks
-  once to allow it), Sway, Hyprland and other wlroots desktops through
-  screen sharing plus a virtual mouse/keyboard;
-- files, terminal (bash), processes, clipboard, power and the timer;
-- media keys, Now Playing and seek (through MPRIS, so any player);
-- camera, and remote access.
+### On the phone
 
-If the PC can't show its screen to Sudo, the phone shows why and how to
-fix it instead of a black picture. Checked on every change
-(`.github/workflows/agent-platforms.yml`): the installer and capture on
-Ubuntu 24.04 and 26.04, Debian 13, Fedora, Arch and openSUSE Tumbleweed,
-screen sharing on Sway, and capture on Windows and macOS.
+1. Install `sudo.apk` (allow "install unknown apps" when Android asks).
+2. Put the phone on the same Wi-Fi as the PC.
+3. Open Sudo → **Find my PC** → tap your PC's name → allow it on the PC.
 
-These are still Windows-only:
-- the app switcher and dock;
-- the phone as a second monitor;
-- phone audio;
-- brightness.
+From then on the app reconnects by itself, at home and away.
 
-See [docs/linux-port-plan.md](docs/linux-port-plan.md) for the plan to port
-them, and for native Wayland (KDE portal) capture.
+## What it does
 
-## Away from home
+<table>
+  <tr>
+    <td width="33%"><img src="docs/screenshots/phone-dashboard.png" alt="The dashboard: connection, CPU and RAM, the Screen, Files, Camera and Terminal buttons, and the track playing on the PC"></td>
+    <td width="33%"><img src="docs/screenshots/phone-files.png" alt="Files: the PC's Documents folder on the phone"></td>
+    <td width="33%"><img src="docs/screenshots/phone-terminal.png" alt="Terminal: commands run on the PC from the phone, with their output"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Dashboard and Now Playing</sub></td>
+    <td align="center"><sub>Files, both ways</sub></td>
+    <td align="center"><sub>Terminal</sub></td>
+  </tr>
+</table>
 
-Pair once on your home Wi-Fi; after that the app reaches your PC from any
-network (mobile data, another Wi-Fi), with nobody at the PC. It tries, in
-order of speed:
+- **Screen** with a live touchpad cursor and keyboard. Type from the phone
+  as you go, in the PC's own keyboard layout. Switch between the PC's
+  screens, lock the view to one window, zoom in to the PC's real pixels.
+  Quality adapts to your Wi-Fi, up to full resolution with sharp text.
+- **PC sound on your phone.** One switch: everything the PC plays comes out
+  of the phone or its headphones, and the PC goes quiet. Works with the
+  phone's screen off and away from home; if the phone drops off, the music
+  pauses instead of blasting out of the PC's speakers.
+- **Files**: browse the PC, download to the phone, upload to the PC.
+- **Now Playing**: what the PC is playing, play/pause, skip, seek, volume.
+- **Terminal** and the process list (end a stuck app from your bed).
+- **Webcam**: see what the PC's camera sees.
+- **Power**: lock, sleep, hibernate, restart, shut down, now or on a timer
+  ("shut down in 30 minutes") with a countdown you can cancel.
+- **Clipboard** both ways, **brightness**, an Alt-Tab style **app
+  switcher** with live previews.
 
-1. the home network;
-2. your router's forward of the PC's secure port (set up by UPnP, when
-   your provider allows incoming connections);
-3. a Cloudflare tunnel the PC opens outward (works even when the provider
-   blocks incoming connections). The PC downloads `cloudflared` once if
-   it isn't installed. No account needed. Traffic stays end-to-end
-   encrypted with the PC's own certificate, so Cloudflare only carries
-   scrambled bytes.
+### What works where
 
-The tunnel's address changes when the PC restarts. The PC posts the new one
-to a secret [ntfy.sh](https://ntfy.sh) topic that only your paired phones
-know, and the app looks there when the old address stops answering.
+| | Windows | Linux |
+|---|---|---|
+| Screen, touchpad, keyboard | Yes | Yes: X11, and Wayland on GNOME, KDE Plasma, Sway, Hyprland |
+| Files, terminal, processes | Yes | Yes |
+| Now Playing and media keys | Yes | Yes (any MPRIS player) |
+| PC sound on the phone | Yes (Windows 10 2004+) | Yes (PipeWire) |
+| Webcam | Yes | Yes |
+| Power and timers, clipboard | Yes | Yes |
+| App switcher and dock | Yes | KDE Plasma |
+| Brightness | Yes | KDE Plasma |
+| Away from home | Yes | Yes |
 
-For it to work whenever you want, the PC must be on, logged in (turn on
-automatic login) and not asleep. Set `"tunnel": false` in the agent's
-`config.json` to turn the tunnel off, or `"remote_access": false` to turn
-off all access from outside.
+macOS isn't supported yet. If the PC can't show its screen (a locked
+session, a Wayland desktop that needs permission), the phone says why and
+how to fix it instead of showing a black picture.
 
-## Optional: Sudo-Agent.exe (GUI)
+## Private by design
 
-Also in the release: `Sudo-Agent.exe` shows a little window with live
-status and a QR for manual pairing. You don't need it for the normal setup
-above.
+- **Nothing to sign up for**, and no Sudo server: at home the phone and the
+  PC talk directly, and nothing leaves your network.
+- **The PC decides.** A phone it hasn't seen before can only connect once
+  you click Allow on the PC.
+- **Encrypted.** After pairing, the phone connects over TLS and checks the
+  PC's own certificate, so nobody can pose as your PC.
+- **Away from home**, the connection goes through your router (when it
+  allows it) or a [Cloudflare](https://www.cloudflare.com/) tunnel that the
+  PC opens outward, with no account needed. Either way it stays encrypted
+  with the PC's certificate, so the tunnel only carries scrambled bytes. The
+  tunnel's address reaches your phones through a secret
+  [ntfy.sh](https://ntfy.sh) topic only they know.
+- **Your choice.** Set `"remote_access": false` in the agent's
+  `config.json` to stay home-only, or `"tunnel": false` to skip the tunnel.
+
+Sudo gives the phone full access to the PC's files and a terminal: that's
+the point. Install the agent only on PCs you own.
 
 ## How it works
 
 ```
- Sudo-Service.exe (PC)                Sudo app (phone)
- ┌─────────────────────┐   ws :8080   ┌────────────────┐
- │ relay (embedded)     │ ◀────────── │ Find my PC      │
- │ screen/camera stream │ ──────────▶ │ (UDP discovery) │
- │ input, files, shell  │   frames    │                 │
- └─────────────────────┘              └────────────────┘
+   PC: Sudo agent (Python)                       Phone: Sudo app (Flutter)
+ ┌──────────────────────────┐   UDP 47809      ┌─────────────────────────┐
+ │ "I'm here" beacon         │ ───────────────▶ │ Find my PC              │
+ │ screen, camera, sound     │   WebSocket      │ touchpad, keyboard      │
+ │ files, terminal, media    │ ◀──────────────▶ │ files, terminal, media  │
+ │ TLS port (paired phones)  │   8080 / 8443    │                         │
+ └──────────────────────────┘                  └─────────────────────────┘
 ```
 
-At home the phone and PC talk directly over WebSocket on port 8080 (and
-8443, TLS, once paired) — nothing leaves your network. PC discovery uses a
-UDP beacon on port 47809. Away from home, see [Away from home](#away-from-home).
+The PC announces itself on the Wi-Fi with a small UDP beacon, so the app
+finds it by name even after its IP changes. The screen is JPEG frames that
+follow the link's speed (or H.264 in the beta "Smooth video" mode); the PC's
+sound is Opus. The wire protocol is in [docs/protocol.md](docs/protocol.md).
+
+Every change is checked on GitHub's machines: the Linux installer and screen
+capture on Ubuntu, Debian, Fedora, Arch and openSUSE, Wayland screen sharing
+on Sway, and on Windows the built exes themselves: pairing, screen frames
+and PC sound on a virtual sound card.
 
 ## Building from source
 
-| part | stack | build |
+| Part | Stack | Build |
 |---|---|---|
-| `agent/` | Python 3.11+ | `pip install -r requirements.txt`, then PyInstaller |
-| `relay/` | Node.js 18+ | only needed for internet/remote mode — `npm install && npm start` |
-| `app/` | Flutter 3.3+ | `flutter pub get && flutter build apk --release` |
+| `agent/` | Python 3.11+ | `pip install -r agent/requirements.txt`; Windows exes: see [windows-exes.yml](.github/workflows/windows-exes.yml) |
+| `app/` | Flutter | `cd app && flutter pub get && flutter build apk --release` |
+| `relay/` | Node.js 18+ | optional standalone relay: `npm install && npm start` |
 
-Repo layout: `agent/` (PC service + GUI, Python), `app/` (Flutter phone
-app), `relay/` (optional standalone Node relay for remote access),
-`docs/protocol.md` (wire protocol), `scripts/` (verification utilities).
+Layout: `agent/` (PC agent, Python), `app/` (phone app, Flutter),
+`relay/` (optional relay), `docs/` (protocol, Linux notes), `scripts/`
+(tests and measuring tools).
 
-## Roadmap
+## Contributing
 
-- PC notification mirroring
+Bug reports, ideas and pull requests are welcome: see
+[CONTRIBUTING.md](CONTRIBUTING.md). Found a security problem? Please read
+[SECURITY.md](SECURITY.md) first.
+
+## License
+
+[MIT](LICENSE)

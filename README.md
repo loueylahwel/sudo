@@ -17,8 +17,8 @@ Its screen, files, terminal, music and sound. One tap to connect, no account, fr
 </div>
 
 <p align="center">
-  <img src="docs/screenshots/phone-screen-landscape.png" alt="A KDE Plasma desktop streamed full screen to an Android phone held sideways" width="880"><br>
-  <sub>Your PC's screen on your phone, with a laptop-style touchpad: drag to move, tap to click, two fingers to scroll.</sub>
+  <img src="docs/demo.gif" alt="Recorded on an Android phone held sideways: the cursor of a KDE Plasma PC moves under the phone's touchpad, opens Documents and Pictures in the file manager, then System Settings from the taskbar" width="880"><br>
+  <sub>Recorded on the phone: its touchpad drives the PC. Drag to move, tap to click, two fingers to scroll.</sub>
 </p>
 
 ## Why Sudo

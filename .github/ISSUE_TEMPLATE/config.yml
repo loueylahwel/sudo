@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security problem
-    url: https://github.com/loueylahwel/sudo/security/advisories/new
+    url: https://github.com/loueylahwel/rem/security/advisories/new
     about: Please report vulnerabilities privately, not in a public issue.

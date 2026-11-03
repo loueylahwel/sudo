@@ -377,24 +377,24 @@ def black_screen_reason():
     """(what happens, how to fix it) for this PC's system."""
     system = platform.system()
     if system == "Linux" and wayland_session():
-        return ("This PC runs a Wayland desktop, and Sudo is reading the "
+        return ("This PC runs a Wayland desktop, and Rem is reading the "
                 "screen through X11 there, which only gives black.",
                 "Fix: re-run agent/linux/install.sh (it sets up screen "
-                "sharing through the desktop portal) and start Sudo again.")
+                "sharing through the desktop portal) and start Rem again.")
     if system == "Darwin":
-        return ("macOS is hiding the screen from Sudo.",
+        return ("macOS is hiding the screen from Rem.",
                 "Fix: System Settings > Privacy & Security > Screen "
-                "Recording: turn on the app that runs Sudo (Terminal, iTerm "
-                "or Python), then quit it and start Sudo again. The mouse "
+                "Recording: turn on the app that runs Rem (Terminal, iTerm "
+                "or Python), then quit it and start Rem again. The mouse "
                 "and keyboard need Accessibility on the same page.")
     if system == "Windows":
-        return ("Windows gives Sudo a black picture.",
-                "Fix: unlock the PC (Sudo can't see the lock or sign-in "
-                "screen). If it stays black, start Sudo from your own "
+        return ("Windows gives Rem a black picture.",
+                "Fix: unlock the PC (Rem can't see the lock or sign-in "
+                "screen). If it stays black, start Rem from your own "
                 "signed-in account, not as a service or a task that runs "
                 "while nobody is signed in.")
-    return ("The PC gives Sudo a black picture.",
-            "Fix: start Sudo from the signed-in desktop session "
+    return ("The PC gives Rem a black picture.",
+            "Fix: start Rem from the signed-in desktop session "
             f"(DISPLAY is {os.environ.get('DISPLAY') or 'not set'}).")
 
 
@@ -414,7 +414,7 @@ def black_screen_notice(size):
     margin = w // 14
     y = h // 6
     what, fix = black_screen_reason()
-    for text, px, color in (("Sudo can't see this PC's screen", w // 22,
+    for text, px, color in (("Rem can't see this PC's screen", w // 22,
                              (255, 255, 255)),
                             (what, w // 34, (220, 220, 220)),
                             (fix, w // 34, (130, 220, 200))):
@@ -2664,7 +2664,7 @@ def win_timer_arm(action, seconds):
     knows where the countdown came from."""
     return run_power_exe(["shutdown", WIN_TIMED_ACTIONS[action],
                           "/t", str(int(seconds)),
-                          "/c", "Scheduled from the Sudo app on your phone."])
+                          "/c", "Scheduled from the Rem app on your phone."])
 
 
 def win_timer_abort():
@@ -3786,7 +3786,7 @@ class Agent:
             # inside the git checkout): the private key must not end up in
             # the repo.
             cert, key, fingerprint = remote_access.ensure_certificate(
-                _default_config_path().parent, f"Sudo {self.cfg['name']}")
+                _default_config_path().parent, f"Rem {self.cfg['name']}")
             ctx = remote_access.server_ssl_context(cert, key)
         except Exception as e:
             print(f"[agent] secure port disabled: {e}")
@@ -5325,8 +5325,12 @@ def ensure_startup_shortcut():
     no admin needed) — part of the zero-setup promise."""
     if not getattr(sys, "frozen", False) or platform.system() != "Windows":
         return
-    link = Path(os.environ.get("APPDATA", "")) / (
-        r"Microsoft\Windows\Start Menu\Programs\Startup\Sudo-Service.lnk")
+    startup = Path(os.environ.get("APPDATA", "")) / (
+        r"Microsoft\Windows\Start Menu\Programs\Startup")
+    # From before the rename to Rem: it starts Sudo-Service.exe, which the
+    # new file replaced.
+    (startup / "Sudo-Service.lnk").unlink(missing_ok=True)
+    link = startup / "Rem-Service.lnk"
     if link.exists():
         return
     ps = ("$s=(New-Object -ComObject WScript.Shell)"
@@ -5358,7 +5362,7 @@ def main():
     ensure_startup_shortcut()
     cfg = load_config()
     print("=" * 52)
-    print("  Sudo agent")
+    print("  Rem agent")
     print(f"  PC name : {cfg['name']}")
     print(f"  Pairing code : {cfg['code']}")
     print(f"  Relay : {cfg['relay']}")

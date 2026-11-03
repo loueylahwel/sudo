@@ -1,9 +1,12 @@
 # Changelog
 
-Downloads for every version: [releases](https://github.com/loueylahwel/sudo/releases).
+Downloads for every version: [releases](https://github.com/loueylahwel/rem/releases).
 
-## Unreleased
+## v2.4.0 (2026-11-03)
 
+- Sudo is now called **Rem**, with a new logo. The files are `rem.apk`,
+  `Rem-Service.exe` and `Rem-Agent.exe`. Updating keeps your pairings:
+  the app installs over the old one, and the PC keeps its settings.
 - A PC set to pair without the Allow/Deny prompt (`"require_approval":
   false`) no longer leaves the phone stuck on "Disconnected" right after
   pairing.
@@ -38,4 +41,4 @@ Downloads for every version: [releases](https://github.com/loueylahwel/sudo/rele
 
 ## v2.2.0 (2026-08-05) and earlier
 
-See the [release notes](https://github.com/loueylahwel/sudo/releases).
+See the [release notes](https://github.com/loueylahwel/rem/releases).

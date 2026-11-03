@@ -1,11 +1,11 @@
 name: Idea or feature request
-description: Something Sudo should do
+description: Something Rem should do
 labels: [enhancement]
 body:
   - type: textarea
     id: idea
     attributes:
-      label: What would you like Sudo to do?
+      label: What would you like Rem to do?
       description: And what would you use it for?
     validations:
       required: true

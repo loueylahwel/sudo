@@ -38,10 +38,10 @@ jobs:
         run: python -I scripts/test_windows_pc_audio.py
       - name: Test pausing the PC's players when the phone drops
         run: python -I scripts/test_windows_media_pause.py
-      - name: Build Sudo-Service.exe and Sudo-Agent.exe
+      - name: Build Rem-Service.exe and Rem-Agent.exe
         shell: bash
         run: |
-          for pair in "Sudo-Service agent/agent.py" "Sudo-Agent agent/agent_gui.py"; do
+          for pair in "Rem-Service agent/agent.py" "Rem-Agent agent/agent_gui.py"; do
             set -- $pair
             pyinstaller --noconfirm --onefile --noconsole --name "$1" \
               --icon agent/sudo.ico \
@@ -53,13 +53,13 @@ jobs:
           done
           ls -l dist
       # One at a time: the agent allows a single instance per PC.
-      - name: Test Sudo-Service.exe
-        run: python -I scripts/test_windows_exe.py dist/Sudo-Service.exe
-      - name: Test Sudo-Agent.exe
-        run: python -I scripts/test_windows_exe.py dist/Sudo-Agent.exe
+      - name: Test Rem-Service.exe
+        run: python -I scripts/test_windows_exe.py dist/Rem-Service.exe
+      - name: Test Rem-Agent.exe
+        run: python -I scripts/test_windows_exe.py dist/Rem-Agent.exe
       - uses: actions/upload-artifact@v7
         with:
           name: windows-exes
           path: |
-            dist/Sudo-Service.exe
-            dist/Sudo-Agent.exe
+            dist/Rem-Service.exe
+            dist/Rem-Agent.exe

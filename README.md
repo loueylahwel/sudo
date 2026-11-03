@@ -2,26 +2,27 @@
 
 <img src="app/assets/icon/icon.png" alt="" width="96" height="96">
 
-# Sudo
+# Rem
 
-**`sudo give me my PC`**: your Windows or Linux PC, in your Android phone.<br>
-Its screen, files, terminal, music and sound. One tap to connect, no account, free.
+**Your Windows or Linux PC, in your Android phone.**<br>
+Its screen, files, terminal, music and sound. One tap to connect, no account, free.<br>
+<sub>Called Sudo before v2.4.</sub>
 
-[![Download](https://img.shields.io/github/v/release/loueylahwel/sudo?label=download&color=2ea44f)](https://github.com/loueylahwel/sudo/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/loueylahwel/sudo/total?color=blue)](https://github.com/loueylahwel/sudo/releases)
+[![Download](https://img.shields.io/github/v/release/loueylahwel/rem?label=download&color=2ea44f)](https://github.com/loueylahwel/rem/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/loueylahwel/rem/total?color=blue)](https://github.com/loueylahwel/rem/releases)
 [![Platforms](https://img.shields.io/badge/PC-Windows%20%E2%80%A2%20Linux-blue)](#what-works-where)
 [![Phone](https://img.shields.io/badge/phone-Android-3ddc84)](#download)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Agent CI](https://github.com/loueylahwel/sudo/actions/workflows/agent-platforms.yml/badge.svg)](https://github.com/loueylahwel/sudo/actions/workflows/agent-platforms.yml)
+[![Agent CI](https://github.com/loueylahwel/rem/actions/workflows/agent-platforms.yml/badge.svg)](https://github.com/loueylahwel/rem/actions/workflows/agent-platforms.yml)
 
 </div>
 
 <p align="center">
-  <img src="docs/demo.gif" alt="Side by side: on the left the Sudo app on a real Android phone, a finger moving on its touchpad; on the right the PC, whose cursor follows it, opens Documents and Pictures in the file manager, then heads for the taskbar" width="880"><br>
+  <img src="docs/demo.gif" alt="Side by side: on the left the Rem app on a real Android phone, a finger moving on its touchpad; on the right the PC, whose cursor follows it, opens Documents and Pictures in the file manager, then heads for the taskbar" width="880"><br>
   <sub>A real phone driving a PC (played 1.5× faster): drag on the phone's touchpad to move the cursor, tap to click, two fingers to scroll.</sub>
 </p>
 
-## Why Sudo
+## Why Rem
 
 - **One tap to connect.** Open the app, tap **Find my PC**, tap your PC's
   name. The first time, the PC asks you to allow the phone. No codes, no QR,
@@ -41,23 +42,24 @@ Its screen, files, terminal, music and sound. One tap to connect, no account, fr
 
 | | Download | Needs |
 |---|---|---|
-| **Android phone** | [sudo.apk](https://github.com/loueylahwel/sudo/releases/latest/download/sudo.apk) | Android 10 or newer |
-| **Windows PC** | [Sudo-Service.exe](https://github.com/loueylahwel/sudo/releases/latest/download/Sudo-Service.exe) | Windows 10 or 11 (PC sound: version 2004 or newer) |
+| **Android phone** | [rem.apk](https://github.com/loueylahwel/rem/releases/latest/download/rem.apk) | Android 10 or newer |
+| **Windows PC** | [Rem-Service.exe](https://github.com/loueylahwel/rem/releases/latest/download/Rem-Service.exe) | Windows 10 or 11 (PC sound: version 2004 or newer) |
 | **Linux PC** | [one command](#on-linux) | Ubuntu, Debian, Mint, Fedora, Arch, openSUSE and others; X11 or Wayland |
 
 ### On Windows
 
-Run `Sudo-Service.exe` once. That's all: it runs invisibly, adds itself to
+Run `Rem-Service.exe` once. That's all: it runs invisibly, adds itself to
 startup and starts at every boot. If Windows asks whether to allow it
 through the firewall, say yes: that's how your phone finds the PC.
 
-Updating: end the running Sudo first (Task Manager → Sudo-Service → End
-task), put the new file in place of the old one and run it once.
+Updating: end the running agent first (Task Manager → Rem-Service, or
+Sudo-Service from before the rename → End task), put the new file in place
+of the old one and run it once.
 
 ### On Linux
 
 ```bash
-git clone https://github.com/loueylahwel/sudo.git && cd sudo
+git clone https://github.com/loueylahwel/rem.git && cd rem
 bash agent/linux/install.sh
 ```
 
@@ -68,9 +70,9 @@ session. Re-run it after `git pull` to update. Logs:
 
 ### On the phone
 
-1. Install `sudo.apk` (allow "install unknown apps" when Android asks).
+1. Install `rem.apk` (allow "install unknown apps" when Android asks).
 2. Put the phone on the same Wi-Fi as the PC.
-3. Open Sudo → **Find my PC** → tap your PC's name → allow it on the PC.
+3. Open Rem → **Find my PC** → tap your PC's name → allow it on the PC.
 
 From then on the app reconnects by itself, at home and away.
 
@@ -126,7 +128,7 @@ how to fix it instead of showing a black picture.
 
 ## Private by design
 
-- **Nothing to sign up for**, and no Sudo server: at home the phone and the
+- **Nothing to sign up for**, and no Rem server: at home the phone and the
   PC talk directly, and nothing leaves your network.
 - **The PC decides.** A phone it hasn't seen before can only connect once
   you click Allow on the PC.
@@ -141,13 +143,13 @@ how to fix it instead of showing a black picture.
 - **Your choice.** Set `"remote_access": false` in the agent's
   `config.json` to stay home-only, or `"tunnel": false` to skip the tunnel.
 
-Sudo gives the phone full access to the PC's files and a terminal: that's
+Rem gives the phone full access to the PC's files and a terminal: that's
 the point. Install the agent only on PCs you own.
 
 ## How it works
 
 ```
-   PC: Sudo agent (Python)                       Phone: Sudo app (Flutter)
+   PC: Rem agent (Python)                       Phone: Rem app (Flutter)
  ┌──────────────────────────┐   UDP 47809      ┌─────────────────────────┐
  │ "I'm here" beacon         │ ───────────────▶ │ Find my PC              │
  │ screen, camera, sound     │   WebSocket      │ touchpad, keyboard      │

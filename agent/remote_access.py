@@ -46,7 +46,7 @@ def ensure_certificate(folder: Path, common_name: str):
 
         key = ec.generate_private_key(ec.SECP256R1())
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,
-                                             common_name[:60] or "Sudo PC")])
+                                             common_name[:60] or "Rem PC")])
         now = datetime.datetime.now(datetime.timezone.utc)
         cert = (x509.CertificateBuilder()
                 .subject_name(name).issuer_name(name)
@@ -340,7 +340,7 @@ class RemoteAccess:
         args = [("NewRemoteHost", ""), ("NewExternalPort", self.port),
                 ("NewProtocol", "TCP"), ("NewInternalPort", self.port),
                 ("NewInternalClient", local_ip), ("NewEnabled", 1),
-                ("NewPortMappingDescription", "Sudo remote access")]
+                ("NewPortMappingDescription", "Rem remote access")]
         try:
             _soap(control, service, "AddPortMapping",
                   args + [("NewLeaseDuration", self.LEASE)])

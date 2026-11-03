@@ -1,5 +1,5 @@
 [Unit]
-Description=Sudo PC agent (phone remote control)
+Description=Rem PC agent (phone remote control)
 # Runs inside the desktop session: mouse/keyboard control and screen capture
 # need the session's display, and the approval prompt shows on it.
 PartOf=graphical-session.target

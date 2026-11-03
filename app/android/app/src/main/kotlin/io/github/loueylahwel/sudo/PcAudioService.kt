@@ -52,7 +52,7 @@ class PcAudioService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
-        session = MediaSession(this, "SudoPcSound").apply {
+        session = MediaSession(this, "RemPcSound").apply {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() = media("media_play_pause")
                 override fun onPause() = media("media_play_pause")

@@ -948,7 +948,7 @@ def verify_installer(path):
 
 def _download(url, dest, report):
     tmp = dest.with_suffix(dest.suffix + ".part")
-    req = urllib.request.Request(url, headers={"User-Agent": "Sudo-agent"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Rem-agent"})
     with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as f:
         total = int(resp.headers.get("Content-Length") or 0)
         got = last = 0

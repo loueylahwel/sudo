@@ -319,7 +319,7 @@ class PcAudio extends ChangeNotifier {
       if (_isUnknownCmd(e)) {
         // An agent from before this feature: nothing to stop on the PC.
         _supported = false;
-        _fail(null, 'The Sudo agent on this PC is too old for this. '
+        _fail(null, 'The Rem agent on this PC is too old for this. '
             'Update it on the PC.');
       } else {
         _fail(client, '$e');

@@ -1,15 +1,15 @@
-# Contributing to Sudo
+# Contributing to Rem
 
 Thanks for helping. Bug reports, ideas, translations and pull requests are
 all welcome.
 
 ## Reporting a bug
 
-Open an [issue](https://github.com/loueylahwel/sudo/issues/new/choose) with:
+Open an [issue](https://github.com/loueylahwel/rem/issues/new/choose) with:
 
 - your phone (model and Android version) and your PC (Windows version, or
   Linux distribution and desktop, X11 or Wayland);
-- the Sudo version (the release you downloaded, or the commit);
+- the Rem version (the release you downloaded, or the commit);
 - what you did, what you expected and what happened instead;
 - on Linux, the agent's log if you can:
   `journalctl --user -u sudo-agent -n 200`.

@@ -1,4 +1,4 @@
-"""Smoke test of a built Windows exe (Sudo-Service.exe or Sudo-Agent.exe).
+"""Smoke test of a built Windows exe (Rem-Service.exe or Rem-Agent.exe).
 
 Starts the exe from its own folder with a config.json that skips the PC's
 Allow/Deny prompt and remote access, then acts like a phone: listens for the
@@ -7,7 +7,7 @@ fs.list, pointer moves, a few JPEG screen frames and PC sound packets. The
 exe is killed at the end. Run by
 .github/workflows/windows-exes.yml on every build.
 
-Usage: python -I scripts/test_windows_exe.py dist/Sudo-Service.exe
+Usage: python -I scripts/test_windows_exe.py dist/Rem-Service.exe
 """
 
 import asyncio

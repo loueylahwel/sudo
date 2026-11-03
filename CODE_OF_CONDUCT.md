@@ -1,6 +1,6 @@
 # Code of conduct
 
-Sudo is made by people in their free time, for anyone who wants their PC
+Rem is made by people in their free time, for anyone who wants their PC
 in their pocket. Everyone is welcome here, whatever their experience,
 background or identity.
 

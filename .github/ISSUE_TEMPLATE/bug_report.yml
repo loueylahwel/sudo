@@ -12,7 +12,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: Sudo version
+      label: Rem version
       placeholder: v2.3.1
     validations:
       required: true

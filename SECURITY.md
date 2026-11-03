@@ -1,6 +1,6 @@
 # Security
 
-Sudo gives a paired phone full control of a PC: its screen, files and a
+Rem gives a paired phone full control of a PC: its screen, files and a
 terminal. Security problems matter a lot here, so thank you for reporting
 them carefully.
 
@@ -9,12 +9,12 @@ them carefully.
 Please **don't open a public issue**. Use GitHub's private reporting
 instead: the **Security** tab of this repository → **Report a
 vulnerability**. Include what an attacker can do, how to reproduce it, and
-the Sudo version.
+the Rem version.
 
 You'll get an answer within a week. Fixes go out as a new release, and the
 report is credited unless you'd rather not.
 
-## How Sudo protects the PC
+## How Rem protects the PC
 
 - A phone the PC hasn't seen before can connect only after someone clicks
   **Allow** on the PC (unless `"require_approval": false` is set in the
@@ -27,5 +27,5 @@ report is credited unless you'd rather not.
 
 ## Supported versions
 
-Only the [latest release](https://github.com/loueylahwel/sudo/releases/latest)
+Only the [latest release](https://github.com/loueylahwel/rem/releases/latest)
 gets security fixes.

@@ -149,7 +149,7 @@ else
     cat > "$HOME/.config/autostart/sudo-agent.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Sudo agent
+Name=Rem agent
 Comment=Phone remote control
 Exec=$DEST/venv/bin/python $DEST/agent.py
 X-GNOME-Autostart-enabled=true
@@ -174,7 +174,7 @@ elif command -v firewall-cmd >/dev/null && as_root firewall-cmd --state >/dev/nu
 fi
 
 echo
-echo "Sudo agent installed and running."
+echo "Rem agent installed and running."
 echo "  Status: $started"
 echo "  Logs:   $logs"
 echo "  On the phone: Add PC -> it appears in the list; tap it and click"
@@ -182,6 +182,6 @@ echo "  Allow on this PC."
 if [ -n "$wayland" ]; then
     echo
     echo "Wayland: the first time the phone opens the Screen page, this PC asks"
-    echo "to allow screen sharing (and remote control). Allow it once; Sudo"
+    echo "to allow screen sharing (and remote control). Allow it once; Rem"
     echo "remembers it."
 fi

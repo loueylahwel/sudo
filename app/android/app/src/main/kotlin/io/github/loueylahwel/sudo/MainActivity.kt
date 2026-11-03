@@ -359,7 +359,7 @@ class MainActivity : FlutterActivity() {
             put(MediaStore.Downloads.DISPLAY_NAME, name)
             put(
                 MediaStore.Downloads.RELATIVE_PATH,
-                Environment.DIRECTORY_DOWNLOADS + File.separator + "Sudo",
+                Environment.DIRECTORY_DOWNLOADS + File.separator + "Rem",
             )
             put(MediaStore.Downloads.IS_PENDING, 1)
         }

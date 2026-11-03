@@ -148,7 +148,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Timer? _powerTick;
 
   // Temporary diagnostics for the network-switch bug (visible in logcat).
-  void _dbg(String msg) => debugPrint('[Sudo] $msg');
+  void _dbg(String msg) => debugPrint('[Rem] $msg');
 
   @override
   void initState() {
@@ -2093,7 +2093,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         if (error != null) {
           subtitle = error;
         } else if (unsupported) {
-          subtitle = 'The Sudo agent on this PC is too old for this. '
+          subtitle = 'The Rem agent on this PC is too old for this. '
               'Update it on the PC.';
         } else if (audio.enabled && audio.playing) {
           subtitle = 'Playing here. The PC is quiet.';

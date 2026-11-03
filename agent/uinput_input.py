@@ -88,7 +88,7 @@ class VirtualInput:
             for rel in (REL_X, REL_Y, REL_HWHEEL, REL_WHEEL):
                 fcntl.ioctl(fd, UI_SET_RELBIT, rel)
             setup = struct.pack("HHHH80sI", BUS_VIRTUAL, 0x5344, 0x0001, 1,
-                                b"Sudo remote input", 0)
+                                b"Rem remote input", 0)
             fcntl.ioctl(fd, UI_DEV_SETUP, setup)
             fcntl.ioctl(fd, UI_DEV_CREATE)
         except OSError:

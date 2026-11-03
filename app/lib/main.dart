@@ -4,15 +4,15 @@ import 'device_store.dart';
 import 'pages/home_page.dart';
 import 'pages/pair_page.dart';
 
-void main() => runApp(const SudoApp());
+void main() => runApp(const RemApp());
 
-class SudoApp extends StatelessWidget {
-  const SudoApp({super.key});
+class RemApp extends StatelessWidget {
+  const RemApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Sudo',
+      title: 'Rem',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,

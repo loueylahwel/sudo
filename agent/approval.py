@@ -68,7 +68,7 @@ class ApprovalManager:
         root = tk.Tk()
         self._root = root
         root.withdraw()
-        root.title("Sudo")
+        root.title("Rem")
         try:
             import sys
             from pathlib import Path
@@ -97,7 +97,7 @@ class ApprovalManager:
     def _show(self, desc, fut):
         dlg = tk.Toplevel(self._root)
         self._dialog = dlg
-        dlg.title("Sudo — connection request")
+        dlg.title("Rem: connection request")
         dlg.configure(bg="#0f0f0f", padx=24, pady=18)
         dlg.resizable(False, False)
         dlg.attributes("-topmost", True)
@@ -186,7 +186,7 @@ class ApprovalManager:
         dry_run = auto_close_s is not None
         dlg = tk.Toplevel(self._root)
         dlg.withdraw()  # mapped only once it can no longer take focus
-        dlg.title("Sudo — scheduled power action"
+        dlg.title("Rem: scheduled power action"
                   + (" (dry run)" if dry_run else ""))
         dlg.configure(bg="#0f0f0f", padx=24, pady=18)
         dlg.resizable(False, False)
@@ -210,7 +210,7 @@ class ApprovalManager:
                             wraplength=320, justify="left")
         headline.pack()
         detail = ("Dry run: nothing will actually happen." if dry_run
-                  else "Scheduled from the Sudo app on your phone. "
+                  else "Scheduled from the Rem app on your phone. "
                        "Save your work, or cancel it here.")
         tk.Label(dlg, text=detail, bg="#0f0f0f", fg="#9ca3af",
                  font=("Segoe UI", 10), wraplength=320,

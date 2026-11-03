@@ -528,7 +528,7 @@ class _ScreenPageState extends State<ScreenPage>
       showError(
           context,
           '$e'.startsWith('unknown cmd')
-              ? 'Update the Sudo agent on the PC for the window lock'
+              ? 'Update the Rem agent on the PC for the window lock'
               : e);
     } finally {
       if (mounted) setState(() => _lockBusy = false);

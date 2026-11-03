@@ -9,7 +9,7 @@ Mbit/s on its own).
 
 Linux (PipeWire with pipewire-pulse):
 
-  * `pw-cli` creates a null sink, "sudo_phone" ("Phone (Sudo)"), and is kept
+  * `pw-cli` creates a null sink, "sudo_phone" ("Phone (Rem)"), and is kept
     running: the sink belongs to that pw-cli (object.linger=false) and goes
     away the moment it exits. The child gets SIGTERM when the agent dies
     (PR_SET_PDEATHSIG), so a crashed agent can't leave a dead output behind;
@@ -100,7 +100,7 @@ MONITOR_PAREC_LATENCY_MS = 20
 
 _CREATE_SINK = (
     "create-node adapter { factory.name=support.null-audio-sink "
-    f'node.name={SINK} node.description="Phone (Sudo)" '
+    f'node.name={SINK} node.description="Phone (Rem)" '
     "media.class=Audio/Sink object.linger=false "
     f"node.latency={SINK_QUANTUM}/{RATE} "
     f"audio.position=[FL FR] audio.rate={RATE} }}\n")
@@ -546,8 +546,8 @@ class PcAudio:
                                    "needs Windows 10 version 2004 or newer")
             if _opus() is None:
                 raise RuntimeError("Playing the PC's sound on the phone "
-                                   "needs opus.dll next to the Sudo agent "
-                                   "(the release's Sudo-Service.exe has it)")
+                                   "needs opus.dll next to the Rem agent "
+                                   "(the release's Rem-Service.exe has it)")
             return
         if system != "Linux":
             raise RuntimeError("Playing the PC's sound on the phone isn't "
@@ -578,7 +578,7 @@ class PcAudio:
             self._wait_sink(False, 1.0)  # ours, still going away?
             if SINK in _sinks():
                 raise RuntimeError("this PC's sound is already going to a "
-                                   "phone (another Sudo agent is running)")
+                                   "phone (another Rem agent is running)")
             # Read before the sink exists: PipeWire may make a new sink
             # the default by itself if it was the picked one once.
             prev = _default_sink()
@@ -758,7 +758,7 @@ class PcAudio:
             else MONITOR_PAREC_LATENCY_MS   # see SINK_QUANTUM
         cmd = ["parec", "-d", source, "--format=s16le", f"--rate={RATE}",
                f"--channels={CHANNELS}", "--raw", f"--latency-msec={latency}",
-               "--client-name=Sudo", "--stream-name=PC sound for the phone"]
+               "--client-name=Rem", "--stream-name=PC sound for the phone"]
         try:
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

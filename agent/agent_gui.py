@@ -1,11 +1,11 @@
-"""Sudo Agent — the normal-user way to run the agent.
+"""Rem Agent: the normal-user way to run the agent.
 
 Double-click the exe (or `python agent_gui.py`): a small window shows the
 pairing QR immediately. No terminal, no Python install needed when frozen
-with PyInstaller. Scan the QR with the Sudo phone app and you're connected.
+with PyInstaller. Scan the QR with the Rem phone app and you're connected.
 
 Build the exe:
-    pyinstaller --noconsole --onefile --name Sudo-Agent --icon sudo.ico agent_gui.py
+    pyinstaller --noconsole --onefile --name Rem-Agent --icon sudo.ico agent_gui.py
 """
 
 import asyncio
@@ -36,10 +36,15 @@ STARTUP_DIR = (
     Path(os.environ.get("APPDATA", ""))
     / r"Microsoft\Windows\Start Menu\Programs\Startup"
 )
-STARTUP_LINK = STARTUP_DIR / "Sudo-Agent.lnk"
+STARTUP_LINK = STARTUP_DIR / "Rem-Agent.lnk"
+LEGACY_LINK = STARTUP_DIR / "Sudo-Agent.lnk"   # from before the rename to Rem
 
 
 def startup_enabled():
+    if LEGACY_LINK.exists():
+        # Was on before the rename: keep it on, under the new name.
+        LEGACY_LINK.unlink(missing_ok=True)
+        set_startup(True)
     return STARTUP_LINK.exists()
 
 
@@ -67,13 +72,13 @@ class AgentGui:
         self.root = root
         self.cfg = load_config()
 
-        root.title("Sudo")
+        root.title("Rem")
         root.configure(bg=BG)
         root.resizable(False, False)
 
-        tk.Label(root, text="Sudo", bg=BG, fg=FG,
+        tk.Label(root, text="Rem", bg=BG, fg=FG,
                  font=("Segoe UI", 20, "bold")).pack(pady=(18, 2))
-        tk.Label(root, text="Scan with the Sudo phone app",
+        tk.Label(root, text="Scan with the Rem phone app",
                  bg=BG, fg=MUTED, font=("Segoe UI", 10)).pack()
 
         payload = pairing_payload(self.cfg)

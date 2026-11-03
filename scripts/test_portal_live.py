@@ -60,7 +60,7 @@ async def main():
         portal.click("left")
         portal.key("enter")
         with open("/proc/bus/input/devices") as f:
-            listed = "Sudo remote input" in f.read()
+            listed = "Rem remote input" in f.read()
         print(f"virtual input device listed by the kernel: {listed}")
         assert listed, "the uinput device did not appear"
         portal._virtual().close()

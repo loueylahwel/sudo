@@ -153,7 +153,7 @@ jobs:
           dev.scroll(0, 1)
           dev.key("enter")
           dev.text("Hi!")
-          listed = "Sudo remote input" in open("/proc/bus/input/devices").read()
+          listed = "Rem remote input" in open("/proc/bus/input/devices").read()
           print("listed by the kernel:", listed)
           dev.close()
           assert listed

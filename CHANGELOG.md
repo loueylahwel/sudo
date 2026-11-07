@@ -2,7 +2,7 @@
 
 Downloads for every version: [releases](https://github.com/loueylahwel/rem/releases).
 
-## v2.4.1 (unreleased)
+## v2.4.1 (2026-11-07)
 
 Security fixes, reported privately by
 [Corey Klass](https://coreyklass.com). Thank you!

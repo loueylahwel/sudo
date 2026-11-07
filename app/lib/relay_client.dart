@@ -143,6 +143,7 @@ class RelayClient {
   StreamSubscription<dynamic>? _sub;
   int _nextId = 0;
   bool _connected = false;
+  bool _pinned = false;
 
   final Map<String, Completer<Map<String, dynamic>>> _pending = {};
   final StreamController<Map<String, dynamic>> _messagesCtrl =
@@ -196,6 +197,14 @@ class RelayClient {
 
   bool get isConnected => _connected;
 
+  /// True while the socket is TLS with the PC's own certificate pinned
+  /// (see [connect]): the only connection a secret such as the PC's
+  /// password may go over. Plain `ws://` on the LAN is false.
+  bool get isPinned => _connected && _pinned;
+
+  /// Requests sent and not answered yet.
+  int get pendingRequests => _pending.length;
+
   /// Opens the WebSocket to [relayUrl] (e.g. `ws://192.168.1.10:8080`).
   /// When [timeout] is given, a socket that isn't ready in time is closed
   /// and the call fails with [RelayException].
@@ -238,6 +247,7 @@ class RelayClient {
       throw RelayException('Could not connect to $relayUrl');
     }
     _connected = true;
+    _pinned = tlsClient != null && relayUrl.startsWith('wss://');
     _connCtrl.add(true);
     _sub = channel.stream.listen(
       _onMessage,
@@ -369,6 +379,7 @@ class RelayClient {
   /// Closes the socket and fails all pending requests.
   Future<void> disconnect() async {
     _connected = false;
+    _pinned = false;
     await _sub?.cancel();
     _sub = null;
     final channel = _channel;

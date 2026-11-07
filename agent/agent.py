@@ -1,15 +1,12 @@
-"""pc-remote PC agent.
+"""Rem PC agent.
 
-Runs on the PC you want to control. Connects OUTBOUND to the relay server,
-so it works behind NAT / on any network without port forwarding.
-
-First run generates a persistent pairing code (stored in config.json next to
-this file). Enter that code in the mobile app once; after that the phone
-reconnects with one tap.
+Runs on the PC you want to control. The phone connects straight to it (the
+relay is built in): over the Wi-Fi at home, and through the router or a
+Cloudflare tunnel away from home. A phone the PC hasn't seen before needs
+someone to click Allow on the PC.
 
 Usage:
-    python agent.py                 # uses config.json / default relay
-    RELAY_URL=wss://example.com python agent.py
+    python agent.py
 """
 
 import asyncio
@@ -124,6 +121,14 @@ def _default_config_path():
 CONFIG_PATH = (HERE / "config.json") if (HERE / "config.json").exists() \
     else _default_config_path()
 DEFAULT_RELAY = "ws://127.0.0.1:8080"
+
+
+def relay_is_local(url):
+    """True when url points at this PC (the built-in relay)."""
+    try:
+        return urlparse(url).hostname in ("127.0.0.1", "localhost", "::1")
+    except ValueError:
+        return False
 CHUNK = 256 * 1024  # fs transfer chunk size
 DISCOVERY_PORT = 47809  # UDP beacon the phone app listens on
 
@@ -171,7 +176,20 @@ def load_config():
     if not cfg.get("name"):
         cfg["name"] = platform.node() or "My PC"
         changed = True
-    cfg["relay"] = os.environ.get("RELAY_URL") or cfg.get("relay") or DEFAULT_RELAY
+    cfg["relay"] = cfg.get("relay") or DEFAULT_RELAY
+    if not relay_is_local(cfg["relay"]):
+        # Outside relays (the old relay/ server, RELAY_URL) are gone: on
+        # that path phones reached the PC with no Allow prompt and no
+        # token. Refuse it loudly and run the built-in relay instead.
+        print(f"[agent] SECURITY: ignoring the outside relay "
+              f"{cfg['relay']!r} in config.json: outside relays are no "
+              f"longer supported (they skipped the Allow prompt). Running "
+              f"the built-in relay on {DEFAULT_RELAY} instead; remove "
+              f"\"relay\" from config.json to silence this.")
+        cfg["relay"] = DEFAULT_RELAY
+    if os.environ.get("RELAY_URL"):
+        print("[agent] SECURITY: ignoring RELAY_URL: outside relays are no "
+              "longer supported.")
     if changed or not CONFIG_PATH.exists():
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
@@ -5107,69 +5125,30 @@ class Agent:
         asyncio.create_task(self.restore_phone_audio())
         asyncio.create_task(self.restore_pc_audio())
         asyncio.create_task(self.restore_window_lock())
-        host = urlparse(self.cfg["relay"]).hostname
-        if host in (None, "127.0.0.1", "localhost", "::1"):
-            # Standalone: the relay is embedded — the phone connects straight
-            # to this process. One exe is the whole PC side.
-            from approval import ApprovalManager
-            self.approval = ApprovalManager()
-            self.approval.start(self.loop)
-            port = urlparse(self.cfg["relay"]).port or 8080
-            remote = self._setup_remote()
-            self.embedded = EmbeddedRelay(
-                self, port, *(remote if remote else (None, None)))
+        # The relay is embedded: the phone connects straight to this
+        # process (load_config refuses outside relays). One exe is the
+        # whole PC side.
+        from approval import ApprovalManager
+        self.approval = ApprovalManager()
+        self.approval.start(self.loop)
+        port = urlparse(self.cfg["relay"]).port or 8080
+        remote = self._setup_remote()
+        self.embedded = EmbeddedRelay(
+            self, port, *(remote if remote else (None, None)))
+        try:
+            await self.embedded.serve()
+        finally:
+            if self.tunnel is not None:
+                self.tunnel.stop()
+            if self.pc_audio is not None:
+                self.pc_audio.stop()  # the PC's sound back on the PC
             try:
-                await self.embedded.serve()
-            finally:
-                if self.tunnel is not None:
-                    self.tunnel.stop()
-                if self.pc_audio is not None:
-                    self.pc_audio.stop()  # the PC's sound back on the PC
-                try:
-                    await asyncio.wait_for(
-                        self.window_unlock("the agent stopped"), 3)
-                except BaseException:
-                    pass  # the next start releases it (restore_window_lock)
-                if self.remote is not None:
-                    self.remote.stop()
-            return
-        await self._run_outbound()
-
-    async def _run_outbound(self):
-        backoff = 1
-        while True:
-            try:
-                async with websockets.connect(
-                    self.cfg["relay"], ping_interval=20, ping_timeout=20,
-                    max_size=8 * 1024 * 1024,
-                    compression=None,  # frames don't compress (see serve)
-                ) as ws:
-                    self.ws = ws
-                    await self.send({
-                        "type": "register",
-                        "code": self.cfg["code"],
-                        "deviceId": self.cfg["device_id"],
-                        "name": self.cfg["name"],
-                    })
-                    print(f"[agent] connected to {self.cfg['relay']} "
-                          f"as '{self.cfg['name']}' code={self.cfg['code']}")
-                    self._status("Connected — waiting for phone")
-                    backoff = 1
-                    watcher = asyncio.create_task(self.clipboard_watcher())
-                    try:
-                        async for raw in ws:
-                            await self.on_message(raw)
-                    finally:
-                        watcher.cancel()
-                        for c in set(self.streamers) | set(self._lanes):
-                            await self.drop_client(c)
-                        self.known_clients.clear()
-                        self.ws = None
-            except (OSError, websockets.WebSocketException) as e:
-                print(f"[agent] connection failed: {e}; retry in {backoff}s")
-                self._status("Relay unreachable — retrying…")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+                await asyncio.wait_for(
+                    self.window_unlock("the agent stopped"), 3)
+            except BaseException:
+                pass  # the next start releases it (restore_window_lock)
+            if self.remote is not None:
+                self.remote.stop()
 
     async def on_message(self, raw):
         # Binary packets are reserved for screen frames; none are expected
@@ -5279,21 +5258,10 @@ def lan_ip():
 
 def pairing_payload(cfg):
     """The pcocket:// URI encoded in the pairing QR."""
-    relay = cfg["relay"]
-    u = urlparse(relay)
-    lan = None
-    if u.hostname in ("127.0.0.1", "localhost", "::1"):
-        # a phone can't reach loopback — advertise the LAN address instead
-        relay = f"{u.scheme or 'ws'}://{lan_ip()}:{u.port or 8080}"
-    else:
-        # remote relay (tunnel/hosted): also offer the direct LAN address —
-        # the app prefers it whenever phone and PC share a network, skipping
-        # the internet round-trip that makes screen sharing laggy
-        lan = f"ws://{lan_ip()}:8080"
-    payload = f"sudo://pair?relay={quote(relay, safe='')}&code={cfg['code']}"
-    if lan:
-        payload += f"&lan={quote(lan, safe='')}"
-    return payload
+    u = urlparse(cfg["relay"])  # always this PC (load_config)
+    # a phone can't reach loopback: advertise the LAN address instead
+    relay = f"{u.scheme or 'ws'}://{lan_ip()}:{u.port or 8080}"
+    return f"sudo://pair?relay={quote(relay, safe='')}&code={cfg['code']}"
 
 
 def show_pairing_qr(cfg):

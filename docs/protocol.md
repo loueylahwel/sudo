@@ -37,12 +37,10 @@ The agent displays a QR code (terminal + `pairing-qr.png`) containing:
 pcocket://pair?relay=<urlencoded ws(s)://host:port>&code=ABC123[&lan=<urlencoded ws://lan-ip:8080>]
 ```
 
-When the configured relay is loopback, the agent substitutes the machine's
-LAN address so phones on the same network can reach it. When the relay is
-remote (tunnel/hosted), the optional `lan` parameter carries the direct LAN
-address of the relay: the app should try `lan` first (short timeout) and
-fall back to `relay`, so at home the connection skips the internet
-round-trip. Scanning the QR in the app should prefill relay + code and pair
+The relay is built into the agent, so the agent puts the machine's LAN
+address in the QR. The optional `lan` parameter came from the old outside
+relay (removed in v2.4.1, as it skipped the Allow prompt); apps may still
+honor it. Scanning the QR in the app should prefill relay + code and pair
 immediately.
 
 Relay also pushes `{ "type": "agent.online" | "agent.offline" }` to paired
@@ -421,8 +419,7 @@ frames also carry the effective JPEG quality `q` and the `preset` (`auto`'s
 `q` and `w`/`h` change as it adapts); older agents send only `w`/`h`/`src`,
 and clients must ignore keys they don't know.
 
-Binary packets go only to the phone that started the stream (with the
-embedded relay; the hosted relay still fans them out), and each phone's
+Binary packets go only to the phone that started the stream, and each phone's
 socket is throttled on its own — a slow phone drops its own frames, never
 another's.
 

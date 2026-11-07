@@ -174,11 +174,9 @@ and PC sound on a virtual sound card.
 |---|---|---|
 | `agent/` | Python 3.11+ | `pip install -r agent/requirements.txt`; Windows exes: see [windows-exes.yml](.github/workflows/windows-exes.yml) |
 | `app/` | Flutter | `cd app && flutter pub get && flutter build apk --release` |
-| `relay/` | Node.js 18+ | optional standalone relay: `npm install && npm start` |
 
 Layout: `agent/` (PC agent, Python), `app/` (phone app, Flutter),
-`relay/` (optional relay), `docs/` (protocol, Linux notes), `scripts/`
-(tests and measuring tools).
+`docs/` (protocol, Linux notes), `scripts/` (tests and measuring tools).
 
 ## Contributing
 

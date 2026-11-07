@@ -2,6 +2,23 @@
 
 Downloads for every version: [releases](https://github.com/loueylahwel/rem/releases).
 
+## v2.4.1 (unreleased)
+
+Security fixes, reported privately by
+[Corey Klass](https://coreyklass.com). Thank you!
+
+- The optional outside relay (`relay/`, and `"relay"` or `RELAY_URL`
+  pointing away from the PC) is removed: phones that went through it
+  reached the PC with no Allow prompt and no token. A PC still set up that
+  way now ignores it, says so in its log, and uses its own built-in relay
+  with the Allow prompt. Default setups were never affected.
+- The app sends the PC's password (Unlock) only over the encrypted
+  connection that checks the PC's own certificate, never over plain Wi-Fi.
+- Right after the first pairing, the phone switches to that encrypted
+  connection at once, instead of at the next reconnect.
+- Two phones asking to pair at the same moment no longer freeze the PC's
+  Allow/Deny window.
+
 ## v2.4.0 (2026-11-03)
 
 - Sudo is now called **Rem**, with a new logo. The files are `rem.apk`,

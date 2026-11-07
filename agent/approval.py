@@ -82,15 +82,24 @@ class ApprovalManager:
         root.mainloop()
 
     def _poll(self):
-        try:
-            while True:
+        # One dialog at a time. While one is open, later requests simply
+        # stay queued for a later tick (re-queueing them inside this loop
+        # spun forever and froze the Tk thread: two phones pairing at once).
+        if self._dialog is None:
+            try:
                 desc, fut = self._requests.get_nowait()
-                if self._dialog is not None:
-                    self._requests.put((desc, fut))  # busy: retry next tick
-                else:
+            except queue.Empty:
+                pass
+            else:
+                try:
                     self._show(desc, fut)
-        except queue.Empty:
-            pass
+                except Exception as e:
+                    # Raising here would end the after() chain, and with it
+                    # every later prompt: deny just this one.
+                    print(f"[agent] approval prompt failed: {e}")
+                    self._dialog = None
+                    self._loop.call_soon_threadsafe(
+                        lambda f=fut: not f.done() and f.set_result(False))
         self._poll_warnings()
         self._root.after(50, self._poll)
 

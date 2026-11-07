@@ -9,6 +9,7 @@ on:
     paths:
       - agent/**
       - scripts/test_capture.py
+      - scripts/test_security.py
       - scripts/test_portal_live.py
       - scripts/test_wayland_portal.py
       - scripts/ci_wlroots.sh
@@ -29,6 +30,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -m pip install -r agent/requirements.txt
+      - run: python -I scripts/test_security.py
       - run: python -I scripts/test_capture.py out
       - uses: actions/upload-artifact@v7
         if: always()

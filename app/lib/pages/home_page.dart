@@ -799,6 +799,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         port == device.tlsPort &&
         tunnelUrl == device.tunnelUrl &&
         rendezvous == device.rendezvous) {
+      _moveToTls(device);
       return;
     }
     final updated = device.copyWith(
@@ -811,6 +812,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // save() dedupes by code+relayUrl: same key, replaced in place.
     unawaited(_store.save(updated));
     if (mounted) setState(() => _selected = updated);
+    _moveToTls(updated);
+  }
+
+  /// Right after the first pairing the phone is on plain `ws://`: it had no
+  /// certificate to pin yet. Once remote.info gave one, reconnect at once
+  /// over TLS with it pinned, instead of keeping the whole first session
+  /// (screen, files, typing) readable on the Wi-Fi until the next connect.
+  /// The token is saved, so this reconnect needs no Allow on the PC.
+  void _moveToTls(SavedDevice device) {
+    final client = _client;
+    if (!mounted || client == null || !_socketUp || client.isPinned) return;
+    if (!device.hasPin || _lanUrl(device) == device.relayUrl) return;
+    if (device.token.isEmpty) return; // would need Allow again: wait
+    unawaited(() async {
+      // Let the start-up requests (system info, media...) answer first:
+      // closing under them fails them with "Disconnected".
+      for (var i = 0; i < 30 && client.pendingRequests > 0; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      final now = _selected;
+      if (!mounted || !identical(client, _client) || !_socketUp) return;
+      if (now == null || !now.hasPin || client.isPinned) return;
+      _dbg('paired over plain ws: moving to pinned TLS');
+      await _connect(now, auto: true);
+    }());
   }
 
   /// Runs LAN discovery once and, when a PC with the same name as [device]
@@ -880,10 +906,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     setState(() => _sysInfoLoading = true);
     try {
       final info = await client.request('sys.info');
-      if (!mounted) return;
+      if (!mounted || !identical(client, _client)) return;
       setState(() => _sysInfo = info);
     } catch (e) {
-      if (mounted) showError(context, e);
+      // A replaced connection's failure is not news.
+      if (mounted && identical(client, _client)) showError(context, e);
     } finally {
       if (mounted) setState(() => _sysInfoLoading = false);
     }
@@ -984,12 +1011,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   /// Unlock the PC's lock screen with the PC user's password, typed here.
-  /// The agent checks it (PAM) and only accepts it over TLS; the app never
-  /// keeps it.
+  /// The agent checks it (PAM); the app never keeps it, and sends it only
+  /// over TLS with the PC's own certificate pinned, so a device posing as
+  /// the PC on the Wi-Fi never receives it.
   Future<void> _unlockPc() async {
     final client = _client;
     if (client == null || !_socketUp) {
       showMessage(context, 'Not connected');
+      return;
+    }
+    if (!client.isPinned) {
+      showMessage(
+        context,
+        'Unlocking needs the secure connection to this PC. '
+        'Reconnect to it and try again.',
+      );
       return;
     }
     final password = await showDialog<String>(
@@ -997,6 +1033,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       builder: (_) => const _UnlockDialog(),
     );
     if (password == null || password.isEmpty || !mounted) return;
+    // The connection may have dropped and come back while the dialog was
+    // open: check again right before the password leaves the phone.
+    if (!identical(client, _client) || !client.isPinned) {
+      showMessage(context, 'The connection changed. Try again.');
+      return;
+    }
     try {
       await client.request('session.unlock', {'password': password});
       if (mounted) showMessage(context, 'PC unlocked');
